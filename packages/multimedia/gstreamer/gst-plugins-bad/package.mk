@@ -10,22 +10,7 @@ PKG_URL="https://gstreamer.freedesktop.org/src/gst-plugins-bad/${PKG_NAME}-${PKG
 PKG_DEPENDS_TARGET="toolchain gst-plugins-base"
 PKG_LONGDESC="GStreamer Bad Plug-ins is a set of plug-ins that aren't up to par compared to the rest."
 
-if [ "${BLUETOOTH_SUPPORT}" = "yes" ]; then
-  PKG_DEPENDS_TARGET+=" fdk-aac sbc ldacBT libfreeaptx"
-fi
-
 pre_configure_target() {
-  if [ "${BLUETOOTH_SUPPORT}" = "yes" ]; then
-    PKG_GST_BT_FDKAAC="-Dfdkaac=enabled"
-    PKG_GST_BT_SBC="-Dsbc=enabled"
-    PKG_GST_BT_EXTRA="-Dldac=enabled \
-                       -Dopenaptx=enabled"
-  else
-    PKG_GST_BT_FDKAAC="-Dfdkaac=disabled"
-    PKG_GST_BT_SBC="-Dsbc=disabled"
-    PKG_GST_BT_EXTRA=""
-  fi
-
   PKG_MESON_OPTS_TARGET="-Dgst_play_tests=false \
                          -Daccurip=disabled \
                          -Dadpcmdec=disabled \
@@ -120,7 +105,7 @@ pre_configure_target() {
                          -Dfaac=disabled \
                          -Dfaad=disabled \
                          -Dfbdev=disabled \
-                         ${PKG_GST_BT_FDKAAC} \
+                         -Dfdkaac=disabled \
                          -Dflite=disabled \
                          -Dfluidsynth=disabled \
                          -Dgl=disabled \
@@ -152,8 +137,7 @@ pre_configure_target() {
                          -Dresindvd=disabled \
                          -Drsvg=disabled \
                          -Drtmp=disabled \
-                         ${PKG_GST_BT_SBC} \
-                         ${PKG_GST_BT_EXTRA} \
+                         -Dsbc=disabled \
                          -Dsctp=disabled \
                          -Dshm=disabled \
                          -Dsmoothstreaming=disabled \

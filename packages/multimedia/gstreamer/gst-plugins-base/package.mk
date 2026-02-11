@@ -15,7 +15,7 @@ pre_configure_target() {
   PKG_MESON_OPTS_TARGET="-Dgl=disabled \
                          -Dadder=disabled \
                          -Dapp=disabled \
-                         -Daudioconvert=enabled \
+                         -Daudioconvert=disabled \
                          -Daudiomixer=disabled \
                          -Daudiorate=disabled \
                          -Daudioresample=disabled \
@@ -63,16 +63,6 @@ pre_configure_target() {
 }
 
 post_makeinstall_target() {
-  if [ "${BLUETOOTH_SUPPORT}" = "yes" ]; then
-    # Keep shared libraries needed by BT audio codec GStreamer plugins
-    safe_remove ${INSTALL}/usr/include
-    safe_remove ${INSTALL}/usr/lib/pkgconfig
-    # Keep audioconvert plugin for BT codec format negotiation
-    safe_remove ${INSTALL}/usr/lib/gstreamer-1.0/libgstrawparse.so
-    safe_remove ${INSTALL}/usr/lib/gstreamer-1.0/libgstsubparse.so
-    safe_remove ${INSTALL}/usr/share
-  else
-    # clean up
-    safe_remove ${INSTALL}
-  fi
+  # clean up
+  safe_remove ${INSTALL}
 }
