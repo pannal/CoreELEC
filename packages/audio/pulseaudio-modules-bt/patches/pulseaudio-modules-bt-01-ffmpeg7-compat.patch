@@ -1,0 +1,22 @@
+--- a/src/modules/bluetooth/a2dp/a2dp_aptx.c
++++ b/src/modules/bluetooth/a2dp/a2dp_aptx.c
+@@ -255,7 +255,7 @@ static size_t pa_dual_encode(void *codec_info, uint32_t timestamp, const uint8_
+     av_frame = av_frame_alloc_func();
+     av_frame->nb_samples = aptx_info->nb_samples;
+     av_frame->format = aptx_info->av_codec_ctx->sample_fmt;
+-    av_frame->channel_layout = aptx_info->av_codec_ctx->channel_layout;
++    av_channel_layout_default(&av_frame->ch_layout, 2);
+ 
+     pkt = av_packet_alloc_func();
+ 
+@@ -346,8 +346,8 @@ static void pa_dual_config_transport(pa_a2dp_codec_t *codec) {
+ 
+     switch (config->channel_mode) {
+         case APTX_CHANNEL_MODE_STEREO:
+-            aptx_ctx->channel_layout = AV_CH_LAYOUT_STEREO;
+-            aptx_ctx->channels = 2;
++            av_channel_layout_default(&aptx_ctx->ch_layout, 2);
++            aptx_ctx->ch_layout.nb_channels = 2;
+             sample_spec->channels = 2;
+             break;
+         default:

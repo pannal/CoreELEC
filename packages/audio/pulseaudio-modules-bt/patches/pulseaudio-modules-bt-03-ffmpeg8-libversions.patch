@@ -1,0 +1,20 @@
+--- a/src/modules/bluetooth/a2dp/ffmpeg_libs.c
++++ b/src/modules/bluetooth/a2dp/ffmpeg_libs.c
+@@ -35,7 +35,7 @@
+ #include "ffmpeg_libs.h"
+ 
+ static const char *AVCODEC_LIB_NAMES[] = {
+-        "libavcodec.so.58",
++        "libavcodec.so.62",
+         "libavcodec.so"
+ };
+ 
+@@ -66,7 +66,7 @@ avcodec_free_context_func_t avcodec_free_context_func;
+ avcodec_open2_func_t avcodec_open2_func;
+ 
+ static const char *AVUTIL_LIB_NAMES[] = {
+-        "libavutil.so.56",
++        "libavutil.so.60",
+         "libavutil.so"
+ };
+ 
