@@ -141,7 +141,7 @@
   # additional packages to install:
   # Space separated list is supported,
   # e.g. ADDITIONAL_PACKAGES="PACKAGE1 PACKAGE2"
-    ADDITIONAL_PACKAGES+=" tmate"
+    ADDITIONAL_PACKAGES+=" tmate pulseaudio-modules-bt"
 
   # add OOTB support for IR remote
   # IR_REMOTE_KEYMAPS+=""
@@ -156,3 +156,5 @@
 
   # TEE supported SoC
     TEE_SOC="S905X4"
+
+    BLUETOOTH_SUPPORT="yes"
