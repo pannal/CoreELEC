@@ -420,6 +420,22 @@ post_makeinstall_target() {
     sed -e "s|@ADDON_REPO_NAME@|${ADDON_REPO_NAME}|g" -i ${INSTALL}/usr/share/kodi/addons/${ADDON_REPO_ID}/addon.xml
     sed -e "s|@ADDON_VERSION@|${ADDON_VERSION}|g" -i ${INSTALL}/usr/share/kodi/addons/${ADDON_REPO_ID}/addon.xml
 
+  # Download and install Don't Panic repository from official source
+  # Dynamically fetch the latest version from pm4k.eu
+  DONTPANIC_FILE=$(curl -sL https://pm4k.eu | grep -oP 'repository\.dontpanic[^"]*\.zip' | head -1)
+  if [ -n "${DONTPANIC_FILE}" ]; then
+    DONTPANIC_URL="https://pm4k.eu/${DONTPANIC_FILE}"
+    DONTPANIC_ZIP="${BUILD}/repository.dontpanic.zip"
+    echo "Fetching Don't Panic repository: ${DONTPANIC_FILE}"
+    curl -Lsf -o "${DONTPANIC_ZIP}" "${DONTPANIC_URL}"
+    if [ -f "${DONTPANIC_ZIP}" ]; then
+      unzip -q "${DONTPANIC_ZIP}" -d ${INSTALL}/usr/share/kodi/addons/
+      rm -f "${DONTPANIC_ZIP}"
+    fi
+  else
+    echo "WARNING: Could not fetch Don't Panic repository from pm4k.eu"
+  fi
+
   mkdir -p ${INSTALL}/usr/share/kodi/config
 
   ln -sf /run/libreelec/cacert.pem ${INSTALL}/usr/share/kodi/system/certs/cacert.pem
