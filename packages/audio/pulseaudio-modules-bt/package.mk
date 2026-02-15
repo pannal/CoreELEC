@@ -2,11 +2,11 @@
 # Copyright (C) 2024-present CoreELEC (https://coreelec.org)
 
 PKG_NAME="pulseaudio-modules-bt"
-PKG_VERSION="1.4"
-PKG_SHA256="72f8ffa46f842c2637b4d51d6db88a013002737acd36abb5f44ad049e8ccdf13"
+PKG_VERSION="1.5"
+PKG_SHA256=""
 PKG_LICENSE="GPL"
-PKG_SITE="https://github.com/EHfive/pulseaudio-modules-bt"
-PKG_URL="https://github.com/EHfive/pulseaudio-modules-bt/archive/v${PKG_VERSION}.tar.gz"
+PKG_SITE="https://github.com/samtheruby/pulseaudio-modules-bt"
+PKG_URL="https://github.com/samtheruby/pulseaudio-modules-bt/archive/v${PKG_VERSION}.tar.gz"
 PKG_DEPENDS_TARGET="toolchain pulseaudio ldacBT libfreeaptx fdk-aac ffmpeg"
 PKG_LONGDESC="Adds Sony LDAC, aptX, aptX HD, AAC codecs (A2DP Audio) support to PulseAudio"
 PKG_TOOLCHAIN="cmake"
