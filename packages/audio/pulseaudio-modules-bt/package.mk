@@ -2,7 +2,7 @@
 # Copyright (C) 2024-present CoreELEC (https://coreelec.org)
 
 PKG_NAME="pulseaudio-modules-bt"
-PKG_VERSION="1.5"
+PKG_VERSION="1.6"
 PKG_SHA256=""
 PKG_LICENSE="GPL"
 PKG_SITE="https://github.com/samtheruby/pulseaudio-modules-bt"
