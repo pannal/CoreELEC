@@ -270,4 +270,4 @@ BUG_REPORT_URL="https://github.com/pannal/CoreELEC"
 # Space separated list is supported,
 # e.g. ADDITIONAL_PACKAGES="PACKAGE1 PACKAGE2"
   ADDITIONAL_PACKAGES="u-boot-script dtc CoreELEC-Debug-Scripts inject_bl301 ceemmc
-                       nfs-utils dtb-xml megatools"
+                       nfs-utils dtb-xml megatools htop binutils"
