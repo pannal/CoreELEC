@@ -2,18 +2,18 @@
 # Copyright (C) 2016-present Team LibreELEC (https://libreelec.tv)
 
 PKG_NAME="htop"
-PKG_VERSION="3.3.0"
-PKG_SHA256="1e5cc328eee2bd1acff89f860e3179ea24b85df3ac483433f92a29977b14b045"
+PKG_VERSION="3.4.1"
+PKG_SHA256="af9ec878f831b7c27d33e775c668ec79d569aa781861c995a0fbadc1bdb666cf"
 PKG_LICENSE="GPL"
-PKG_SITE="https://hisham.hm/htop"
+PKG_SITE="https://htop.dev"
 PKG_URL="https://github.com/htop-dev/htop/archive/${PKG_VERSION}.tar.gz"
 PKG_DEPENDS_TARGET="toolchain ncurses"
 PKG_LONGDESC="An interactive process viewer for Unix."
 PKG_TOOLCHAIN="autotools"
 PKG_BUILD_FLAGS="-sysroot"
 
-PKG_CONFIGURE_OPTS_TARGET="--disable-unicode \
-                           HTOP_NCURSES_CONFIG_SCRIPT=ncurses-config"
+PKG_CONFIGURE_OPTS_TARGET="--enable-unicode \
+                           HTOP_NCURSES_CONFIG_SCRIPT=ncursesw6-config"
 
 pre_configure_target() {
   export LDFLAGS="${LDFLAGS} -pthread"

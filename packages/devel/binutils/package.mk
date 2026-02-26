@@ -73,7 +73,7 @@ make_target() {
   make -C libiberty
   make -C bfd
   make -C opcodes
-  make -C binutils strings
+  make -C binutils strings nm-new
 }
 
 makeinstall_target() {
@@ -84,4 +84,5 @@ makeinstall_target() {
 
   mkdir -p ${INSTALL}/usr/bin
     cp binutils/strings ${INSTALL}/usr/bin
+    cp binutils/nm-new ${INSTALL}/usr/bin/nm
 }
