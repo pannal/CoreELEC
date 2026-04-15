@@ -1,0 +1,265 @@
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.cpp
+index bfeb0ac5..cb74e555 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.cpp
+@@ -306,6 +306,9 @@ bool CDVDVideoCodecAmlogic::Open(CDVDStreamInfo &hints, CDVDCodecOptions &option
+       }
+       m_pFormatName = "am-h265";
+       m_bitstream = new CBitstreamConverter();
++      // Before Open(): tell the converter that this stream is DV, so it can engage the
++      // hvcC passthrough path if the extradata is in hvcC format.
++      m_bitstream->SetDoViHvccPassthrough(m_hints.hdrType == StreamHdrType::HDR_TYPE_DOLBYVISION);
+       m_bitstream->Open(m_hints.codec, m_hints.extradata.GetData(), m_hints.extradata.GetSize(), true);
+ 
+       if (m_hints.extradata && !m_hints.cryptoSession)
+diff --git a/xbmc/utils/BitstreamConverter.cpp b/xbmc/utils/BitstreamConverter.cpp
+index c1bac630..661ab0da 100644
+--- a/xbmc/utils/BitstreamConverter.cpp
++++ b/xbmc/utils/BitstreamConverter.cpp
+@@ -447,6 +447,24 @@ bool CBitstreamConverter::Open(enum AVCodecID codec, uint8_t *in_extradata, int
+ 
+         if (in_extradata[0] || in_extradata[1] || in_extradata[2] > 1)
+         {
++          // Dolby Vision HLS fmp4: the hvcC already contains VPS/SPS/PPS that the amstream
++          // kernel driver is happy with. Don't run the full HEVC bitstream filter (SPS/PPS
++          // carousel, SEI rewrite, RPU transform, HDR10+ conversion) -- any of those mutate
++          // NAL payloads in ways that break DV on S905X3. Instead build AnnexB extradata
++          // once here and switch Convert() to a byte-exact length->start-code rewrite.
++          if (m_dovi_hvcc_passthrough_requested && in_extradata[0] != 0)
++          {
++            if (BuildDoViAnnexbExtradataHEVC(in_extradata, in_extrasize))
++            {
++              m_dovi_hvcc_passthrough = true;
++              m_convert_bitstream = true; // so NeedConvert()/Convert() dispatches here
++              CLog::Log(LOGINFO, "CBitstreamConverter::Open DV hvcC passthrough enabled "
++                                 "-- packet per-NAL rewrite bypassed");
++              return true;
++            }
++            CLog::Log(LOGWARNING, "CBitstreamConverter::Open DV hvcC passthrough init "
++                                  "failed, falling back to standard HEVC filter");
++          }
+           CLog::Log(LOGINFO, "CBitstreamConverter::Open bitstream to annexb init");
+           m_extraData = FFmpegExtraData(in_extradata, in_extrasize);
+           m_convert_bitstream =
+@@ -516,6 +534,8 @@ void CBitstreamConverter::Close(void)
+   m_convert_bytestream = false;
+   m_convert_3byteTo4byteNALSize = false;
+   m_combine = false;
++  m_dovi_hvcc_passthrough = false;
++  m_dovi_length_size = 4;
+ }
+ 
+ bool CBitstreamConverter::Convert(uint8_t *pData, int iSize)
+@@ -545,7 +565,13 @@ bool CBitstreamConverter::Convert(uint8_t *pData, int iSize)
+           int bytestream_size = 0;
+           uint8_t *bytestream_buff = NULL;
+ 
+-          BitstreamConvert(demuxer_content, demuxer_bytes, &bytestream_buff, &bytestream_size);
++          if (m_dovi_hvcc_passthrough)
++          {
++            DoViHvccPassthroughConvert(demuxer_content, demuxer_bytes,
++                                       &bytestream_buff, &bytestream_size);
++          }
++          else
++            BitstreamConvert(demuxer_content, demuxer_bytes, &bytestream_buff, &bytestream_size);
+           if (bytestream_buff && (bytestream_size > 0))
+           {
+             m_convertSize   = bytestream_size;
+@@ -1045,6 +1071,155 @@ bool CBitstreamConverter::BitstreamConvertInitHEVC(void *in_extradata, int in_ex
+   return true;
+ }
+ 
++// Walk an hvcC atom, collect each VPS/SPS/PPS NAL, and emit an AnnexB-format blob
++// (VPS | SPS | PPS, each preceded by a 4-byte 00 00 00 01 start code) into m_extraData.
++// This is the DV-passthrough equivalent of BitstreamConvertInitHEVC but it does NOT
++// populate m_sps_pps_context (we never reinject parameter sets on IDR in passthrough
++// mode -- the segment's own VPS/SPS/PPS NALs ride in the packet stream).
++bool CBitstreamConverter::BuildDoViAnnexbExtradataHEVC(const uint8_t *in_extradata,
++                                                       int in_extrasize)
++{
++  if (!in_extradata || in_extrasize < 23)
++    return false;
++
++  // hvcC length-prefix width used for packet-level NALs (not the extradata NAL widths,
++  // which are always 16-bit inside the arrays).
++  m_dovi_length_size = (in_extradata[21] & 0x3) + 1;
++  if (m_dovi_length_size != 1 && m_dovi_length_size != 2 && m_dovi_length_size != 4)
++  {
++    CLog::Log(LOGERROR, "CBitstreamConverter::BuildDoViAnnexbExtradataHEVC invalid "
++                        "length_size=%d", m_dovi_length_size);
++    return false;
++  }
++
++  const uint8_t *p   = in_extradata + 22; // numOfArrays
++  const uint8_t *end = in_extradata + in_extrasize;
++  if (p >= end)
++    return false;
++
++  uint8_t array_nb = *p++;
++  static const uint8_t nalu_header[4] = {0, 0, 0, 1};
++
++  uint8_t *out = NULL;
++  uint32_t total_size = 0;
++
++  while (array_nb--)
++  {
++    if (p + 3 > end) { av_free(out); return false; }
++    /* uint8_t array_completeness = (*p >> 7) & 1; */
++    /* uint8_t nal_type = *p & 0x3f; */
++    p += 1;
++    uint16_t unit_nb = (p[0] << 8) | p[1];
++    p += 2;
++
++    while (unit_nb--)
++    {
++      if (p + 2 > end) { av_free(out); return false; }
++      uint16_t unit_size = (p[0] << 8) | p[1];
++      p += 2;
++      if (p + unit_size > end) { av_free(out); return false; }
++
++      uint32_t new_size = total_size + 4 + unit_size;
++      if (new_size > (uint32_t)(INT_MAX - AV_INPUT_BUFFER_PADDING_SIZE))
++      {
++        av_free(out);
++        return false;
++      }
++      void *tmp = av_realloc(out, new_size + AV_INPUT_BUFFER_PADDING_SIZE);
++      if (!tmp) { av_free(out); return false; }
++      out = (uint8_t*)tmp;
++
++      memcpy(out + total_size, nalu_header, 4);
++      memcpy(out + total_size + 4, p, unit_size);
++      total_size = new_size;
++      p += unit_size;
++    }
++  }
++
++  if (!out || total_size == 0)
++    return false;
++
++  memset(out + total_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
++
++  m_extraData = FFmpegExtraData(out, total_size);
++  av_free(out);
++
++  CLog::Log(LOGINFO, "CBitstreamConverter::BuildDoViAnnexbExtradataHEVC built %u bytes "
++                     "of AnnexB extradata (length_size=%u)",
++            total_size, m_dovi_length_size);
++  return true;
++}
++
++// Byte-exact hvcC->AnnexB rewrite for a single packet. Every length-prefixed NAL in
++// pData has its length field replaced with 00 00 00 01; NAL bodies are copied verbatim
++// (including RPU NAL 62, SEI NAL 39/40, VPS/SPS/PPS). No SPS/PPS carousel. No SEI mangle.
++// No RPU transform. Bounds-checked against iSize on every step.
++bool CBitstreamConverter::DoViHvccPassthroughConvert(const uint8_t *pData, int iSize,
++                                                     uint8_t **poutbuf, int *poutbuf_size)
++{
++  *poutbuf = NULL;
++  *poutbuf_size = 0;
++  if (!pData || iSize <= 0)
++    return false;
++
++  const uint8_t ls = m_dovi_length_size ? m_dovi_length_size : 4;
++  if (ls != 1 && ls != 2 && ls != 4)
++    return false;
++
++  // Worst case: every NAL has ls == 4 and maps 1:1 to a 4-byte start code, so output is
++  // exactly iSize. For ls < 4 the output would grow, but hvcC in practice is always 4.
++  const size_t out_cap = (size_t)iSize + (size_t)iSize; // generous headroom for ls<4
++  uint8_t *out = (uint8_t*)av_malloc(out_cap + AV_INPUT_BUFFER_PADDING_SIZE);
++  if (!out)
++    return false;
++
++  size_t out_pos = 0;
++  const uint8_t *p = pData;
++  const uint8_t *end = pData + iSize;
++  static const uint8_t start_code[4] = {0, 0, 0, 1};
++
++  while (p < end)
++  {
++    if (p + ls > end)
++    {
++      CLog::Log(LOGERROR, "CBitstreamConverter::DoViHvccPassthroughConvert truncated "
++                          "length field at offset %ld", (long)(p - pData));
++      av_free(out);
++      return false;
++    }
++    uint32_t nal_size = 0;
++    for (uint8_t i = 0; i < ls; ++i)
++      nal_size = (nal_size << 8) | p[i];
++    p += ls;
++
++    if (nal_size == 0)
++      continue;
++    if (p + nal_size > end)
++    {
++      CLog::Log(LOGERROR, "CBitstreamConverter::DoViHvccPassthroughConvert NAL size %u "
++                          "overruns packet (remaining %ld)",
++                nal_size, (long)(end - p));
++      av_free(out);
++      return false;
++    }
++    if (out_pos + 4 + nal_size > out_cap)
++    {
++      av_free(out);
++      return false;
++    }
++    memcpy(out + out_pos, start_code, 4);
++    out_pos += 4;
++    memcpy(out + out_pos, p, nal_size);
++    out_pos += nal_size;
++    p += nal_size;
++  }
++
++  memset(out + out_pos, 0, AV_INPUT_BUFFER_PADDING_SIZE);
++  *poutbuf = out;
++  *poutbuf_size = (int)out_pos;
++  return true;
++}
++
+ bool CBitstreamConverter::IsIDR(uint8_t unit_type)
+ {
+   switch (m_codec)
+diff --git a/xbmc/utils/BitstreamConverter.h b/xbmc/utils/BitstreamConverter.h
+index 023d8559..cc19229b 100644
+--- a/xbmc/utils/BitstreamConverter.h
++++ b/xbmc/utils/BitstreamConverter.h
+@@ -131,6 +131,10 @@ public:
+   void              ResetStartDecode(void);
+   bool              CanStartDecode() const;
+   void SetConvertDovi(enum DOVIMode value) { m_convert_dovi = value; }
++  // Hint from the caller (e.g. CDVDVideoCodecAmlogic) that this stream's hdrType is
++  // Dolby Vision. Must be called BEFORE Open(). Enables hvcC->AnnexB byte-exact
++  // passthrough so SEI/RPU/SPS-PPS mangling cannot corrupt DV NAL payloads.
++  void SetDoViHvccPassthrough(bool value) { m_dovi_hvcc_passthrough_requested = value; }
+   void SetRemoveDovi(bool value) { m_removeDovi = value; }
+   void SetRemoveHdr10Plus(bool value) { m_removeHdr10Plus = value; }
+   void SetDoviZeroLevel5(bool value) { m_setDoviZeroLevel5 = value; }
+@@ -148,6 +152,12 @@ protected:
+   bool              IsSlice(uint8_t unit_type);
+   bool              BitstreamConvertInitAVC(void *in_extradata, int in_extrasize);
+   bool              BitstreamConvertInitHEVC(void *in_extradata, int in_extrasize);
++  // Dolby Vision hvcC passthrough: build AnnexB-form extradata (VPS/SPS/PPS) once from
++  // hvcC, and perform a byte-exact length-prefix -> start-code rewrite on each packet
++  // with no SEI/RPU/HDR10+ processing and no SPS/PPS carousel.
++  bool              BuildDoViAnnexbExtradataHEVC(const uint8_t *in_extradata, int in_extrasize);
++  bool              DoViHvccPassthroughConvert(const uint8_t *pData, int iSize,
++                                               uint8_t **poutbuf, int *poutbuf_size);
+   bool              BitstreamConvert(uint8_t* pData, int iSize, uint8_t **poutbuf, int *poutbuf_size);
+   static void BitstreamAllocAndCopy(uint8_t** poutbuf,
+                                     int* poutbuf_size,
+@@ -195,4 +205,13 @@ protected:
+   bool              m_removeHdr10Plus;
+   bool              m_setDoviZeroLevel5;
+   enum ELType       m_dovi_el_type;
++
++  // When true, bypass the full HEVC bitstream filter (no SPS/PPS carousel, no SEI / RPU /
++  // HDR10+ processing) and simply rewrite length-prefix fields to 4-byte AnnexB start
++  // codes. Used for HLS fmp4 Dolby Vision where the hvcC-format sample entries already
++  // contain all the metadata the amstream kernel driver needs and any SEI/RPU mangling
++  // breaks DV output on the S905X3.
++  bool              m_dovi_hvcc_passthrough_requested = false;
++  bool              m_dovi_hvcc_passthrough = false;
++  uint8_t           m_dovi_length_size = 4;
+ };
