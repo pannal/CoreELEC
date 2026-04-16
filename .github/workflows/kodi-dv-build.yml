@@ -1,0 +1,82 @@
+name: Build patched Kodi for CoreELEC Amlogic-ne
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [dv-hvcc-passthrough]
+
+jobs:
+  build-kodi:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
+            "$AGENT_TOOLSDIRECTORY" /opt/hostedtoolcache /usr/local/lib/android || true
+          sudo apt-get clean || true
+          df -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            bash bc bison bsdmainutils build-essential ccache cpio flex gawk \
+            gperf lzop libncurses5-dev rsync texinfo unzip u-boot-tools wget \
+            xfonts-utils xmlstarlet xsltproc zip python3 python3-distutils \
+            git patch perl file xz-utils default-jre-headless \
+            libssl-dev libparse-yapp-perl libjson-perl libxml-parser-perl \
+            diffutils gzip tar sed gcc g++ make patchutils rdfind zstd \
+            ca-certificates curl
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-kodi-v2
+          restore-keys: |
+            ccache-kodi-
+
+      - name: Build kodi (single package)
+        env:
+          PROJECT: Amlogic-ce
+          DEVICE: Amlogic-ne
+          ARCH: arm
+          CCACHE_DIR: /home/runner/.ccache
+        run: |
+          export CCACHE_MAXSIZE=6G
+          ccache -M 6G || true
+          ./scripts/build kodi 2>&1 | tail -2000
+
+      - name: Locate kodi build output
+        if: always()
+        run: |
+          echo "=== build dir contents ==="
+          ls -la build.*/ 2>/dev/null | head -20 || true
+          echo "=== kodi .install_pkg tree ==="
+          find build.* -path '*/kodi-*/.install_pkg/usr/lib/kodi*' -type f 2>/dev/null | head -30 || true
+          echo "=== kodi.bin ==="
+          find build.* -name 'kodi.bin' -type f 2>/dev/null || true
+
+      - name: Upload kodi install tree
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kodi-install-arm
+          path: |
+            build.*/kodi-*/.install_pkg/usr/lib/kodi/**
+            build.*/kodi-*/.install_pkg/usr/share/kodi/**
+            build.*/kodi-*/.install_pkg/usr/bin/kodi*
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.*/.build.log
+          if-no-files-found: warn
