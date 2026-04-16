@@ -1,0 +1,13 @@
+Fix statx.c falling off the end when __NR_statx undefined but __ASSUME_STATX
+defined (a header/kernel mismatch that never happens in practice).  GCC 13's
+-Werror=return-type now catches this.  Add __builtin_unreachable to tell the
+compiler the path is dead code.
+
+--- a/sysdeps/unix/sysv/linux/statx.c
++++ b/sysdeps/unix/sysv/linux/statx.c
+@@ -38,4 +38,5 @@ statx (int fd, const char *path, int flags,
+ #ifndef __ASSUME_STATX
+   return statx_generic (fd, path, flags, mask, buf);
+ #endif
++  __builtin_unreachable ();
+ }
