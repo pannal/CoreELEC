@@ -47,9 +47,10 @@ jobs:
           ARCH: arm
           CCACHE_DIR: /home/runner/.ccache
         run: |
+          set -o pipefail
           export CCACHE_MAXSIZE=6G
           ccache -M 6G || true
-          ./scripts/build kodi 2>&1 | tail -2000
+          ./scripts/build kodi 2>&1 | tee build-kodi.log | tail -2000
 
       - name: Locate kodi build output
         if: always()
