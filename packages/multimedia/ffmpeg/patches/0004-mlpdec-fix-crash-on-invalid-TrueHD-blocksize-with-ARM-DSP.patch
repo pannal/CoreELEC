@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pannal <1359593+pannal@users.noreply.github.com>
+Date: Sat, 1 Mar 2026 00:00:00 +0000
+Subject: [PATCH] avcodec/mlpdec: fix crash on invalid TrueHD blocksize with
+ ARM DSP
+
+When read_decoding_params() encounters an invalid blocksize it sets
+s->blocksize = 0 and returns AVERROR_INVALIDDATA.  The current frame
+is skipped via goto next_substr, but params_valid and restart_seen
+remain set.  If the next access unit does not carry a blocksize change
+bit, the stale zero propagates into read_block_data() ->
+filter_channel() -> mlp_filter_channel().
+
+The C implementation handles blocksize == 0 safely (its for-loop
+executes zero iterations), but the ARM assembly in mlpdsp_armv5te.S
+uses a do-while structure (subs / bne) that always executes at least
+once.  With blocksize == 0 the counter wraps to 0xFFFFFFFF, causing
+~4 billion iterations of out-of-bounds reads and writes through the
+state and sample_buffer pointers, resulting in an immediate SIGSEGV.
+
+Fix both layers:
+
+ 1. mlpdec.c -- do not write the invalid value into s->blocksize in
+    the first place; use a local variable and only commit on success,
+    so the previous valid blocksize is preserved for subsequent frames.
+
+ 2. mlpdsp_armv5te.S -- guard the filter loop entry with a blocksize
+    check so that blocksize == 0 is handled correctly regardless of
+    how it is reached.
+
+Signed-off-by: pannal <1359593+pannal@users.noreply.github.com>
+---
+ libavcodec/arm/mlpdsp_armv5te.S | 2 ++
+ libavcodec/mlpdec.c             | 7 ++++---
+ 2 files changed, 6 insertions(+), 3 deletions(-)
+
+diff -Naur a/libavcodec/arm/mlpdsp_armv5te.S b/libavcodec/arm/mlpdsp_armv5te.S
+--- a/libavcodec/arm/mlpdsp_armv5te.S
++++ b/libavcodec/arm/mlpdsp_armv5te.S
+@@ -406,6 +406,8 @@
+         push    {v1-fp,lr}
+         add     v1, sp, #9*4 // point at arguments on stack
+         ldm     v1, {ST0,ST1,I,PSAMP}
++        cmp     I, #0
++        beq     99f
+         cmp     ST1, #-1
+         bne     30f
+         movs    ST2, ST0, lsl #29 // shift is in range 0-15; we want to special-case 0 and 8
+diff -Naur a/libavcodec/mlpdec.c b/libavcodec/mlpdec.c
+--- a/libavcodec/mlpdec.c
++++ b/libavcodec/mlpdec.c
+@@ -899,12 +899,12 @@
+ 
+     if (s->param_presence_flags & PARAM_BLOCKSIZE)
+         if (get_bits1(gbp)) {
+-            s->blocksize = get_bits(gbp, 9);
+-            if (s->blocksize < 8 || s->blocksize > m->access_unit_size) {
++            unsigned int blocksize = get_bits(gbp, 9);
++            if (blocksize < 8 || blocksize > m->access_unit_size) {
+                 av_log(m->avctx, AV_LOG_ERROR, "Invalid blocksize.\n");
+-                s->blocksize = 0;
+                 return AVERROR_INVALIDDATA;
+             }
++            s->blocksize = blocksize;
+         }
+ 
+     if (s->param_presence_flags & PARAM_MATRIX)

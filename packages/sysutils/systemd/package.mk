@@ -250,6 +250,7 @@ post_makeinstall_target() {
   ln -sf /storage/.config/modules-load.d ${INSTALL}/etc/modules-load.d
   ln -sf /storage/.config/logind.conf.d ${INSTALL}/etc/systemd/logind.conf.d
   ln -sf /storage/.config/sleep.conf.d ${INSTALL}/etc/systemd/sleep.conf.d
+  ln -sf /storage/.config/system.conf.d ${INSTALL}/etc/systemd/system.conf.d
   ln -sf /storage/.config/timesyncd.conf.d ${INSTALL}/etc/systemd/timesyncd.conf.d
   safe_remove ${INSTALL}/etc/sysctl.d
   ln -sf /storage/.config/sysctl.d ${INSTALL}/etc/sysctl.d

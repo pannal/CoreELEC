@@ -1,0 +1,76 @@
+--- a/libavcodec/pgssubdec.c
++++ b/libavcodec/pgssubdec.c
+@@ -39,6 +39,13 @@
+ #define MAX_EPOCH_OBJECTS  64  // Max 64 allowed per PGS epoch
+ #define MAX_OBJECT_REFS    2   // Max objects per display set
+
++enum PGSMatrixMode {
++    PGS_MATRIX_AUTO = 0,
++    PGS_MATRIX_BT601,
++    PGS_MATRIX_BT709,
++    PGS_MATRIX_BT2020,
++};
++
+ enum SegmentType {
+     PALETTE_SEGMENT      = 0x14,
+     OBJECT_SEGMENT       = 0x15,
+@@ -97,6 +104,7 @@
+     PGSSubPalettes     palettes;
+     PGSSubObjects      objects;
+     int forced_subs_only;
++    int pgs_matrix;
+ } PGSSubContext;
+
+ static void flush_cache(AVCodecContext *avctx)
+@@ -358,11 +366,36 @@
+         cb        = bytestream_get_byte(&buf);
+         alpha     = bytestream_get_byte(&buf);
+
+-        /* Default to BT.709 colorspace. In case of <= 576 height use BT.601 */
+-        if (avctx->height <= 0 || avctx->height > 576) {
+-            YUV_TO_RGB1_CCIR_BT709(cb, cr);
++        /* PGS palettes are YCbCr + alpha. */
++        cb -= 128;
++        cr -= 128;
++
++        int use_mode = ctx->pgs_matrix;
++        if (use_mode == PGS_MATRIX_AUTO) {
++            /* Default to BT.709 colorspace. In case of <= 576 height use BT.601 */
++            use_mode = (avctx->height <= 0 || avctx->height > 576)
++                       ? PGS_MATRIX_BT709
++                       : PGS_MATRIX_BT601;
++        }
++
++        if (use_mode == PGS_MATRIX_BT2020) {
++            /* BT.2020 (non-constant luminance) */
++            r_add = ONE_HALF + FIX(1.4746  * 255.0 / 224.0) * cr;
++            g_add = ONE_HALF - FIX(0.16455 * 255.0 / 224.0) * cb
++                             - FIX(0.57135 * 255.0 / 224.0) * cr;
++            b_add = ONE_HALF + FIX(1.8814  * 255.0 / 224.0) * cb;
++        } else if (use_mode == PGS_MATRIX_BT709) {
++            /* BT.709 */
++            r_add = ONE_HALF + FIX(1.5748 * 255.0 / 224.0) * cr;
++            g_add = ONE_HALF - FIX(0.1873 * 255.0 / 224.0) * cb
++                             - FIX(0.4681 * 255.0 / 224.0) * cr;
++            b_add = ONE_HALF + FIX(1.8556 * 255.0 / 224.0) * cb;
+         } else {
+-            YUV_TO_RGB1_CCIR(cb, cr);
++            /* BT.601 */
++            r_add = ONE_HALF + FIX(1.4020   * 255.0 / 224.0) * cr;
++            g_add = ONE_HALF - FIX(0.344136 * 255.0 / 224.0) * cb
++                             - FIX(0.714136 * 255.0 / 224.0) * cr;
++            b_add = ONE_HALF + FIX(1.7720   * 255.0 / 224.0) * cb;
+         }
+
+         YUV_TO_RGB2_CCIR(r, g, b, y);
+@@ -680,6 +713,11 @@
+ #define SD AV_OPT_FLAG_SUBTITLE_PARAM | AV_OPT_FLAG_DECODING_PARAM
+ static const AVOption options[] = {
+     {"forced_subs_only", "Only show forced subtitles", OFFSET(forced_subs_only), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, SD},
++    {"pgs_matrix", "PGS palette YCbCr->RGB matrix", OFFSET(pgs_matrix), AV_OPT_TYPE_INT, {.i64 = PGS_MATRIX_AUTO}, PGS_MATRIX_AUTO, PGS_MATRIX_BT2020, SD, "pgs_matrix"},
++    {"auto", "Auto-select matrix (BT.709/BT.601 heuristic)", 0, AV_OPT_TYPE_CONST, {.i64 = PGS_MATRIX_AUTO}, 0, 0, SD, "pgs_matrix"},
++    {"bt601", "Use BT.601 matrix", 0, AV_OPT_TYPE_CONST, {.i64 = PGS_MATRIX_BT601}, 0, 0, SD, "pgs_matrix"},
++    {"bt709", "Use BT.709 matrix", 0, AV_OPT_TYPE_CONST, {.i64 = PGS_MATRIX_BT709}, 0, 0, SD, "pgs_matrix"},
++    {"bt2020", "Use BT.2020 matrix", 0, AV_OPT_TYPE_CONST, {.i64 = PGS_MATRIX_BT2020}, 0, 0, SD, "pgs_matrix"},
+     { NULL },
+ };

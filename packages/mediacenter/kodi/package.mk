@@ -427,6 +427,9 @@ post_makeinstall_target() {
   if [ -n "${DISTRO_PKG_SETTINGS}" ]; then
     xmlstarlet ed -L --subnode "/addons" -t elem -n "addon" -v "${DISTRO_PKG_SETTINGS_ID}" ${ADDON_MANIFEST}
   fi
+  if [ -d "${INSTALL}/usr/share/kodi/addons/repository.dontpanic" ]; then
+    xmlstarlet ed -L --subnode "/addons" -t elem -n "addon" -v "repository.dontpanic" ${ADDON_MANIFEST}
+  fi
 
   if [ "${DRIVER_ADDONS_SUPPORT}" = "yes" ]; then
     xmlstarlet ed -L --subnode "/addons" -t elem -n "addon" -v "script.program.driverselect" ${ADDON_MANIFEST}
