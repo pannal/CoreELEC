@@ -3,8 +3,9 @@
 #
 # Rebuilding the prebuilt tarball:
 #
-# The default path uses a pre-compiled tarball. To rebuild (e.g. after
-# upgrading to a new libdovi version or building from unreleased main):
+# The default path builds from source. To rebuild a pre-compiled tarball
+# (e.g. after upgrading to a new libdovi version or building from
+# unreleased main):
 #
 #   CE_TOOLCHAIN="<CE_BUILD>/build.CoreELEC-Amlogic-ng.arm-21/toolchain"
 #   CE_CC="${CE_TOOLCHAIN}/bin/armv8a-libreelec-linux-gnueabihf-gcc"
@@ -26,7 +27,7 @@
 #     --profile release --prefix /usr --destdir /tmp/libdovi-install
 #
 #   # Package with required prefix (must match libdovi-${ARCH}-${PKG_VERSION}):
-#   VER=3.3.3  # match PKG_VERSION below
+#   VER=3.3.2  # match PKG_VERSION below
 #   mkdir -p /tmp/libdovi-pkg/libdovi-arm-${VER}
 #   cp -a /tmp/libdovi-install/usr /tmp/libdovi-pkg/libdovi-arm-${VER}/
 #   tar cJf libdovi-arm-${VER}.tar.xz -C /tmp/libdovi-pkg libdovi-arm-${VER}
@@ -40,12 +41,14 @@
 #   # Update PKG_SHA256 for "arm" below with the sha256 value
 
 PKG_NAME="libdovi"
-PKG_VERSION="3.3.3"
+PKG_VERSION="3.3.2"
 PKG_SITE="https://github.com/quietvoid/dovi_tool"
 PKG_DEPENDS_TARGET="toolchain"
+: ${BUILD_FROM_SRC:="yes"}
 if [ "${BUILD_FROM_SRC}" = "yes" ]; then
   PKG_SHA256="8ccb1922d7dbb57bc4f2c15c10b90c462f7a5f292efe317c116db923728dd3f1"
   PKG_URL="https://github.com/quietvoid/dovi_tool/archive/${PKG_NAME}-${PKG_VERSION}.tar.gz"
+  PKG_SOURCE_DIR="dovi_tool-${PKG_NAME}-${PKG_VERSION}"
   PKG_DEPENDS_TARGET+=" cargo-c:host"
 else
   case "${TARGET_ARCH}" in
