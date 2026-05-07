@@ -292,7 +292,7 @@ class BuildProcess(threading.Thread):
         returncode = 1
         with RusagePopen(run_args, cwd=ROOT,
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                         universal_newlines=True, shell=False, parent=self, start_new_session=True,
+                         universal_newlines=True, shell=False, start_new_session=True,
                          bufsize=1) as process:
             self.child = process
             logfile_handle = None
