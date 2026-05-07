@@ -11,10 +11,14 @@ PKG_DEPENDS_HOST="cargo:host"
 PKG_LONGDESC="Use Cargo-c to build and install C-compatible libraries"
 PKG_TOOLCHAIN="manual"
 
+pre_make_host() {
+  cp -f ${PKG_DIR}/Cargo.lock ${PKG_BUILD}/Cargo.lock
+}
+
 make_host() {
-  cargo build --release --manifest-path ${PKG_BUILD}/Cargo.toml
+  cargo build --release --locked --manifest-path ${PKG_BUILD}/Cargo.toml
 }
 
 makeinstall_host() {
-  cargo install --profile release --path ${PKG_BUILD}
+  cargo install --profile release --locked --path ${PKG_BUILD}
 }
