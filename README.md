@@ -1,3 +1,5 @@
+IMPORTANT: THIS IS A FORK OF p3i MADE BY pannal - https://github.com/pannal/CoreELEC/releases DO NOT BUILD OR PR AGAINST, THISIS FOR PERSONAL DEV ONLY
+
 # CoreELEC p3i
 
 This is a custom build based on the great work Jamal did with his [U3k line of CE builds](https://github.com/CE-Repo) and by proxy, [CPM](https://github.com/cpm-code), [avdvplus](https://github.com/avdvplus/Builds), and everyone else involved. p3i aims to continue the lineage of U3k by:
@@ -15,17 +17,16 @@ It's directly forked off of [U3k B11](https://github.com/CE-Repo/xbmc/releases/t
 
 ## Issues & Support
 
-* [Issue-tracker](https://github.com/pannal/CoreELEC/issues)
-* [Discussions](https://github.com/pannal/CoreELEC/discussions)
+* [Issue-tracker](https://github.com/samtheruby/CoreELEC/issues)
+* [Discussions](https://github.com/samtheruby/CoreELEC/discussions)
 * **Discord:** [TRaSH-Guides #ugoos-mediaplayer and #support channels](https://trash-guides.info/discord)
 
 ## Links
-As my Github profile isn't public at the moment, here are the significant source-code repository links for you, if you're interested:
-* [Releases](https://github.com/pannal/CoreELEC/releases)
-* [XBMC/Kodi base repository](https://github.com/pannal/xbmc/)
-* [CoreELEC Settings Addon repository](https://github.com/pannal/service.coreelec.settings)
-* [Linux Amlogic repository](https://github.com/pannal/linux-amlogic)
-* [Amlogic media modules repository](https://github.com/pannal/media_modules-aml)
+* [Releases](https://github.com/samtheruby/CoreELEC/releases)
+* [XBMC/Kodi base repository](https://github.com/samtheruby/xbmc/)
+* [CoreELEC Settings Addon repository](https://github.com/samtheruby/service.coreelec.settings)
+* [Linux Amlogic repository](https://github.com/samtheruby/linux-amlogic)
+* [Amlogic media modules repository](https://github.com/samtheruby/media_modules-aml)
 
 ## Thanks
 Massive thanks to all the testers, especially the ones from [TRaSH-Guides #ugoos-mediaplayer](https://trash-guides.info/discord), who initially spiked my interest in continuing Jamal's work by exposing potential long standing UI issues in Kodi.
