@@ -1,4 +1,4 @@
-IMPORTANT: THIS IS A FORK OF p3i MADE BY pannal - https://github.com/pannal/CoreELEC/releases DO NOT BUILD OR PR AGAINST, THISIS FOR PERSONAL DEV ONLY
+IMPORTANT: THIS IS A FORK OF p3i MADE BY pannal - https://github.com/pannal/CoreELEC/releases DO NOT BUILD OR PR AGAINST, THIS IS FOR PERSONAL DEV ONLY
 
 # CoreELEC p3i
 
