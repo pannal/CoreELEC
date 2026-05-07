@@ -17,12 +17,16 @@ start_multithread_build() {
   [ "${THREADCOUNT}" = "0" ] && ulimit -n ${ULIMITN:-10240}
 
   # create a single log file by default for a single threaded build (or the builder is a masochist)
-  if [ ${THREADCOUNT} -eq 1 -a "${ONELOG,,}" != "no" ] || [ "${ONELOG,,}" = "yes" ]; then
+  if [ "${LIVE_OUTPUT}" = "yes" -o "${MTLIVEOUTPUT}" = "yes" ]; then
+    mkdir -p "${THREAD_CONTROL}/logs"
+    buildopts+=" --log-burst"
+  elif [ ${THREADCOUNT} -eq 1 -a "${ONELOG,,}" != "no" ] || [ "${ONELOG,,}" = "yes" ]; then
     buildopts+=" --no-log-burst"
   else
     mkdir -p "${THREAD_CONTROL}/logs"
     buildopts+=" --log-burst"
   fi
+  [ "${LIVE_OUTPUT}" = "yes" -o "${MTLIVEOUTPUT}" = "yes" ] && buildopts+=" --live-output"
   buildopts+=" --log-combine ${LOGCOMBINE:-always}"
 
   [ "${AUTOREMOVE}" = "yes" ] && buildopts+=" --auto-remove"

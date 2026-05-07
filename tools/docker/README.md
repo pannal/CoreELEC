@@ -32,6 +32,12 @@ Use `--env`, `-e` or `--env-file` to pass environment variables used by the Core
 docker run --rm -v `pwd`:/build -w /build -it -e PROJECT=Amlogic-ce -e DEVICE=Amlogic-ng -e ARCH=arm coreelec make image
 ```
 
+To stream job output live from the multithreaded builder, add `LIVE_OUTPUT=yes`:
+
+```
+docker run --rm -v `pwd`:/build -w /build -it -e PROJECT=Amlogic-ce -e DEVICE=Amlogic-ng -e ARCH=arm -e LIVE_OUTPUT=yes coreelec make image
+```
+
 See https://docs.docker.com/engine/reference/commandline/run/ for details on `docker run` usage.
 
 Note: `dockerd` is set to send all its logs to journald using the setting `--log-driver=journald` (so if you don't set the `--log-driver none` for your `docker run` these logs will be sent through to your log.

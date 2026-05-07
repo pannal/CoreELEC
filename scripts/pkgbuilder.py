@@ -15,6 +15,8 @@ import queue
 import subprocess
 import multiprocessing
 import signal
+import errno
+import shutil
 import fcntl, termios, struct
 
 # Ensure we can output any old crap to stdout and stderr
@@ -250,7 +252,7 @@ class Generator:
                 self.delRefCounts(p)
 
 class BuildProcess(threading.Thread):
-    def __init__(self, slot, maxslot, jobtotal, haltonerror, work, complete):
+    def __init__(self, slot, maxslot, jobtotal, haltonerror, work, complete, live_output=False, oprint=None):
         threading.Thread.__init__(self, daemon=True)
 
         self.slot = slot
@@ -259,6 +261,8 @@ class BuildProcess(threading.Thread):
         self.haltonerror = haltonerror
         self.work = work
         self.complete = complete
+        self.live_output = live_output
+        self.oprint = oprint
 
         self.active = False
 
@@ -278,6 +282,38 @@ class BuildProcess(threading.Thread):
 
     def isActive(self):
         return self.active == True
+
+    def run_streaming(self, args, logfile=None, mode="w"):
+        run_args = args
+        stdbuf = shutil.which("stdbuf")
+        if stdbuf:
+            run_args = [stdbuf, "-oL", "-eL"] + run_args
+
+        returncode = 1
+        with RusagePopen(run_args, cwd=ROOT,
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         universal_newlines=True, shell=False, parent=self, start_new_session=True,
+                         bufsize=1) as process:
+            self.child = process
+            logfile_handle = None
+            try:
+                if logfile:
+                    logfile_handle = open(logfile, mode)
+                try:
+                    for line in iter(process.stdout.readline, ""):
+                        if logfile_handle:
+                            logfile_handle.write(line)
+                            logfile_handle.flush()
+                        if self.oprint:
+                            self.oprint(line, end="")
+                    returncode = process.wait()
+                finally:
+                    if logfile_handle:
+                        logfile_handle.close()
+            finally:
+                self.child = None
+
+        return process, returncode
 
     def run(self):
         while not self.stopping:
@@ -314,9 +350,13 @@ class BuildProcess(threading.Thread):
                        job["task"], job["name"], failedinfo]
 
         job["start"] = time.time()
+        job["cmdproc"] = None
         returncode = 1
         try:
-            if job["logfile"]:
+            if self.live_output:
+                cmd, returncode = self.run_streaming(job["args"], job["logfile"])
+                job["cmdproc"] = cmd
+            elif job["logfile"]:
                 with open(job["logfile"], "w") as logfile:
                     cmd = rusage_run(job["args"], cwd=ROOT,
                                      stdin=subprocess.PIPE, stdout=logfile, stderr=subprocess.STDOUT,
@@ -355,7 +395,7 @@ class BuildProcess(threading.Thread):
 class Builder:
     def __init__(self, maxthreadcount, inputfilename, jobglog, loadstats, stats_interval, \
                  haltonerror=True, failimmediately=True, log_burst=True, log_combine="always", \
-                 bookends=True, autoremove=False, colors=False, progress=False, debug=False, verbose=False):
+                 bookends=True, autoremove=False, colors=False, progress=False, debug=False, verbose=False, live_output=False):
         if inputfilename == "-":
             plan = json.load(sys.stdin)
         else:
@@ -396,10 +436,12 @@ class Builder:
         self.verbose = verbose
         self.bookends = bookends
         self.autoremove = autoremove
+        self.live_output = live_output
 
         self.stdout_dirty = False
         self.stderr_dirty = False
         self.progress_dirty = False
+        self.output_lock = threading.RLock()
 
         self.joblogfile = None
         self.loadstatsfile = None
@@ -413,7 +455,8 @@ class Builder:
         # Init all processes
         self.processes = []
         for i in range(1, self.threadcount + 1):
-            self.processes.append(BuildProcess(i, self.threadcount, self.jobtotal, self.haltonerror, self.work, self.complete))
+            self.processes.append(BuildProcess(i, self.threadcount, self.jobtotal, self.haltonerror, self.work, self.complete,
+                                                live_output=self.live_output, oprint=self.oprint))
 
         # work and completion sequences
         self.wseq = 0
@@ -640,9 +683,10 @@ class Builder:
             self.progress_dirty = True
 
     def clearProgress(self):
-        if self.progress and self.progress_dirty:
-            self.progress_dirty = False
-            self.eprint("\033[0J", end="")
+        with self.output_lock:
+            if self.progress and self.progress_dirty:
+                self.progress_dirty = False
+                self.eprint("\033[0J", end="")
 
     # Output completion info, and links to any relevant logs
     def displayJobStatus(self, job):
@@ -664,6 +708,9 @@ class Builder:
 
     # If configured, send output for a job (either a logfile, or captured stdout) to stdout
     def processJobOutput(self, job):
+        if self.live_output:
+            return
+
         log_processed = False
         log_size = 0
         log_start = time.time()
@@ -739,7 +786,9 @@ class Builder:
             for pkg_name in self.generator.getPackagesToRemove(job):
                 DEBUG("Removing Pkg: %s" % pkg_name)
                 args = ["%s/%s/autoremove" % (ROOT, SCRIPTS), pkg_name]
-                if job["logfile"]:
+                if self.live_output:
+                    self.run_streaming(args, job["logfile"], mode="a")
+                elif job["logfile"]:
                     with open(job["logfile"], "a") as logfile:
                         cmd = subprocess.run(args, cwd=ROOT,
                                              stdin=subprocess.PIPE, stdout=logfile, stderr=subprocess.STDOUT,
@@ -767,42 +816,46 @@ class Builder:
             self.processes = None
 
     def cleanup(self):
-        self.clearProgress()
-        self.flush()
-        if self.original_resize_handler != None:
-            signal.signal(signal.SIGWINCH, self.original_resize_handler)
+        with self.output_lock:
+            self.clearProgress()
+            self.flush()
+            if self.original_resize_handler != None:
+                signal.signal(signal.SIGWINCH, self.original_resize_handler)
         self.stopProcesses()
 
     def flush(self):
-        if self.stdout_dirty:
-            sys.stdout.flush()
-            self.stdout_dirty = False
+        with self.output_lock:
+            if self.stdout_dirty:
+                sys.stdout.flush()
+                self.stdout_dirty = False
 
-        if self.stderr_dirty:
-            sys.stderr.flush()
-            self.stderr_dirty = False
+            if self.stderr_dirty:
+                sys.stderr.flush()
+                self.stderr_dirty = False
 
     def oprint(self, *args, flush=False, **kwargs):
-        if self.progress_dirty:
-            self.clearProgress()
+        with self.output_lock:
+            if self.progress_dirty:
+                self.clearProgress()
 
-        if self.stderr_dirty:
-            sys.stderr.flush()
-            self.stderr_dirty = False
+            if self.stderr_dirty:
+                sys.stderr.flush()
+                self.stderr_dirty = False
 
-        print(*args, **kwargs, file=sys.stdout, flush=flush)
-        self.stdout_dirty = not flush
+            print(*args, **kwargs, file=sys.stdout, flush=flush)
+            self.stdout_dirty = not flush
 
     def eprint(self, *args, flush=False, isProgress=False, **kwargs):
-        if self.stdout_dirty:
-            sys.stdout.flush()
-            self.stdout_dirty = False
+        with self.output_lock:
+            if self.stdout_dirty:
+                sys.stdout.flush()
+                self.stdout_dirty = False
 
-        if not isProgress and self.progress_dirty:
-            self.clearProgress()
+            if not isProgress and self.progress_dirty:
+                self.clearProgress()
 
-        print(*args, **kwargs, file=sys.stderr, flush=flush)
-        self.stderr_dirty = not flush
+            print(*args, **kwargs, file=sys.stderr, flush=flush)
+            self.stderr_dirty = not flush
 
     def getLoad(self):
         return open("/proc/loadavg", "r").readline().split()
@@ -884,6 +937,9 @@ parser.add_argument("--progress", action="store_true", default=False, \
 parser.add_argument("--verbose", action="store_true", default=False, \
                     help="Output verbose information to stderr.")
 
+parser.add_argument("--live-output", action="store_true", default=False, \
+                    help="Stream job output live instead of replaying it after completion.")
+
 parser.add_argument("--debug", action="store_true", default=False, \
                     help="Enable debug information.")
 
@@ -913,7 +969,7 @@ try:
                       haltonerror=args.halt_on_error, failimmediately=args.fail_immediately, \
                       log_burst=args.log_burst, log_combine=args.log_combine, bookends=args.with_bookends, \
                       autoremove=args.auto_remove, colors=args.colors, progress=args.progress, \
-                      debug=args.debug, verbose=args.verbose)
+                      debug=args.debug, verbose=args.verbose, live_output=args.live_output)
 
     result = builder.build()
 
@@ -929,4 +985,3 @@ except (KeyboardInterrupt, SystemExit) as e:
         sys.exit(int(str(e)))
     else:
         sys.exit(1)
-
