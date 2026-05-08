@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: CoreELEC <none@none>
+Date: Thu, 7 May 2026 20:00:00 +0000
+Subject: [PATCH] include sys/stat for stat and S_ISBLK
+
+device-info.c uses stat() and S_ISBLK(), but does not include
+sys/stat.h. Newer toolchains reject the resulting implicit declarations.
+---
+ src/device-info.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/device-info.c b/src/device-info.c
+index 1111111..2222222 100644
+--- a/src/device-info.c
++++ b/src/device-info.c
+@@ -3,6 +3,7 @@
+ ************************************************************************** */
+ 
+ #include "device-info.h"
++#include <sys/stat.h>
+ 
+ static char *
+ _dupv8 (const char *s)
+-- 
+2.43.0
+
