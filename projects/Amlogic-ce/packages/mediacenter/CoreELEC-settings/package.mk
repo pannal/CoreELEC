@@ -6,10 +6,17 @@ PKG_VERSION="coreelec-21-ng"
 PKG_LICENSE="GPL"
 PKG_SITE="https://coreelec.org"
 # Using local service.coreelec.settings checkout for development
-PKG_URL="file://${ROOT}/sources/service.coreelec.settings/service.coreelec.settings-local"
+PKG_URL="file://${ROOT}/../service.coreelec.settings"
 PKG_SOURCE_NAME="service.coreelec.settings-local"
 PKG_DEPENDS_TARGET="toolchain Python3 connman dbussy"
 PKG_LONGDESC="CoreELEC-settings: is a settings dialog for CoreELEC"
+
+pre_unpack() {
+  local source_path="${ROOT}/../service.coreelec.settings"
+
+  [ "${PKG_URL}" = "file://${source_path}" ] || die "${PKG_NAME}: expected local source ${source_path}, got ${PKG_URL}"
+  [ -d "${source_path}" ] || die "${PKG_NAME}: local source ${source_path} not found"
+}
 
 PKG_MAKE_OPTS_TARGET="DISTRONAME=${DISTRONAME} ADDON_VERSION=${ADDON_VERSION} ROOT_PASSWORD=${ROOT_PASSWORD}"
 

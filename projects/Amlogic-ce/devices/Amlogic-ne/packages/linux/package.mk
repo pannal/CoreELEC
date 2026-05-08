@@ -8,7 +8,9 @@ PKG_VERSION="a3aaaa5b0e646dcd8cf4a23d6b8d66a5292840eb"
 PKG_SHA256=""
 PKG_LICENSE="GPL"
 PKG_SITE="http://www.kernel.org"
-PKG_URL="https://github.com/CoreELEC/linux-amlogic/archive/${PKG_VERSION}.tar.gz"
+# Using local linux-amlogic checkout for development
+PKG_URL="file://${ROOT}/../linux-amlogic"
+PKG_SOURCE_NAME="linux-amlogic-local"
 PKG_GIT_BRANCH="amlogic-5.4.210"
 PKG_BUILD_PERF="no"
 PKG_DEPENDS_HOST="ccache:host rsync:host openssl:host"
@@ -22,6 +24,13 @@ PKG_STAMP="${KERNEL_TARGET} ${KERNEL_MAKE_EXTRACMD} ${KERNEL_UBOOT_EXTRA_TARGET}
 PKG_PATCH_DIRS="${LINUX}"
 
 PKG_KERNEL_CFG_FILE=$(kernel_config_path) || die
+
+pre_unpack() {
+  local source_path="${ROOT}/../linux-amlogic"
+
+  [ "${PKG_URL}" = "file://${source_path}" ] || die "${PKG_NAME}: expected local source ${source_path}, got ${PKG_URL}"
+  [ -d "${source_path}" ] || die "${PKG_NAME}: local source ${source_path} not found"
+}
 
 if [ -n "${KERNEL_TOOLCHAIN}" ]; then
   PKG_DEPENDS_HOST="${PKG_DEPENDS_HOST} gcc-${KERNEL_TOOLCHAIN}:host"

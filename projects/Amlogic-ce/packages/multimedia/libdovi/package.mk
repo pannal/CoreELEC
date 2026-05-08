@@ -27,7 +27,7 @@
 #     --profile release --prefix /usr --destdir /tmp/libdovi-install
 #
 #   # Package with required prefix (must match libdovi-${ARCH}-${PKG_VERSION}):
-#   VER=3.3.2  # match PKG_VERSION below
+#   VER=3.3.3  # match PKG_VERSION below
 #   mkdir -p /tmp/libdovi-pkg/libdovi-arm-${VER}
 #   cp -a /tmp/libdovi-install/usr /tmp/libdovi-pkg/libdovi-arm-${VER}/
 #   tar cJf libdovi-arm-${VER}.tar.xz -C /tmp/libdovi-pkg libdovi-arm-${VER}
@@ -41,14 +41,15 @@
 #   # Update PKG_SHA256 for "arm" below with the sha256 value
 
 PKG_NAME="libdovi"
-PKG_VERSION="3.3.2"
+PKG_VERSION="3.3.3"
 PKG_SITE="https://github.com/quietvoid/dovi_tool"
 PKG_DEPENDS_TARGET="toolchain"
 : ${BUILD_FROM_SRC:="yes"}
 if [ "${BUILD_FROM_SRC}" = "yes" ]; then
-  PKG_SHA256="8ccb1922d7dbb57bc4f2c15c10b90c462f7a5f292efe317c116db923728dd3f1"
-  PKG_URL="https://github.com/quietvoid/dovi_tool/archive/${PKG_NAME}-${PKG_VERSION}.tar.gz"
-  PKG_SOURCE_DIR="dovi_tool-${PKG_NAME}-${PKG_VERSION}"
+  PKG_SOURCE_NAME="${PKG_NAME}-${PKG_VERSION}.tar.gz"
+  PKG_SHA256="63e42dc875eb94160cab5e3e76375efe8ce69f742260b3b26625dc593f6256d4"
+  PKG_URL="file://${ROOT}/sources/libdovi/${PKG_SOURCE_NAME}"
+  PKG_SOURCE_DIR="libdovi-${PKG_VERSION}"
   PKG_DEPENDS_TARGET+=" cargo-c:host"
 else
   case "${TARGET_ARCH}" in
@@ -68,9 +69,27 @@ PKG_TOOLCHAIN="manual"
 
 if [ "${BUILD_FROM_SRC}" = "yes" ]; then
 pre_make_target() {
+  local target_env target_env_lc rustc_wrapper
+
+  target_env="$(printf '%s' "${TARGET_NAME}" | tr '[:lower:]-' '[:upper:]_')"
+  target_env_lc="$(printf '%s' "${TARGET_NAME}" | tr '-' '_')"
+
+  eval "export CC_${target_env_lc}=\"${TARGET_CC}\""
+  eval "export AR_${target_env_lc}=\"${TARGET_AR}\""
+  eval "export CARGO_TARGET_${target_env}_LINKER=\"${TARGET_CC}\""
+
+  rustc_wrapper="${PKG_BUILD}/rustc-wrapper"
+  cat > "${rustc_wrapper}" <<EOF
+#!/bin/sh
+exec env RUSTC_BOOTSTRAP=1 "${TOOLCHAIN}/bin/rustc" -Zunstable-options "\$@"
+EOF
+  chmod +x "${rustc_wrapper}"
+  export RUSTC="${rustc_wrapper}"
+
   CARGO_BASE_OPTS="--manifest-path ${PKG_BUILD}/dolby_vision/Cargo.toml \
                    --target ${TARGET_NAME}"
-  CARGO_BUILD_OPTS="--library-type staticlib \
+  CARGO_BUILD_OPTS="--features serde \
+                    --library-type staticlib \
                     --profile release \
                     --prefix /usr
                     ${CARGO_BASE_OPTS}"

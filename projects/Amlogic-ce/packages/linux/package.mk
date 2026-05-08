@@ -19,7 +19,7 @@ case "$LINUX" in
   amlogic-4.9)
     PKG_VERSION="amlogic-4.9-20"
     # Using local linux-amlogic checkout for development
-    PKG_URL="file://${HOME}/linux-amlogic-local"
+    PKG_URL="file://${ROOT}/../linux-amlogic"
     PKG_SOURCE_NAME="linux-amlogic-local"
     PKG_DEPENDS_TARGET="$PKG_DEPENDS_TARGET aml-dtbtools:host"
     PKG_BUILD_PERF="no"
@@ -28,6 +28,13 @@ case "$LINUX" in
 esac
 
 PKG_KERNEL_CFG_FILE=$(kernel_config_path) || die
+
+pre_unpack() {
+  local source_path="${ROOT}/../linux-amlogic"
+
+  [ "${PKG_URL}" = "file://${source_path}" ] || die "${PKG_NAME}: expected local source ${source_path}, got ${PKG_URL}"
+  [ -d "${source_path}" ] || die "${PKG_NAME}: local source ${source_path} not found"
+}
 
 if [ -n "$KERNEL_TOOLCHAIN" ]; then
   PKG_DEPENDS_HOST="$PKG_DEPENDS_HOST gcc-$KERNEL_TOOLCHAIN:host"

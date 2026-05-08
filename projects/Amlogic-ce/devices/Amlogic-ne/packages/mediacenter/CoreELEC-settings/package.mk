@@ -6,9 +6,18 @@ PKG_VERSION="a24cd5ad7068e101f8328f0514e2807427d6d6d5"
 PKG_SHA256="121c9f8bd24b2dcf258ade8caed63b32c2dfd8eaa9e42288cc5d01badaf122c0"
 PKG_LICENSE="GPL"
 PKG_SITE="https://coreelec.org"
-PKG_URL="https://github.com/CoreELEC/service.coreelec.settings/archive/${PKG_VERSION}.tar.gz"
+# Using local service.coreelec.settings checkout for development
+PKG_URL="file://${ROOT}/../service.coreelec.settings"
+PKG_SOURCE_NAME="service.coreelec.settings-local"
 PKG_DEPENDS_TARGET="toolchain Python3 connman dbussy"
 PKG_LONGDESC="CoreELEC-settings: is a settings dialog for CoreELEC"
+
+pre_unpack() {
+  local source_path="${ROOT}/../service.coreelec.settings"
+
+  [ "${PKG_URL}" = "file://${source_path}" ] || die "${PKG_NAME}: expected local source ${source_path}, got ${PKG_URL}"
+  [ -d "${source_path}" ] || die "${PKG_NAME}: local source ${source_path} not found"
+}
 
 PKG_MAKE_OPTS_TARGET="DISTRONAME=${DISTRONAME} ADDON_VERSION=${ADDON_VERSION} ROOT_PASSWORD=${ROOT_PASSWORD}"
 

@@ -6,11 +6,20 @@ PKG_VERSION="a387dea216e416f975377152d374557d448093c8"
 PKG_SHA256="873b70f482c4cc993d75073fe6b2744e536f00af946a25bc06e59841b46d3c8e"
 PKG_LICENSE="GPL"
 PKG_SITE="https://coreelec.org"
-PKG_URL="https://github.com/CoreELEC/media_modules-aml/archive/${PKG_VERSION}.tar.gz"
+# Using local media_modules-aml checkout for development
+PKG_URL="file://${ROOT}/../media_modules-aml"
+PKG_SOURCE_NAME="media_modules-aml-local"
 PKG_DEPENDS_TARGET="toolchain linux"
 PKG_NEED_UNPACK="${LINUX_DEPENDS}"
 PKG_LONGDESC="${PKG_NAME}: Linux driver"
 PKG_TOOLCHAIN="manual"
+
+pre_unpack() {
+  local source_path="${ROOT}/../media_modules-aml"
+
+  [ "${PKG_URL}" = "file://${source_path}" ] || die "${PKG_NAME}: expected local source ${source_path}, got ${PKG_URL}"
+  [ -d "${source_path}" ] || die "${PKG_NAME}: local source ${source_path} not found"
+}
 
 pre_make_target() {
   unset LDFLAGS

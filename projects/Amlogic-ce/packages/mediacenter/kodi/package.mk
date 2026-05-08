@@ -8,13 +8,20 @@ PKG_VERSION="aml-4.9-21.3"
 PKG_LICENSE="GPL"
 PKG_SITE="http://www.kodi.tv"
 # Using local xbmc checkout for development
-PKG_URL="file://${ROOT}/sources/kodi/xbmc-local"
+PKG_URL="file://${ROOT}/../xbmc"
 PKG_SOURCE_NAME="xbmc-local"
 PKG_DEPENDS_TARGET="toolchain JsonSchemaBuilder:host TexturePacker:host Python3 zlib systemd lzo pcre swig:host libass curl fontconfig fribidi tinyxml tinyxml2 libjpeg-turbo freetype libcdio taglib libxml2 libxslt rapidjson sqlite ffmpeg crossguid libfmt lirc libfstrcmp flatbuffers:host flatbuffers libudfread spdlog obu_util libdovi"
 PKG_DEPENDS_UNPACK="commons-lang3 commons-text groovy"
 PKG_DEPENDS_HOST="toolchain"
 PKG_LONGDESC="A free and open source cross-platform media player."
 PKG_BUILD_FLAGS="+speed"
+
+pre_unpack() {
+  local source_path="${ROOT}/../xbmc"
+
+  [ "${PKG_URL}" = "file://${source_path}" ] || die "${PKG_NAME}: expected local source ${source_path}, got ${PKG_URL}"
+  [ -d "${source_path}" ] || die "${PKG_NAME}: local source ${source_path} not found"
+}
 
 post_unpack() {
   if [ -f ${DISTRO_DIR}/${DISTRO}/splash/${DEVICE}/splash-1080.png ]; then

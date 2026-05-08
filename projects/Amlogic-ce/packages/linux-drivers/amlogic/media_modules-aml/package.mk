@@ -6,12 +6,19 @@ PKG_VERSION="amlogic-4.9.269"
 PKG_LICENSE="GPL"
 PKG_SITE="https://coreelec.org"
 # Using local media_modules-aml checkout for development
-PKG_URL="file://${ROOT}/sources/media_modules-aml/media_modules-aml-local"
+PKG_URL="file://${ROOT}/../media_modules-aml"
 PKG_SOURCE_NAME="media_modules-aml-local"
 PKG_DEPENDS_TARGET="toolchain linux"
 PKG_NEED_UNPACK="$LINUX_DEPENDS"
 PKG_LONGDESC="$PKG_NAME: Linux driver"
 PKG_TOOLCHAIN="manual"
+
+pre_unpack() {
+  local source_path="${ROOT}/../media_modules-aml"
+
+  [ "${PKG_URL}" = "file://${source_path}" ] || die "${PKG_NAME}: expected local source ${source_path}, got ${PKG_URL}"
+  [ -d "${source_path}" ] || die "${PKG_NAME}: local source ${source_path} not found"
+}
 
 pre_make_target() {
   unset LDFLAGS
