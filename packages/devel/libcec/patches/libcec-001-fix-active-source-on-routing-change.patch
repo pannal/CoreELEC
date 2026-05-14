@@ -1,0 +1,69 @@
+From: CoreELEC
+Subject: [PATCH] Fix HDMI input grab-back when routing changes to external device
+
+When ROUTING_CHANGE or SET_STREAM_PATH points to a device not handled by
+libCEC, mark our own devices as inactive sources. Without this fix,
+m_bActiveSource stays true; when the TV broadcasts REQUEST_ACTIVE_SOURCE
+(~30 seconds after the user switches away), libCEC responds and steals the
+HDMI input back.
+
+Root cause: libcec issue #76, closed upstream as "not planned". Critical
+for Amlogic/AOCEC where SET_STREAM_PATH to a known external device is the
+only signal that the user has switched away.
+
+---
+ src/libcec/devices/CECBusDevice.cpp              |  9 ++++++++-
+ src/libcec/implementations/CECCommandHandler.cpp |  9 +++++++++
+ 2 files changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/src/libcec/devices/CECBusDevice.cpp b/src/libcec/devices/CECBusDevice.cpp
+--- a/src/libcec/devices/CECBusDevice.cpp
++++ b/src/libcec/devices/CECBusDevice.cpp
+@@ -1228,9 +1228,17 @@ void CCECBusDevice::SetActiveRoute(uint16_t iRoute)
+   CCECBusDevice* newRoute = m_processor->GetDeviceByPhysicalAddress(iRoute, true);
+   if (newRoute && newRoute->IsHandledByLibCEC() && (!ActiveSourceSent() || !newRoute->IsActiveSource()))
+   {
+-    // we were made the active source, send notification
++    // routing to our device - activate it
+     newRoute->ActivateSource();
+   }
++  else if (newRoute && !newRoute->IsHandledByLibCEC())
++  {
++    // routing to external device - mark our devices inactive so we don't
++    // respond to REQUEST_ACTIVE_SOURCE and steal the input back
++    CECDEVICEVEC myDevices;
++    map->GetLibCECControlled(myDevices);
++    for (CECDEVICEVEC::iterator it = myDevices.begin(); it != myDevices.end(); it++)
++      (*it)->MarkAsInactiveSource();
++  }
+ }
+
+ void CCECBusDevice::SetStreamPath(uint16_t iNewAddress, uint16_t iOldAddress /* = CEC_INVALID_PHYSICAL_ADDRESS */)
+diff --git a/src/libcec/implementations/CECCommandHandler.cpp b/src/libcec/implementations/CECCommandHandler.cpp
+--- a/src/libcec/implementations/CECCommandHandler.cpp
++++ b/src/libcec/implementations/CECCommandHandler.cpp
+@@ -648,13 +648,22 @@ int CCECCommandHandler::HandleSetStreamPath(const cec_command &command)
+     CCECBusDevice *device = GetDeviceByPhysicalAddress(iStreamAddress);
+     if (device)
+     {
+       if (device->IsHandledByLibCEC())
+       {
+         if (!device->IsActiveSource())
+           device->ActivateSource();
+         else
+         {
+           device->MarkAsActiveSource();
+           device->TransmitActiveSource(true);
+         }
+       }
++      else
++      {
++        // stream path to known external device - deactivate our devices
++        CECDEVICEVEC myDevices;
++        m_processor->GetDevices()->GetLibCECControlled(myDevices);
++        for (CECDEVICEVEC::iterator it = myDevices.begin(); it != myDevices.end(); it++)
++          (*it)->MarkAsInactiveSource();
++      }
+       return COMMAND_HANDLED;
+     }
+     else
