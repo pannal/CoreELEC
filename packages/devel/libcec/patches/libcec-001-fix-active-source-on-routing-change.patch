@@ -37,7 +37,7 @@ diff --git a/src/libcec/devices/CECBusDevice.cpp b/src/libcec/devices/CECBusDevi
 +      (*it)->MarkAsInactiveSource();
 +  }
  }
-
+ 
  void CCECBusDevice::SetStreamPath(uint16_t iNewAddress, uint16_t iOldAddress /* = CEC_INVALID_PHYSICAL_ADDRESS */)
 diff --git a/src/libcec/implementations/CECCommandHandler.cpp b/src/libcec/implementations/CECCommandHandler.cpp
 --- a/src/libcec/implementations/CECCommandHandler.cpp
