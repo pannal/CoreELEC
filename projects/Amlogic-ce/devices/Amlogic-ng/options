@@ -111,7 +111,7 @@
     ADDITIONAL_DRIVERS+=" RTL8192CU RTL8192DU RTL8192EU RTL8188EU RTL8821CU
                         ssv6xxx-aml mt7668-wifi-bt RTL8188FTV-aml RTL8189ES-aml RTL8189FS-aml
                         RTL8723BS-aml RTL8822BS-aml RTL8821CS-aml qca9377-aml
-                        qca6174-aml smartchip"
+                        qca6174-aml smartchip uas"
 
   # additional Firmware to use (dvb-firmware, misc-firmware, wlan-firmware)
   # Space separated list is supported,
@@ -141,7 +141,11 @@
   # additional packages to install:
   # Space separated list is supported,
   # e.g. ADDITIONAL_PACKAGES="PACKAGE1 PACKAGE2"
-    ADDITIONAL_PACKAGES+=" tmate pulseaudio-modules-bt"
+    ADDITIONAL_PACKAGES+=" tmate pulseaudio-modules-bt zram"
+
+  # zram compressed-swap defaults (size in MiB, on/off)
+    ZRAM_SIZE_MB="1024"
+    ZRAM_ENABLED_DEFAULT="yes"
 
   # add OOTB support for IR remote
   # IR_REMOTE_KEYMAPS+=""

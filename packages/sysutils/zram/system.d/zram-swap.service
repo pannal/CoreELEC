@@ -1,0 +1,17 @@
+[Unit]
+Description=Compressed RAM swap (zram)
+DefaultDependencies=false
+Before=swap.target shutdown.target
+Conflicts=shutdown.target
+Wants=swap.target
+ConditionKernelCommandLine=!noswap
+ConditionKernelCommandLine=!installer
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/libreelec/zram-swap start
+ExecStop=/usr/lib/libreelec/zram-swap stop
+RemainAfterExit=yes
+
+[Install]
+WantedBy=basic.target

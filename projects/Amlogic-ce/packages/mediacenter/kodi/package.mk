@@ -445,6 +445,22 @@ post_makeinstall_target() {
     echo "WARNING: Could not fetch Don't Panic repository from pm4k.eu"
   fi
 
+  # Download and install p3i repository from official source
+  # Dynamically fetch the latest version from p3irepo.pm4k.eu
+  P3I_FILE=$(curl -sL https://p3irepo.pm4k.eu | grep -oP 'repository\.p3i[^"]*\.zip' | head -1)
+  if [ -n "${P3I_FILE}" ]; then
+    P3I_URL="https://p3irepo.pm4k.eu/${P3I_FILE}"
+    P3I_ZIP="${BUILD}/repository.p3i.zip"
+    echo "Fetching p3i repository: ${P3I_FILE}"
+    curl -Lsf -o "${P3I_ZIP}" "${P3I_URL}"
+    if [ -f "${P3I_ZIP}" ]; then
+      unzip -q "${P3I_ZIP}" -d ${INSTALL}/usr/share/kodi/addons/
+      rm -f "${P3I_ZIP}"
+    fi
+  else
+    echo "WARNING: Could not fetch p3i repository from p3irepo.pm4k.eu"
+  fi
+
   mkdir -p ${INSTALL}/usr/share/kodi/config
 
   ln -sf /run/libreelec/cacert.pem ${INSTALL}/usr/share/kodi/system/certs/cacert.pem

@@ -1,0 +1,43 @@
+#!/bin/sh
+
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+# Configure a single zram device as compressed swap.
+# Reads /etc/zram.conf for size and on/off state.
+
+CONFIG=/etc/zram.conf
+DEVICE=/dev/zram0
+SYSFS=/sys/block/zram0
+
+[ -r "${CONFIG}" ] && . "${CONFIG}"
+
+ZRAM_SIZE_MB="${ZRAM_SIZE_MB:-1024}"
+ZRAM_ENABLED="${ZRAM_ENABLED:-no}"
+
+start() {
+  [ "${ZRAM_ENABLED}" = "yes" ] || exit 0
+  [ -e "${SYSFS}" ] && exit 0
+
+  modprobe zram num_devices=1 || exit 1
+
+  # Prefer lz4 (faster decompression); fall back silently to the
+  # kernel default (lzo) if lz4 isn't available.
+  echo lz4 > "${SYSFS}/comp_algorithm" 2>/dev/null
+
+  echo "${ZRAM_SIZE_MB}M" > "${SYSFS}/disksize" || exit 1
+  mkswap -L zram-swap "${DEVICE}" >/dev/null || exit 1
+  swapon -p 100 "${DEVICE}" || exit 1
+}
+
+stop() {
+  [ -e "${SYSFS}" ] || exit 0
+  swapoff "${DEVICE}" 2>/dev/null
+  echo 1 > "${SYSFS}/reset" 2>/dev/null
+  rmmod zram 2>/dev/null
+}
+
+case "$1" in
+  start) start ;;
+  stop)  stop  ;;
+  *)     echo "Usage: $0 {start|stop}" >&2; exit 1 ;;
+esac
