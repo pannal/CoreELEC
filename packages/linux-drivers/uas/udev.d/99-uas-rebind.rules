@@ -1,0 +1,8 @@
+# Hot-plug rebind for UAS opt-in.
+# When a USB interface is bound to usb-storage and the user has opted
+# into UAS (marker file present), hand the interface over to uas. The
+# rebind script falls back to usb-storage if uas refuses the bind.
+
+ACTION=="bind", SUBSYSTEM=="usb", DRIVER=="usb-storage", \
+    TEST=="/storage/.config/uas.enabled", \
+    RUN+="/usr/lib/libreelec/uas-rebind %k"

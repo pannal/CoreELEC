@@ -461,6 +461,23 @@ post_makeinstall_target() {
     echo "WARNING: Could not fetch p3i repository from p3irepo.pm4k.eu"
   fi
 
+  # Pre-install p3i seamless-branching helper service addon from p3i repo.
+  # Version is parsed from the repo's addons.xml so the latest zip is always picked.
+  P3I_SB_VERSION=$(curl -sL https://p3irepo.pm4k.eu/omega/zips/addons.xml | grep -oP 'id="service\.p3i\.sb"[^>]*version="\K[^"]+' | head -1)
+  if [ -n "${P3I_SB_VERSION}" ]; then
+    P3I_SB_FILE="service.p3i.sb-${P3I_SB_VERSION}.zip"
+    P3I_SB_URL="https://p3irepo.pm4k.eu/omega/zips/service.p3i.sb/${P3I_SB_FILE}"
+    P3I_SB_ZIP="${BUILD}/service.p3i.sb.zip"
+    echo "Fetching service.p3i.sb: ${P3I_SB_FILE}"
+    curl -Lsf -o "${P3I_SB_ZIP}" "${P3I_SB_URL}"
+    if [ -f "${P3I_SB_ZIP}" ]; then
+      unzip -q "${P3I_SB_ZIP}" -d ${INSTALL}/usr/share/kodi/addons/
+      rm -f "${P3I_SB_ZIP}"
+    fi
+  else
+    echo "WARNING: Could not determine service.p3i.sb version from p3irepo.pm4k.eu"
+  fi
+
   mkdir -p ${INSTALL}/usr/share/kodi/config
 
   ln -sf /run/libreelec/cacert.pem ${INSTALL}/usr/share/kodi/system/certs/cacert.pem

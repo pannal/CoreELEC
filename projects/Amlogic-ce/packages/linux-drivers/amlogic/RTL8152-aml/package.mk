@@ -2,8 +2,8 @@
 # Copyright (C) 2020-present Team CoreELEC (https://coreelec.org)
 
 PKG_NAME="RTL8152-aml"
-PKG_VERSION="cee2df544a6013a8efe4ed1493f594ca50b8d3c8"
-PKG_SHA256="fadfebca469e2203e5aee1c727a7e3916f85a3a5f499c08fce0138bc67c1c92e"
+PKG_VERSION="848347459cd2fc6812e3a14d14d44a86f135d0d9"
+PKG_SHA256="67e2cbe962adf7c3009f01d98f93c7309f9f12b38b3373338abfcc0275c64a4e"
 PKG_ARCH="arm aarch64"
 PKG_LICENSE="GPL"
 PKG_SITE="https://github.com/bb-qq/r8152"

@@ -1,0 +1,16 @@
+#!/bin/sh
+
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+# At boot, if the UAS opt-in marker is present, load uas and rebind
+# every currently-attached usb-storage interface that supports UAS.
+# Hot-plug after this point is handled by 99-uas-rebind.rules.
+
+[ -e /storage/.config/uas.enabled ] || exit 0
+
+modprobe uas || exit 1
+
+for intf in /sys/bus/usb/drivers/usb-storage/[0-9]*; do
+  [ -e "${intf}" ] || continue
+  /usr/lib/libreelec/uas-rebind "${intf##*/}"
+done

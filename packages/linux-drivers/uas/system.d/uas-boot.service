@@ -1,0 +1,11 @@
+[Unit]
+Description=Apply UAS at boot if opt-in marker is set
+ConditionPathExists=/storage/.config/uas.enabled
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/libreelec/uas-boot
+RemainAfterExit=yes
+
+[Install]
+WantedBy=basic.target

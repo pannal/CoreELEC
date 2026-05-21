@@ -1,0 +1,12 @@
+# Compressed RAM swap (zram) — user override.
+#
+# Rename this file to zram.conf (same directory) to activate, then
+# reboot or run: systemctl restart zram-swap
+# Values set here override the build defaults in /etc/zram.conf.
+
+# Size of the zram device in MiB. Actual physical RAM cost is ~1/3
+# of this when fully populated (lz4 typical compression ratio).
+#ZRAM_SIZE_MB="1024"
+
+# Set to "yes" to enable, "no" to disable.
+#ZRAM_ENABLED="yes"

@@ -3,13 +3,15 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 # Configure a single zram device as compressed swap.
-# Reads /etc/zram.conf for size and on/off state.
+# Reads /etc/zram.conf for the build defaults, then
+# /storage/.config/zram.conf for user overrides (the read-only rootfs
+# means /etc isn't editable at runtime).
 
-CONFIG=/etc/zram.conf
 DEVICE=/dev/zram0
 SYSFS=/sys/block/zram0
 
-[ -r "${CONFIG}" ] && . "${CONFIG}"
+[ -r /etc/zram.conf ] && . /etc/zram.conf
+[ -r /storage/.config/zram.conf ] && . /storage/.config/zram.conf
 
 ZRAM_SIZE_MB="${ZRAM_SIZE_MB:-1024}"
 ZRAM_ENABLED="${ZRAM_ENABLED:-no}"

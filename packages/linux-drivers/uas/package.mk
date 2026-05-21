@@ -42,4 +42,13 @@ makeinstall_target() {
   # until the user opts in.
   mkdir -p ${INSTALL}/usr/lib/modprobe.d
     echo "blacklist uas" > ${INSTALL}/usr/lib/modprobe.d/uas.conf
+
+  # Boot-time apply and hot-plug helpers.
+  mkdir -p ${INSTALL}/usr/lib/libreelec
+    cp ${PKG_DIR}/scripts/uas-rebind ${INSTALL}/usr/lib/libreelec/
+    cp ${PKG_DIR}/scripts/uas-boot   ${INSTALL}/usr/lib/libreelec/
+}
+
+post_install() {
+  enable_service uas-boot.service
 }

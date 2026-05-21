@@ -1,0 +1,46 @@
+#!/bin/sh
+
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+# Rebind a single USB interface from usb-storage to uas.
+# Usage: uas-rebind <interface>          e.g. uas-rebind 1-2:1.0
+#
+# Users can list misbehaving devices in /storage/.config/uas-blacklist.txt
+# (one "VID:PID" per line, # for comments) to keep them on usb-storage in
+# BOT mode while UAS stays on for everything else. Add a line, reboot.
+#
+# If uas's probe refuses (no UAS alt-setting on the device), restore
+# the interface to usb-storage so the drive stays usable.
+
+BLACKLIST=/storage/.config/uas-blacklist.txt
+
+intf="$1"
+[ -n "${intf}" ] || exit 1
+
+# Nothing to do if uas isn't loaded.
+[ -d /sys/bus/usb/drivers/uas ] || exit 0
+
+# Don't touch interfaces that aren't currently on usb-storage.
+[ -e "/sys/bus/usb/drivers/usb-storage/${intf}" ] || exit 0
+
+# Check the user blacklist. Interface name is like "1-2:1.0"; the
+# parent USB device is at /sys/bus/usb/devices/1-2/.
+if [ -f "${BLACKLIST}" ]; then
+  devname="${intf%:*}"
+  vid=$(cat "/sys/bus/usb/devices/${devname}/idVendor" 2>/dev/null)
+  pid=$(cat "/sys/bus/usb/devices/${devname}/idProduct" 2>/dev/null)
+  if [ -n "${vid}" ] && [ -n "${pid}" ]; then
+    # Strip comments/blanks, normalise case, exact-match "vid:pid".
+    if sed -e 's/#.*//' -e 's/[[:space:]]//g' "${BLACKLIST}" \
+         | tr 'A-Z' 'a-z' \
+         | grep -qFx "${vid}:${pid}"; then
+      exit 0
+    fi
+  fi
+fi
+
+echo "${intf}" > /sys/bus/usb/drivers/usb-storage/unbind 2>/dev/null || exit 0
+
+if ! echo "${intf}" > /sys/bus/usb/drivers/uas/bind 2>/dev/null; then
+  echo "${intf}" > /sys/bus/usb/drivers/usb-storage/bind 2>/dev/null
+fi
