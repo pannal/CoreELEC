@@ -2,8 +2,8 @@
 # Copyright (C) 2016-present Team LibreELEC (https://libreelec.tv)
 
 PKG_NAME="iperf"
-PKG_VERSION="3.17.1"
-PKG_SHA256="105b4fe7fbce31c9b94a3fec10c46e3b4b298adc076e1e3af52b990e1faf2db9"
+PKG_VERSION="3.21"
+PKG_SHA256="dd289b6700d3bc33eda7fa3ce6db217d6ca42239edbcb2e7f152bf7bf5c8a5aa"
 PKG_LICENSE="BSD"
 PKG_SITE="http://software.es.net/iperf/"
 PKG_URL="https://github.com/esnet/iperf/archive/${PKG_VERSION}.tar.gz"
@@ -14,3 +14,9 @@ PKG_BUILD_FLAGS="-sysroot"
 
 PKG_CONFIGURE_OPTS_TARGET="--enable-static \
                            --disable-shared"
+
+makeinstall_target() {
+  # only ship the iperf3 binary in the image; skip libiperf, headers and man pages
+  mkdir -p ${INSTALL}/usr/bin
+    cp -P src/iperf3 ${INSTALL}/usr/bin
+}
