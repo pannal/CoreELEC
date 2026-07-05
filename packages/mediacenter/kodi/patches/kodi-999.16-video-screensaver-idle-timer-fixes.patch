@@ -1,0 +1,121 @@
+diff --git a/xbmc/application/Application.cpp b/xbmc/application/Application.cpp
+index 92f1de22e5..f539799ea9 100644
+--- a/xbmc/application/Application.cpp
++++ b/xbmc/application/Application.cpp
+@@ -877,7 +877,8 @@ void CApplication::Render()
+   if (!extPlayerActive && CServiceBroker::GetWinSystem()->GetGfxContext().IsFullScreenVideo() &&
+       !appPlayer->IsPausedPlayback())
+   {
+-    appPower->ResetScreenSaver();
++    if (!appPower->IsPythonScreenSaverActive())
++      appPower->ResetScreenSaver();
+   }
+ 
+   if (!CServiceBroker::GetRenderSystem()->BeginRender())
+diff --git a/xbmc/application/ApplicationPowerHandling.cpp b/xbmc/application/ApplicationPowerHandling.cpp
+index 8000a7ee9e..94ed72ac64 100644
+--- a/xbmc/application/ApplicationPowerHandling.cpp
++++ b/xbmc/application/ApplicationPowerHandling.cpp
+@@ -41,7 +41,10 @@
+ void CApplicationPowerHandling::ResetScreenSaver()
+ {
+   // reset our timers
+-  m_shutdownTimer.StartZero();
++  // Don't reset the shutdown timer if a Python screensaver is active - the video
++  // playback from the screensaver should not prevent idle shutdown
++  if (!IsPythonScreenSaverActive())
++    m_shutdownTimer.StartZero();
+ 
+   // screen saver timer is reset only if we're not already in screensaver or
+   // DPMS mode
+@@ -202,6 +205,13 @@ bool CApplicationPowerHandling::WakeUpScreenSaver(bool bPowerOffKeyPressed /* =
+ #define SCRIPT_ALARM "sssssscreensaver"
+ #define SCRIPT_TIMEOUT 15 // seconds
+ 
++        const auto appPlayer = CServiceBroker::GetAppComponents().GetComponent<CApplicationPlayer>();
++        if (appPlayer && appPlayer->IsPlayingVideo() && !appPlayer->IsPaused())
++        {
++          CServiceBroker::GetAppMessenger()->SendMsg(TMSG_GUI_ACTION, CServiceBroker::GetGUI()->GetWindowManager().GetActiveWindow(), -1,
++                                                     static_cast<void*>(new CAction(ACTION_NAV_BACK)));
++        }
++
+         /* FIXME: This is a hack but a proper fix is non-trivial. Basically this code
+         * makes sure the addon gets terminated after we've moved out of the screensaver window.
+         * If we don't do this, we may simply lockup.
+@@ -288,10 +298,10 @@ void CApplicationPowerHandling::CheckScreenSaverAndDPMS()
+   if (m_bInhibitScreenSaver)
+     haveIdleActivity = true;
+ 
+-  // Are we playing a video and it is not paused?
++  // Are we playing a video and it is not paused? (Ignore if screensaver is active, so video screensavers don't kill themselves)
+   const auto& components = CServiceBroker::GetAppComponents();
+   const auto appPlayer = components.GetComponent<CApplicationPlayer>();
+-  if (appPlayer && appPlayer->IsPlayingVideo() && !appPlayer->IsPaused())
++  if (appPlayer && appPlayer->IsPlayingVideo() && !appPlayer->IsPaused() && !m_screensaverActive)
+     haveIdleActivity = true;
+ 
+   // Are we playing audio and screensaver is disabled globally for audio?
+@@ -508,8 +518,14 @@ void CApplicationPowerHandling::CheckShutdown()
+   if (!appPlayer)
+     return;
+ 
+-  if (m_bInhibitIdleShutdown || appPlayer->IsPlaying() ||
+-      appPlayer->IsPausedPlayback() // is something playing?
++  bool bPlayingMediaActivity = appPlayer->IsPlaying() || appPlayer->IsPausedPlayback();
++  if (m_screensaverActive && appPlayer->IsPlayingVideo())
++    bPlayingMediaActivity = false;
++  
++  if (IsPythonScreenSaverActive())
++    bPlayingMediaActivity = false;
++
++  if (m_bInhibitIdleShutdown || bPlayingMediaActivity
+       || CMusicLibraryQueue::GetInstance().IsRunning() ||
+       CVideoLibraryQueue::GetInstance().IsRunning() ||
+       CServiceBroker::GetGUI()->GetWindowManager().IsWindowActive(
+@@ -517,6 +533,7 @@ void CApplicationPowerHandling::CheckShutdown()
+       ||
+       !CServiceBroker::GetPVRManager().Get<PVR::GUI::PowerManagement>().CanSystemPowerdown(false))
+   {
++
+     m_shutdownTimer.StartZero();
+     return;
+   }
+diff --git a/xbmc/application/ApplicationPowerHandling.h b/xbmc/application/ApplicationPowerHandling.h
+index 9d78c6e36d..711c596d11 100644
+--- a/xbmc/application/ApplicationPowerHandling.h
++++ b/xbmc/application/ApplicationPowerHandling.h
+@@ -43,6 +43,7 @@ public:
+   void SetScreenSaverUnlocked() { m_iScreenSaveLock = 1; }
+   void StopScreenSaverTimer();
+   std::string ScreensaverIdInUse() const { return m_screensaverIdInUse; }
++  bool IsPythonScreenSaverActive() const { return m_pythonScreenSaver != nullptr; }
+ 
+   bool GetRenderGUI() const { return m_renderGUI; }
+   void SetRenderGUI(bool renderGUI);
+diff --git a/xbmc/guilib/GUIVideoControl.cpp b/xbmc/guilib/GUIVideoControl.cpp
+index ccb066a754..0bc9c2eb5b 100644
+--- a/xbmc/guilib/GUIVideoControl.cpp
++++ b/xbmc/guilib/GUIVideoControl.cpp
+@@ -54,7 +54,8 @@ void CGUIVideoControl::Render()
+     {
+       auto& appComponents = CServiceBroker::GetAppComponents();
+       const auto appPower = appComponents.GetComponent<CApplicationPowerHandling>();
+-      appPower->ResetScreenSaver();
++      if (!appPower->IsPythonScreenSaverActive())
++        appPower->ResetScreenSaver();
+     }
+ 
+     CServiceBroker::GetWinSystem()->GetGfxContext().SetViewWindow(m_posX, m_posY, m_posX + m_width, m_posY + m_height);
+diff --git a/xbmc/peripherals/devices/PeripheralCecAdapter.cpp b/xbmc/peripherals/devices/PeripheralCecAdapter.cpp
+index c63788a597..f283aa9008 100644
+--- a/xbmc/peripherals/devices/PeripheralCecAdapter.cpp
++++ b/xbmc/peripherals/devices/PeripheralCecAdapter.cpp
+@@ -164,7 +164,7 @@ void CPeripheralCecAdapter::Announce(ANNOUNCEMENT::AnnouncementFlag flag,
+         CLog::Log(LOGDEBUG, "{} - ignoring OnScreensaverDeactivated for power action",
+                   __FUNCTION__);
+     }
+-    if (m_bPowerOnScreensaver && !bIgnoreDeactivate && m_configuration.bActivateSource)
++    if (m_bPowerOnScreensaver && !bIgnoreDeactivate)
+     {
+       ActivateSource();
+     }
