@@ -1,0 +1,588 @@
+diff --git a/addons/resource.language.en_gb/resources/strings.po b/addons/resource.language.en_gb/resources/strings.po
+index 590fd8f334..8ae60e74e7 100644
+--- a/addons/resource.language.en_gb/resources/strings.po
++++ b/addons/resource.language.en_gb/resources/strings.po
+@@ -19095,12 +19095,12 @@ msgstr ""
+ 
+ #: system/peripherals.xml
+ msgctxt "#36008"
+-msgid "Devices to power off during shutdown"
++msgid "Enable devices to power off during shutdown"
+ msgstr ""
+ 
+ #: system/peripherals.xml
+ msgctxt "#36009"
+-msgid "Put devices in standby mode when activating the screensaver"
++msgid "Enable devices to power off when activating the screensaver"
+ msgstr ""
+ 
+ msgctxt "#36010"
+@@ -19180,7 +19180,7 @@ msgstr ""
+ 
+ #: system/peripherals.xml
+ msgctxt "#36026"
+-msgid "Devices to also put in standby mode"
++msgid "Devices to target for power off"
+ msgstr ""
+ 
+ #: xbmc/peripherals/devices/PeripheralCecAdapter.cpp
+@@ -19347,7 +19347,7 @@ msgstr ""
+ 
+ #: system/peripherals.xml
+ msgctxt "#36055"
+-msgid "Put devices in standby by Screensaver on paused video"
++msgid "Enable devices to power off by screensaver on paused video"
+ msgstr ""
+ 
+ #: system/peripherals.xml
+@@ -26994,3 +26994,8 @@ msgstr ""
+ msgctxt "#69999"
+ msgid "Enable this to disable noise reduction. Requires reboot. FOR BETTER VIDEO PROCESSING LEAVE THIS SETTING ENABLED (i.e., DISABLE NOISE REDUCTION)."
+ msgstr ""
++
++#: system/peripherals.xml
++msgctxt "#36060"
++msgid "Switch source to this device on activity"
++msgstr ""
+diff --git a/system/peripherals.xml b/system/peripherals.xml
+index 6f7230c62b..239d27eaa6 100644
+--- a/system/peripherals.xml
++++ b/system/peripherals.xml
+@@ -9,35 +9,47 @@
+   </peripheral>
+ 
+   <peripheral bus="cec" name="CEC Adapter" mapTo="cec">
++    <!-- Master Switch -->
+     <setting key="enabled" type="bool" value="1" label="305" order="1" />
+-    <setting key="activate_source" type="bool" value="1" label="36020" order="2" />
+-    <setting key="wake_devices" type="enum" value="36037" label="36007" lvalues="36037|36038|36039|231" order="3" />
+-    <setting key="standby_devices" type="enum" value="36037" label="36008" lvalues="36037|36038|36039|231" order="4" />
+-    <setting key="send_inactive_source" type="bool" value="1" label="36025" order="5" />
+-    <setting key="cec_standby_screensaver" type="bool" value="0" label="36009" order="6" />
+-    <setting key="cec_standby_screensaver_paused" type="bool" value="0" order="7" label="36055" />
+-    <setting key="screensaver_delay_standby" type="int" min="0" max="60" step="1" value="0" label="36054" order="8" />
+-    <setting key="cec_wake_screensaver" type="bool" value="1" label="36010" order="9" />
+-    <setting key="standby_pc_on_tv_standby" type="enum" value="13011" label="36029" order="10" lvalues="36028|13005|13011|13010|13009|36044|36045" />
+-    <setting key="standby_tv_on_pc_standby" type="bool" value="1" label="36026" order="11" />
+-    <setting key="use_tv_menu_language" type="bool" value="0" label="36018" order="12" />
+-    <setting key="pause_playback_on_deactivate" type="bool" value="1" label="36033" configurable="0" />
+-    <setting key="pause_or_stop_playback_on_deactivate" type="enum" value="231" label="36033" order="13" lvalues="231|36044|36045" />
+-    <setting key="physical_address" type="string" label="36021" value="0" order="14" />
+-    <setting key="power_avr_on_as" type="bool" label="36046" value="0" order="15" />
+ 
++    <!-- Global Identity -->
++    <setting key="device_name" type="string" value="CoreELEC" label="36056" order="2" />
++    <setting key="device_type" type="enum" value="36051" label="36013" lvalues="36051|36052|36053" order="3" />
++    <setting key="physical_address" type="string" value="0" label="36021" order="4" />
++    <setting key="use_tv_menu_language" type="bool" value="0" label="36018" order="5" />
++
++    <!-- Boot / Wake-Up -->
++    <setting key="activate_source" type="bool" value="1" label="36020" order="6" />
++    <setting key="activate_on_keypress" type="bool" value="0" label="36060" order="7" />
++    <setting key="wakeup_cec_auto_power" type="bool" value="1" label="36057" order="8" />
++    <setting key="wakeup_cec_streaming" type="bool" value="1" label="36058" order="9" />
++    <setting key="wakeup_cec_active_route" type="bool" value="0" label="36059" order="10" />
++    <setting key="wake_devices" type="enum" value="36037" label="36007" lvalues="36037|36038|36039|231" order="11" />
++    <setting key="power_avr_on_as" type="bool" value="0" label="36046" order="12" />
++
++    <!-- Power-Off Actions -->
++    <setting key="standby_devices" type="enum" value="36037" label="36026" lvalues="36037|36038|36039|231" order="13" />
++    <setting key="standby_tv_on_pc_standby" type="bool" value="1" label="36008" order="14" />
++    <setting key="cec_standby_screensaver" type="bool" value="0" label="36009" order="15" />
++    <setting key="cec_standby_screensaver_paused" type="bool" value="0" label="36055" order="16" />
++    <setting key="screensaver_delay_standby" type="int" min="0" max="60" step="1" value="0" label="36054" order="17" />
++    <setting key="cec_wake_screensaver" type="bool" value="1" label="36010" order="18" />
++
++    <!-- General Power State Changes -->
++    <setting key="send_inactive_source" type="bool" value="1" label="36025" order="19" />
++    <setting key="standby_pc_on_tv_standby" type="enum" value="13011" label="36029" order="20" lvalues="36028|13005|13011|13010|13009|36044|36045" />
++
++    <!-- Miscellaneous -->
++    <setting key="pause_or_stop_playback_on_deactivate" type="enum" value="231" label="36033" order="21" lvalues="231|36044|36045" />
++    <setting key="double_tap_timeout_ms" type="int" min="50" max="1000" step="50" value="300" label="36047" order="22" />
++    <setting key="button_repeat_rate_ms" type="int" min="0" max="250" step="10" value="0" label="36048" order="23" />
++    <setting key="button_release_delay_ms" type="int" min="0" max="500" step="50" value="0" label="36049" order="24" />
++
++    <!-- Non-configurable / hidden settings -->
++    <setting key="pause_playback_on_deactivate" type="bool" value="1" label="36033" configurable="0" />
+     <setting key="tv_vendor" type="int" value="0" configurable="0" />
+     <setting key="wake_devices_advanced" type="string" value="" configurable="0" />
+     <setting key="standby_devices_advanced" type="string" value="" configurable="0" />
+-    <setting key="double_tap_timeout_ms" type="int" min="50" max="1000" step="50" value="300" label="36047" order="16" />
+-    <setting key="button_repeat_rate_ms" type="int" min="0" max="250" step="10" value="0" label="36048" order="17" />
+-    <setting key="button_release_delay_ms" type="int" min="0" max="500" step="50" value="0" label="36049" order="18" />
+-    <setting key="device_type" type="enum" value="36051" label="36013" lvalues="36051|36052|36053" order="19" />
+-
+-    <setting key="device_name" type="string" value="CoreELEC" order="20" label="36056" />
+-    <setting key="wakeup_cec_auto_power" type="bool" value="1" order="21" label="36057" />
+-    <setting key="wakeup_cec_streaming" type="bool" value="1" order="22" label="36058" />
+-    <setting key="wakeup_cec_active_route" type="bool" value="0" order="23" label="36059" />
+   </peripheral>
+ 
+   <peripheral vendor_product="2548:1001,2548:1002" bus="usb" name="Pulse-Eight CEC Adapter" mapTo="cec">
+diff --git a/xbmc/application/Application.cpp b/xbmc/application/Application.cpp
+index f539799ea9..a419699264 100644
+--- a/xbmc/application/Application.cpp
++++ b/xbmc/application/Application.cpp
+@@ -934,6 +934,9 @@ void CApplication::Render()
+ 
+ bool CApplication::OnAction(const CAction &action)
+ {
++  // notify action listeners for early observation
++  GetComponent<CApplicationActionListeners>()->NotifyActionListenersPre(action);
++
+   // special case for switching between GUI & fullscreen mode.
+   if (action.GetID() == ACTION_SHOW_GUI)
+   { // Switch to fullscreen mode if we can
+diff --git a/xbmc/application/ApplicationActionListeners.cpp b/xbmc/application/ApplicationActionListeners.cpp
+index 6b641c1930..aacd612702 100644
+--- a/xbmc/application/ApplicationActionListeners.cpp
++++ b/xbmc/application/ApplicationActionListeners.cpp
+@@ -46,3 +46,12 @@ bool CApplicationActionListeners::NotifyActionListeners(const CAction& action) c
+ 
+   return false;
+ }
++
++void CApplicationActionListeners::NotifyActionListenersPre(const CAction& action) const
++{
++  std::unique_lock<CCriticalSection> lock(m_critSection);
++  for (const auto& listener : m_actionListeners)
++  {
++    listener->OnActionPre(action);
++  }
++}
+diff --git a/xbmc/application/ApplicationActionListeners.h b/xbmc/application/ApplicationActionListeners.h
+index 504a79d47e..bc4c677a2f 100644
+--- a/xbmc/application/ApplicationActionListeners.h
++++ b/xbmc/application/ApplicationActionListeners.h
+@@ -53,6 +53,12 @@ protected:
+    */
+   bool NotifyActionListeners(const CAction& action) const;
+ 
++  /*!
++   \brief Delegates the action to all registered action handlers before window manager processes it.
++   \param action The action
++   */
++  void NotifyActionListenersPre(const CAction& action) const;
++
+   std::vector<KODI::ACTION::IActionListener*> m_actionListeners;
+ 
+   CCriticalSection& m_critSection;
+diff --git a/xbmc/input/actions/interfaces/IActionListener.h b/xbmc/input/actions/interfaces/IActionListener.h
+index 0e4d767284..320334a60c 100644
+--- a/xbmc/input/actions/interfaces/IActionListener.h
++++ b/xbmc/input/actions/interfaces/IActionListener.h
+@@ -32,6 +32,13 @@ public:
+    * \return True if the action was handled, false otherwise
+    */
+   virtual bool OnAction(const CAction& action) = 0;
++
++  /*!
++   * \brief Observe a GUI action before it is consumed
++   *
++   * \param action The GUI action
++   */
++  virtual void OnActionPre(const CAction& action) {}
+ };
+ } // namespace ACTION
+ } // namespace KODI
+diff --git a/xbmc/peripherals/Peripherals.cpp b/xbmc/peripherals/Peripherals.cpp
+index 38ad5b552f..6344aae0b0 100644
+--- a/xbmc/peripherals/Peripherals.cpp
++++ b/xbmc/peripherals/Peripherals.cpp
+@@ -651,7 +651,7 @@ void CPeripherals::GetSettingsFromMappingsFile(
+ 
+       /* set the order */
+       int iOrder = 0;
+-      currentNode->Attribute("order", std::to_string(iOrder).c_str());
++      currentNode->QueryIntAttribute("order", &iOrder);
+       /* if the order attribute is invalid or 0, then the setting will be added at the end */
+       if (iOrder < 0)
+         iOrder = 0;
+diff --git a/xbmc/peripherals/devices/PeripheralCecAdapter.cpp b/xbmc/peripherals/devices/PeripheralCecAdapter.cpp
+index f283aa9008..7a00e72ed3 100644
+--- a/xbmc/peripherals/devices/PeripheralCecAdapter.cpp
++++ b/xbmc/peripherals/devices/PeripheralCecAdapter.cpp
+@@ -30,6 +30,7 @@
+ #include "xbmc/interfaces/legacy/configini.h"
+ 
+ #include <mutex>
++#include <unistd.h>
+ 
+ #include <libcec/cec.h>
+ 
+@@ -57,6 +58,10 @@ using namespace XBMCAddon;
+ #define LOCALISED_ID_HIBERNATE 13010
+ #define LOCALISED_ID_QUIT 13009
+ #define LOCALISED_ID_IGNORE 36028
++
++
++#include "application/ApplicationActionListeners.h"
++
+ #define LOCALISED_ID_RECORDING_DEVICE 36051
+ #define LOCALISED_ID_PLAYBACK_DEVICE 36052
+ #define LOCALISED_ID_TUNER_DEVICE 36053
+@@ -74,6 +79,11 @@ CPeripheralCecAdapter::CPeripheralCecAdapter(CPeripherals& manager,
+   ResetMembers();
+   m_features.push_back(FEATURE_CEC);
+   m_strComPort = scanResult.m_strLocation;
++  
++  auto& components = CServiceBroker::GetAppComponents();
++  auto appListener = components.GetComponent<CApplicationActionListeners>();
++  if (appListener)
++    appListener->RegisterActionListener(this);
+ }
+ 
+ void CPeripheralCecAdapter::Deinitialize(void)
+@@ -81,6 +91,10 @@ void CPeripheralCecAdapter::Deinitialize(void)
+   {
+     std::unique_lock<CCriticalSection> lock(m_critSection);
+     CServiceBroker::GetAnnouncementManager()->RemoveAnnouncer(this);
++    auto& components = CServiceBroker::GetAppComponents();
++    auto appListener = components.GetComponent<CApplicationActionListeners>();
++    if (appListener)
++      appListener->UnregisterActionListener(this);
+     m_bStop = true;
+   }
+ 
+@@ -143,10 +157,21 @@ void CPeripheralCecAdapter::Announce(ANNOUNCEMENT::AnnouncementFlag flag,
+   if (flag == ANNOUNCEMENT::System && sender == CAnnouncementManager::ANNOUNCEMENT_SENDER &&
+       message == "OnQuit" && m_bIsReady)
+   {
+-    std::unique_lock<CCriticalSection> lock(m_critSection);
+-    m_iExitCode = static_cast<int>(data["exitcode"].asInteger(EXITCODE_QUIT));
+-    CServiceBroker::GetAnnouncementManager()->RemoveAnnouncer(this);
+-    StopThread(false);
++    {
++      std::unique_lock<CCriticalSection> lock(m_critSection);
++      m_iExitCode = static_cast<int>(data["exitcode"].asInteger(EXITCODE_QUIT));
++      CServiceBroker::GetAnnouncementManager()->RemoveAnnouncer(this);
++    }
++    
++    if (m_iExitCode == EXITCODE_POWERDOWN)
++    {
++      CLog::Log(LOGDEBUG, "{} - Synchronously joining CEC thread to ensure StandbyDevices is sent before system powerdown", __FUNCTION__);
++      StopThread(true);
++    }
++    else
++    {
++      StopThread(false);
++    }
+   }
+   else if (flag == ANNOUNCEMENT::GUI && sender == CAnnouncementManager::ANNOUNCEMENT_SENDER &&
+            message == "OnScreensaverDeactivated" && m_bIsReady)
+@@ -213,7 +238,9 @@ void CPeripheralCecAdapter::Announce(ANNOUNCEMENT::AnnouncementFlag flag,
+         m_bActiveSourceBeforeStandby = false;
+       }
+       if (bActivate)
++      {
+         ActivateSource();
++      }
+     }
+   }
+   else if (flag == ANNOUNCEMENT::Player && sender == CAnnouncementManager::ANNOUNCEMENT_SENDER &&
+@@ -226,11 +253,18 @@ void CPeripheralCecAdapter::Announce(ANNOUNCEMENT::AnnouncementFlag flag,
+   else if (flag == ANNOUNCEMENT::Player && sender == CAnnouncementManager::ANNOUNCEMENT_SENDER &&
+            (message == "OnPlay" || message == "OnResume"))
+   {
++    const auto& components = CServiceBroker::GetAppComponents();
++    const auto appPower = components.GetComponent<CApplicationPowerHandling>();
++    if (appPower->IsInScreenSaver())
++    {
++      return;
++    }
++
+     // activate the source when playback started, and the option is enabled
+     bool bActivateSource(false);
+     {
+       std::unique_lock<CCriticalSection> lock(m_critSection);
+-      bActivateSource = (m_configuration.bActivateSource && !m_bOnPlayReceived &&
++      bActivateSource = (GetSettingBool("activate_on_keypress") && !m_bOnPlayReceived &&
+                          !m_cecAdapter->IsLibCECActiveSource() &&
+                          (!m_preventActivateSourceOnPlay.IsValid() ||
+                           CDateTime::GetCurrentDateTime() - m_preventActivateSourceOnPlay >
+@@ -238,7 +272,9 @@ void CPeripheralCecAdapter::Announce(ANNOUNCEMENT::AnnouncementFlag flag,
+       m_bOnPlayReceived = true;
+     }
+     if (bActivateSource)
++    {
+       ActivateSource();
++    }
+   }
+ }
+ 
+@@ -246,12 +282,6 @@ bool CPeripheralCecAdapter::InitialiseFeature(const PeripheralFeature feature)
+ {
+   if (feature == FEATURE_CEC && !m_bStarted && GetSettingBool("enabled"))
+   {
+-    // hide settings that have an override set
+-    if (!GetSettingString("wake_devices_advanced").empty())
+-      SetSettingVisible("wake_devices", false);
+-    if (!GetSettingString("standby_devices_advanced").empty())
+-      SetSettingVisible("standby_devices", false);
+-
+     SetConfigurationFromSettings();
+     m_callbacks.Clear();
+     m_callbacks.logMessage = &CecLogMessage;
+@@ -643,7 +673,9 @@ void CPeripheralCecAdapter::CecCommand(void* cbParam, const cec_command* command
+     switch (command->opcode)
+     {
+       case CEC_OPCODE_STANDBY:
+-        if (command->initiator == CECDEVICE_TV &&
++        if ((command->initiator == CECDEVICE_TV ||
++             command->destination == CECDEVICE_TV ||
++             command->destination == CECDEVICE_BROADCAST) &&
+             (!adapter->m_standbySent.IsValid() ||
+              CDateTime::GetCurrentDateTime() - adapter->m_standbySent >
+                  CDateTimeSpan(0, 0, 0, SCREENSAVER_TIMEOUT)))
+@@ -824,6 +856,8 @@ void CPeripheralCecAdapter::PushCecKeypress(const CecButtonPress& key)
+ 
+ void CPeripheralCecAdapter::PushCecKeypress(const cec_keypress& key)
+ {
++  m_lastCecKeypressTime = std::chrono::steady_clock::now();
++
+   CecButtonPress xbmcKey;
+   xbmcKey.iDuration = key.duration;
+ 
+@@ -1132,6 +1166,12 @@ void CPeripheralCecAdapter::ResetButton(void)
+   }
+ }
+ 
++void CPeripheralCecAdapter::LoadPersistedSettings(void)
++{
++  CPeripheral::LoadPersistedSettings();
++  SetConfigurationFromSettings();
++}
++
+ void CPeripheralCecAdapter::OnSettingChanged(const std::string& strChangedSetting)
+ {
+   if (StringUtils::EqualsNoCase(strChangedSetting, "enabled"))
+@@ -1140,6 +1180,15 @@ void CPeripheralCecAdapter::OnSettingChanged(const std::string& strChangedSettin
+     if (!bEnabled && IsRunning())
+     {
+       CLog::Log(LOGDEBUG, "{} - closing the CEC connection", __FUNCTION__);
++      
++      if (m_bInitialised)
++      {
++        CEC::libcec_configuration config = m_configuration;
++        config.bPowerOffOnStandby = 0;
++        config.powerOffDevices.Clear();
++        m_cecAdapter->SetConfiguration(&config);
++      }
++
+       SetConfigurationFromSettings();
+       StopThread(true);
+     }
+@@ -1200,6 +1249,19 @@ void CPeripheralCecAdapter::CecSourceActivated(void* cbParam,
+   if (!adapter)
+     return;
+ 
++  bool isActive = adapter->m_cecAdapter->IsLibCECActiveSource();
++  FILE* fp = fopen("/run/kodi_cec_startup_done", "w");
++  if (fp)
++  {
++    fputs(isActive ? "1\n" : "0\n", fp);
++    fclose(fp);
++  }
++
++  if (activated == 0)
++  {
++    adapter->m_lastSourceDeactivatedTime = std::chrono::steady_clock::now();
++  }
++
+   // wake up the screensaver, so the user doesn't switch to a black screen
+   if (activated == 1)
+   {
+@@ -1305,7 +1367,7 @@ void CPeripheralCecAdapter::SetConfigurationFromLibCEC(const CEC::libcec_configu
+ 
+   // set the boolean settings
+   m_configuration.bActivateSource = config.bActivateSource;
+-  bChanged |= SetSetting("activate_source", m_configuration.bActivateSource == 1);
++  // bChanged |= SetSetting("activate_source", m_configuration.bActivateSource == 1);
+ 
+   m_configuration.iDoubleTapTimeoutMs = config.iDoubleTapTimeoutMs;
+   bChanged |= SetSetting("double_tap_timeout_ms", (int)m_configuration.iDoubleTapTimeoutMs);
+@@ -1331,6 +1393,9 @@ void CPeripheralCecAdapter::SetConfigurationFromLibCEC(const CEC::libcec_configu
+ 
+ void CPeripheralCecAdapter::SetConfigurationFromSettings(void)
+ {
++  bool bEnabled = GetSettingBool("enabled");
++
++
+   // client version matches the version of libCEC that we originally used the API from
+   m_configuration.clientVersion = LIBCEC_VERSION_TO_UINT(4, 0, 0);
+ 
+@@ -1396,7 +1461,7 @@ void CPeripheralCecAdapter::SetConfigurationFromSettings(void)
+ 
+   // read the boolean settings
+   m_bUseTVMenuLanguage = GetSettingBool("use_tv_menu_language");
+-  m_configuration.bActivateSource = GetSettingBool("activate_source") ? 1 : 0;
++  m_configuration.bActivateSource = 0; // Prevent libcec internal startup blast
+   m_bPowerOffScreensaver = GetSettingBool("cec_standby_screensaver");
+   m_bPowerOffScreensaverPaused = GetSettingBool("cec_standby_screensaver_paused") ? 1 : 0;
+   m_bPowerOnScreensaver = GetSettingBool("cec_wake_screensaver");
+@@ -1545,13 +1610,13 @@ bool CPeripheralCecAdapterUpdateThread::UpdateConfiguration(libcec_configuration
+ bool CPeripheralCecAdapterUpdateThread::WaitReady(void)
+ {
+   // don't wait if we're not powering up anything
+-  if (m_configuration.wakeDevices.IsEmpty() && m_configuration.bActivateSource == 0)
++  if (m_configuration.wakeDevices.IsEmpty() && !m_adapter->GetSettingBool("activate_source"))
+     return true;
+ 
+   // wait for the TV if we're configured to become the active source.
+   // wait for the first device in the wake list otherwise.
+   cec_logical_address waitFor =
+-      (m_configuration.bActivateSource == 1) ? CECDEVICE_TV : m_configuration.wakeDevices.primary;
++      (m_adapter->GetSettingBool("activate_source")) ? CECDEVICE_TV : m_configuration.wakeDevices.primary;
+ 
+   cec_power_status powerStatus(CEC_POWER_STATUS_UNKNOWN);
+   bool bContinue(true);
+@@ -1614,18 +1679,56 @@ std::string CPeripheralCecAdapterUpdateThread::UpdateAudioSystemStatus(void)
+ 
+ bool CPeripheralCecAdapterUpdateThread::SetInitialConfiguration(void)
+ {
+-  // the option to make XBMC the active source is set
+-  if (m_configuration.bActivateSource == 1)
++  bool bStealFocus = true;
++  bool bIsColdBoot = false;
++  FILE* fp = fopen("/run/kodi_cec_startup_done", "r");
++  if (fp)
++  {
++    char buf[2] = {0};
++    if (fread(buf, 1, 1, fp) == 1)
++    {
++      if (buf[0] == '0')
++        bStealFocus = false;
++    }
++    fclose(fp);
++  }
++  else
++  {
++    bIsColdBoot = true;
++  }
++
++  bool bIsActiveSource = false;
++
++  // On cold boot, respect the GUI setting.
++  // On soft restart, respect our previous state (bStealFocus) regardless of the setting.
++  if ((bIsColdBoot && m_adapter->GetSettingBool("activate_source")) || (!bIsColdBoot && bStealFocus))
++  {
+     m_adapter->m_cecAdapter->SetActiveSource();
++    bIsActiveSource = true;
++  }
+
+ 
+   // devices to wake are set
+   cec_logical_addresses tvOnly;
+   tvOnly.Clear();
+   tvOnly.Set(CECDEVICE_TV);
+   if (!m_configuration.wakeDevices.IsEmpty() &&
+-      (m_configuration.wakeDevices != tvOnly || m_configuration.bActivateSource == 0))
++      (m_configuration.wakeDevices != tvOnly || !m_adapter->GetSettingBool("activate_source")) &&
++      bStealFocus)
+     m_adapter->m_cecAdapter->PowerOnDevices(CECDEVICE_BROADCAST);
+ 
++  fp = fopen("/run/kodi_cec_startup_done", "w");
++  if (fp)
++  {
++    fputs(bIsActiveSource ? "1\n" : "0\n", fp);
++    fclose(fp);
++  }
++
+   // wait until devices are powered up
+   if (!WaitReady())
+     return false;
+@@ -1757,6 +1860,13 @@ bool CPeripheralCecAdapter::ReopenConnection(bool bAsync /* = false */)
+ 
+ void CPeripheralCecAdapter::ActivateSource(void)
+ {
++  auto now = std::chrono::steady_clock::now();
++  if (std::chrono::duration_cast<std::chrono::seconds>(now - m_lastActivateSourceTime).count() < 5)
++  {
++    return; // Throttle to prevent spamming CEC bus when IsLibCECActiveSource takes time to update
++  }
++  m_lastActivateSourceTime = now;
++
+   std::unique_lock<CCriticalSection> lock(m_critSection);
+   m_bActiveSourcePending = true;
+ }
+@@ -1868,3 +1978,33 @@ bool CPeripheralCecAdapter::ToggleDeviceState(CecStateChange mode /*= STATE_SWIT
+ 
+   return false;
+ }
++
++void CPeripheralCecAdapter::OnActionPre(const CAction& action)
++{
++  if (GetSettingBool("activate_on_keypress") && m_cecAdapter && !m_cecAdapter->IsLibCECActiveSource())
++  {
++    // Ignore pure analog noise (like mouse movements) so we only trigger on distinct button presses
++    if (action.GetID() != ACTION_MOUSE_MOVE && action.GetID() != ACTION_NONE && action.GetID() != ACTION_ANALOG_MOVE)
++    {
++       const auto& components = CServiceBroker::GetAppComponents();
++       const auto appPower = components.GetComponent<CApplicationPowerHandling>();
++       if (appPower->IsInScreenSaver())
++       {
++         CLog::Log(LOGDEBUG, "{} - ignoring OnActionPre because screensaver is active", __FUNCTION__);
++         return;
++       }
++
++       auto now = std::chrono::steady_clock::now();
++       if (std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastCecKeypressTime).count() > 1000 &&
++           std::chrono::duration_cast<std::chrono::seconds>(now - m_lastSourceDeactivatedTime).count() > 5)
++       {
++         ActivateSource(); // ActivateSource internally checks if it's already active before firing!
++       }
++    }
++  }
++}
++
++bool CPeripheralCecAdapter::OnAction(const CAction& action)
++{
++  return false;
++}
+diff --git a/xbmc/peripherals/devices/PeripheralCecAdapter.h b/xbmc/peripherals/devices/PeripheralCecAdapter.h
+index 86e2df1995..3d33575545 100644
+--- a/xbmc/peripherals/devices/PeripheralCecAdapter.h
++++ b/xbmc/peripherals/devices/PeripheralCecAdapter.h
+@@ -58,6 +58,8 @@ public:
+ 
+ class CVariant;
+ 
++#include "input/actions/interfaces/IActionListener.h"
++
+ namespace CEC
+ {
+ class ICECAdapter;
+@@ -93,6 +95,7 @@ typedef enum
+ 
+ class CPeripheralCecAdapter : public CPeripheralHID,
+                               public ANNOUNCEMENT::IAnnouncer,
++                              public KODI::ACTION::IActionListener,
+                               private CThread
+ {
+   friend class CPeripheralCecAdapterUpdateThread;
+@@ -119,9 +122,14 @@ public:
+   bool IsMuted(void);
+ 
+   // CPeripheral callbacks
++  void LoadPersistedSettings(void) override;
+   void OnSettingChanged(const std::string& strChangedSetting) override;
+   void OnDeviceRemoved(void) override;
+ 
++  // IActionListener
++  bool OnAction(const CAction& action) override;
++  void OnActionPre(const CAction& action) override;
++
+   // input
+   int GetButton(void);
+   unsigned int GetHoldTime(void);
+@@ -210,6 +218,9 @@ private:
+   bool m_bUseTVMenuLanguage;
+   bool m_bSendInactiveSource;
+   bool m_bPowerOffScreensaver;
++  std::chrono::steady_clock::time_point m_lastCecKeypressTime;
++  std::chrono::steady_clock::time_point m_lastActivateSourceTime;
++  std::chrono::steady_clock::time_point m_lastSourceDeactivatedTime;
+   bool m_bShutdownOnStandby;
+   int m_iCec_func_config;
+ };
