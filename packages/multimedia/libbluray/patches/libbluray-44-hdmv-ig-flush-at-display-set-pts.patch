@@ -1,0 +1,375 @@
+From: SamuriHL <samurihl@msn.com>
+Subject: [PATCH] HDMV: flush IG pages at the display set's presentation time
+
+An IG display set is decoded when the application reads it: bd_read()
+decodes a main-path IG stream from the bytes it reads, and a preloaded
+sub-path IG stream is decoded in full when the playlist starts. Both are
+ahead of presentation, by the application's read-ahead or by the time
+the previous playlist takes to finish. The page is rendered with pts -1,
+so the application shows it at once, over background video that has not
+reached the display set's pts yet.
+
+When a display set has just been decoded (bd_read(), or the preloaded
+sub-path at HDMV PLAY_PL), give its renders a timeline:
+- the page is due at the display set's pts;
+- steps libbluray schedules on its own clock (in/out effects, button
+  animation, user timeout) are due at that pts plus the time they were
+  scheduled for after the decode;
+- redraws the HDMV VM asks for (button page, enable, disable, IG end)
+  take the time of the latest of these, the page or a step.
+
+When reading moves to the next clip (bd_read(), the seamless angle
+path, or bd_read_skip_still() after a still-time playitem), the
+timeline moves onto that clip's clock by the previous clip's out time
+minus the next clip's in time, so later steps keep their place relative
+to the stream.
+
+A pop-up menu that its user timeout hides while a timeline runs is
+hidden at that timeline's time: its plane is cleared and flushed empty,
+since an immediate close would drop the pages still waiting for their
+pts.
+
+Renders stay immediate (pts -1):
+- after user input (key, mouse, popup);
+- when INIT_MENU re-initialises an existing display set;
+- after a seek, until the next display set is decoded.
+
+Applications that ignore IG flush pts are unaffected.
+
+diff -ruN a/src/libbluray/bluray.c b/src/libbluray/bluray.c
+--- a/src/libbluray/bluray.c
++++ b/src/libbluray/bluray.c
+@@ -1695,6 +1695,8 @@
+     if (result >= 0) {
+         uint32_t media_time;
+ 
++        gc_run(bd->graphics_controller, GC_CTRL_SEEK, 0, NULL);
++
+         /* update title position */
+         bd->s_pos = (uint64_t)title_pkt * 192;
+ 
+@@ -2031,6 +2033,17 @@
+     return bd->s_pos;
+ }
+ 
++/* the IG timeline follows reading onto the next clip's clock */
++static void _gc_clip_end(BLURAY *bd, const NAV_CLIP *prev, const NAV_CLIP *next)
++{
++    int64_t step = 2 * ((int64_t)prev->out_time - (int64_t)next->in_time);
++    if (step > INT32_MAX || step < INT32_MIN) {
++        gc_run(bd->graphics_controller, GC_CTRL_SEEK, 0, NULL);
++        return;
++    }
++    gc_run(bd->graphics_controller, GC_CTRL_CLIP_END, (uint32_t)(int32_t)step, NULL);
++}
++
+ static int _bd_read(BLURAY *bd, unsigned char *buf, int len, int stop_at_boundary)
+ {
+     BD_STREAM *st = &bd->st0;
+@@ -2038,6 +2051,7 @@
+ 
+         while (len > 0) {
+             uint32_t clip_pkt;
++            const NAV_CLIP *prev_clip;
+ 
+             unsigned int size = len;
+             // Do we need to read more data?
+@@ -2049,10 +2063,12 @@
+                         return out_len;
+                     }
+                     if (clip_pkt >= st->clip->end_pkt) {
++                        const NAV_CLIP *angle_prev_clip = st->clip;
+                         st->clip = nav_next_clip(bd->title, st->clip);
+                         if (!_open_m2ts(bd, st)) {
+                             return -1;
+                         }
++                        _gc_clip_end(bd, angle_prev_clip, st->clip);
+                         bd->s_pos = (uint64_t)st->clip->title_pkt * 192L;
+                     } else {
+                         _change_angle(bd);
+@@ -2094,6 +2110,7 @@
+                     }
+ 
+                     // find next clip
++                    prev_clip = st->clip;
+                     st->clip = nav_next_clip(bd->title, st->clip);
+                     if (st->clip == NULL) {
+                         BD_DEBUG(DBG_BLURAY | DBG_STREAM, "End of title\n");
+@@ -2104,6 +2121,7 @@
+                     if (!_open_m2ts(bd, st)) {
+                         return -1;
+                     }
++                    _gc_clip_end(bd, prev_clip, st->clip);
+ 
+                     if (st->clip->connection == CONNECT_NON_SEAMLESS) {
+                         /* application layer demuxer buffers must be reset here */
+@@ -2123,7 +2141,7 @@
+                     if (st->ig_pid > 0) {
+                         if (gc_decode_ts(bd->graphics_controller, st->ig_pid, bd->int_buf, 1, -1) > 0) {
+                             /* initialize menus */
+-                            _run_gc(bd, GC_CTRL_INIT_MENU, 0);
++                            _run_gc(bd, GC_CTRL_INIT_MENU, 1);
+                         }
+                     }
+                     if (st->pg_pid > 0) {
+@@ -2234,9 +2252,13 @@
+ 
+     if (st->clip) {
+         if (st->clip->still_mode == BLURAY_STILL_TIME) {
++            const NAV_CLIP *prev_clip = st->clip;
+             st->clip = nav_next_clip(bd->title, st->clip);
+             if (st->clip) {
+                 ret = _open_m2ts(bd, st);
++                if (ret) {
++                    _gc_clip_end(bd, prev_clip, st->clip);
++                }
+             }
+         }
+     }
+@@ -2419,7 +2441,10 @@
+ 
+     /* decode already preloaded IG sub-path */
+     if (bd->st_ig.clip) {
+-        gc_decode_ts(bd->graphics_controller, ig_pid, bd->st_ig.buf, SPN(bd->st_ig.clip_size) / 32, -1);
++        /* 2: a display set was decoded */
++        if (gc_decode_ts(bd->graphics_controller, ig_pid, bd->st_ig.buf, SPN(bd->st_ig.clip_size) / 32, -1) > 0) {
++            return 2;
++        }
+         return 1;
+     }
+ 
+@@ -3778,9 +3803,8 @@
+                 bd->hdmv_num_invalid_pl = 0;
+             }
+ 
+-            /* initialize menus */
+-            _init_ig_stream(bd);
+-            _run_gc(bd, GC_CTRL_INIT_MENU, 0);
++            /* initialize menus; a preloaded display set is presented at its pts */
++            _run_gc(bd, GC_CTRL_INIT_MENU, _init_ig_stream(bd) == 2);
+             break;
+ 
+         case HDMV_EVENT_PLAY_PI:
+diff -ruN a/src/libbluray/decoders/graphics_controller.c b/src/libbluray/decoders/graphics_controller.c
+--- a/src/libbluray/decoders/graphics_controller.c
++++ b/src/libbluray/decoders/graphics_controller.c
+@@ -96,6 +96,14 @@
+     /* timers */
+     int64_t                user_timeout;
+ 
++    /* IG presentation timeline: the display set's pts at the SCR it was
++     * decoded, the SCR the current render is scheduled for, and the latest
++     * scheduled step (90 kHz). ig_timeline_pts < 0 when renders are immediate. */
++    int64_t                ig_timeline_pts;
++    int64_t                ig_timeline_scr;
++    int64_t                ig_render_scr;
++    int64_t                ig_step_scr;
++
+     /* animated buttons */
+     unsigned               frame_interval;
+     unsigned               button_effect_running;
+@@ -513,6 +521,25 @@
+     }
+ }
+ 
++/*
++ * The display set is decoded when the application reads it, ahead of
++ * presentation. Until the user acts on the menu, its renders are due at the
++ * display set's pts; effect, animation and timeout steps at that pts plus the
++ * time they were scheduled for after the decode. User actions render
++ * immediately.
++ */
++static int64_t _ig_flush_pts(GRAPHICS_CONTROLLER *gc)
++{
++    if (gc->ig_timeline_pts < 0) {
++        return -1;
++    }
++    if (gc->ig_render_scr < gc->ig_timeline_scr) {
++        /* a step scheduled before the display set was decoded */
++        return gc->ig_timeline_pts;
++    }
++    return gc->ig_timeline_pts + (gc->ig_render_scr - gc->ig_timeline_scr);
++}
++
+ static void _hide_osd(GRAPHICS_CONTROLLER *gc, int plane)
+ {
+     if (gc->overlay_proc) {
+@@ -754,6 +781,8 @@
+     gc->textst_user_style = -1;
+ 
+     memset(gc->bog_data, 0, sizeof(gc->bog_data));
++
++    gc->ig_timeline_pts = -1;
+ }
+ 
+ /*
+@@ -816,6 +845,7 @@
+     bd_psr_register_cb(regs, _process_psr_event, p);
+ 
+     p->textst_user_style = -1;
++    p->ig_timeline_pts = -1;
+ 
+     return p;
+ }
+@@ -1349,7 +1379,7 @@
+ {
+     BD_PG_PALETTE *palette = NULL;
+     unsigned ii;
+-    int64_t pts = -1;
++    int64_t pts = _ig_flush_pts(gc);
+ 
+     if (!gc->ig_open) {
+         _open_osd(gc, BD_OVERLAY_IG, 0, 0,
+@@ -1397,6 +1427,14 @@
+ 
+         if (gc->ig_open) {
+             GC_TRACE("_render_page(): popup menu not visible\n");
++            if (gc->ig_timeline_pts >= 0) {
++                /* hide at the timeline's time: an immediate close would
++                 * drop the pages still waiting for their pts */
++                _clear_osd(gc, BD_OVERLAY_IG);
++                _flush_osd(gc, BD_OVERLAY_IG, _ig_flush_pts(gc));
++                gc->ig_open = 0;
++                return 1;
++            }
+             _close_osd(gc, BD_OVERLAY_IG);
+             return 1;
+         }
+@@ -1508,7 +1546,7 @@
+     }
+ 
+     if (gc->ig_dirty) {
+-        _flush_osd(gc, BD_OVERLAY_IG, -1);
++        _flush_osd(gc, BD_OVERLAY_IG, _ig_flush_pts(gc));
+         gc->ig_dirty = 0;
+         return 1;
+     }
+@@ -1873,6 +1911,7 @@
+             int64_t duration = (int64_t)gc->out_effects->effect[gc->effect_idx].duration;
+             if (pts >= (gc->next_effect_time + duration)) {
+                 gc->next_effect_time += duration;
++                gc->ig_render_scr = gc->ig_step_scr = gc->next_effect_time;
+                 gc->effect_idx++;
+                 if (gc->effect_idx >= gc->out_effects->num_effects) {
+                     gc->out_effects = NULL;
+@@ -1886,6 +1925,7 @@
+             int64_t duration = (int64_t)gc->in_effects->effect[gc->effect_idx].duration;
+             if (pts >= (gc->next_effect_time + duration)) {
+                 gc->next_effect_time += duration;
++                gc->ig_render_scr = gc->ig_step_scr = gc->next_effect_time;
+                 gc->effect_idx++;
+                 if (gc->effect_idx >= gc->in_effects->num_effects) {
+                     gc->in_effects = NULL;
+@@ -1899,6 +1939,7 @@
+             int64_t pts = bd_get_scr();
+             if (pts >= (gc->next_effect_time + gc->frame_interval)) {
+                 gc->next_effect_time += gc->frame_interval;
++                gc->ig_render_scr = gc->ig_step_scr = gc->next_effect_time;
+                 result = _render_page(gc, 0xffff, cmds);
+             }
+         }
+@@ -1920,6 +1961,7 @@
+             if (pts > gc->user_timeout) {
+ 
+                 GC_TRACE("user timeout expired\n");
++                gc->ig_render_scr = gc->ig_step_scr = gc->user_timeout;
+ 
+                 if (gc->igs->ics->interactive_composition.ui_model != IG_UI_MODEL_POPUP) {
+ 
+@@ -1958,6 +2000,10 @@
+ 
+     bd_mutex_lock(&gc->mutex);
+ 
++    /* renders the HDMV VM asks for belong to the display set's time, or to
++     * the latest effect, animation or timeout step that led to them */
++    gc->ig_render_scr = gc->ig_step_scr;
++
+     /* always accept reset */
+     switch (ctrl) {
+         case GC_CTRL_RESET:
+@@ -1994,6 +2040,24 @@
+             bd_mutex_unlock(&gc->mutex);
+             return 0;
+ 
++        case GC_CTRL_CLIP_END:
++            /* keep the timeline on the clock of the clip being read */
++            if (gc->ig_timeline_pts >= 0) {
++                gc->ig_timeline_pts -= (int32_t)param;
++                if (gc->ig_timeline_pts < 0) {
++                    gc->ig_timeline_pts = -1;
++                }
++            }
++
++            bd_mutex_unlock(&gc->mutex);
++            return 0;
++
++        case GC_CTRL_SEEK:
++            gc->ig_timeline_pts = -1;
++
++            bd_mutex_unlock(&gc->mutex);
++            return 0;
++
+         default:;
+     }
+ 
+@@ -2011,6 +2075,8 @@
+             break;
+ 
+         case GC_CTRL_VK_KEY:
++            /* user input is shown immediately */
++            gc->ig_timeline_pts = -1;
+             if (param != BD_VK_POPUP) {
+                 result = _user_input(gc, param, cmds);
+                 break;
+@@ -2020,6 +2086,7 @@
+             /* fall thru */
+ 
+         case GC_CTRL_POPUP:
++            gc->ig_timeline_pts = -1;
+             if (gc->igs->ics->interactive_composition.ui_model != IG_UI_MODEL_POPUP) {
+                 /* not pop-up menu */
+                 break;
+@@ -2040,6 +2107,9 @@
+             break;
+ 
+         case GC_CTRL_INIT_MENU:
++            /* present a display set decoded from the stream at its pts */
++            gc->ig_timeline_pts = param ? gc->igs->valid_pts : -1;
++            gc->ig_timeline_scr = gc->ig_render_scr = gc->ig_step_scr = bd_get_scr();
+             _select_page(gc, 0, 0);
+             _render_page(gc, 0xffff, cmds);
+             break;
+@@ -2058,6 +2128,7 @@
+             break;
+ 
+         case GC_CTRL_MOUSE_MOVE:
++            gc->ig_timeline_pts = -1;
+             result = _mouse_move(gc, param >> 16, param & 0xffff, cmds);
+             break;
+ #ifndef __COVERITY__
+@@ -2066,6 +2137,8 @@
+          * but not handled here.
+          */
+         case GC_CTRL_RESET:
++        case GC_CTRL_CLIP_END:
++        case GC_CTRL_SEEK:
+         case GC_CTRL_PG_RESET:
+         case GC_CTRL_PG_UPDATE:
+         case GC_CTRL_PG_CHARCODE:
+diff -ruN a/src/libbluray/decoders/graphics_controller.h b/src/libbluray/decoders/graphics_controller.h
+--- a/src/libbluray/decoders/graphics_controller.h
++++ b/src/libbluray/decoders/graphics_controller.h
+@@ -44,9 +44,12 @@
+ 
+ typedef enum {
+     /* */
+-    GC_CTRL_INIT_MENU,       /* */
++    GC_CTRL_INIT_MENU,       /* param: 1 when the display set was just decoded from the stream */
+     GC_CTRL_NOP,             /* No input. Render page / run timers / run animations */
+     GC_CTRL_RESET,           /* reset graphics controller */
++    GC_CTRL_CLIP_END,        /* reading moved to the next clip, param: (int32_t) 90 kHz step
++                              * from the next clip's clock to the old one (old out - new in) */
++    GC_CTRL_SEEK,            /* reading jumped: IG renders are no longer on a timeline */
+ 
+     /* user input */
+     GC_CTRL_VK_KEY,          /* param: bd_vk_key_e */
