@@ -37,9 +37,11 @@
  * it was doing something.
  *
  *   OPEN  (1)  payload is `key=value` lines, one per line: `lib` (required,
- *              the engine to load), and `config`, `layout`, `bridge`, `codec`
- *              and `rate`. Must come first. Unknown keys are ignored, so a
- *              newer host can send a key this build does not know.
+ *              the engine to load), and `config`, `layout`, `bridge`, `codec`,
+ *              `rate` and `decode_thread` (`on` or `off`; unset means on for
+ *              TrueHD, off otherwise). Must come first. Unknown keys are
+ *              ignored, so a newer host can send a key this build does not
+ *              know.
  *   FEED  (2)  payload is input for the bridge named in OPEN, passed on
  *              as it is. For the Harletty bridge that is one raw encoded
  *              packet, exactly as it comes off Kodi's stream parser before
@@ -65,8 +67,9 @@
  * FLUSH AND RESET
  *
  * FLUSH is an end-of-stream operation. It calls the optional `orender_drain`
- * entry point, emits its final metadata and audio using the same framing as
- * FEED, then writes the `flush` acknowledgement. The acknowledgement therefore
+ * entry point until it returns no audio - one packet's per call - emits the
+ * final metadata and audio using the same framing as FEED, then writes the
+ * `flush` acknowledgement. The acknowledgement therefore
  * means every preceding output byte belongs to the completed stream. Older
  * engines without the symbol still acknowledge, with a diagnostic that drain
  * was unavailable.
@@ -167,6 +170,7 @@ typedef struct
   uint32_t (*hrir_in_use)(const OrenderRenderer*, char*, uint32_t);
   uint32_t (*decoded_sample_rate)(const OrenderRenderer*);
   int (*drain)(OrenderRenderer*, float*, uintptr_t, uintptr_t*, uint32_t*, int64_t*);
+  int (*set_option)(OrenderRenderer*, const char*, const char*);
   uint32_t (*version_major)(void);
   uint32_t (*version_minor)(void);
 } Api;
@@ -278,6 +282,7 @@ typedef struct
   const char* bridge;
   const char* codec;
   const char* rate;
+  const char* decode_thread;
 } OpenArgs;
 
 static void parse_open(char* text, size_t len, OpenArgs* out)
@@ -311,6 +316,8 @@ static void parse_open(char* text, size_t len, OpenArgs* out)
         out->codec = v;
       else if (strcmp(k, "rate") == 0)
         out->rate = v;
+      else if (strcmp(k, "decode_thread") == 0)
+        out->decode_thread = v;
       /* Unknown keys are ignored on purpose: a newer host may send a key this
        * build does not know, and refusing the whole stream over it would be a
        * worse failure than proceeding without it. */
@@ -364,6 +371,7 @@ static int bind_engine(const char* path)
   *(void**)(&api.hrir_in_use) = dlsym(lib_handle, "orender_hrir_in_use");
   *(void**)(&api.decoded_sample_rate) = dlsym(lib_handle, "orender_decoded_sample_rate");
   *(void**)(&api.drain) = dlsym(lib_handle, "orender_drain");
+  *(void**)(&api.set_option) = dlsym(lib_handle, "orender_set_option");
   *(void**)(&api.version_minor) = dlsym(lib_handle, "orender_version_minor");
   return 0;
 }
@@ -696,9 +704,30 @@ int main(void)
           exit_code = 3;
           goto done;
         }
-        emit_status(ST_OK, "open codec=%s rate=%u engine=%u.%u", a.codec ? a.codec : "(sniffed)",
-                    (unsigned)cfg.sample_rate, api.version_major(),
-                    api.version_minor ? api.version_minor() : 0);
+
+        /* Decode on a thread of the engine's own, overlapping the render, so
+         * the two share the work across two cores. It is the engine's
+         * `decode_thread` option, off unless a host asks, because a packet's
+         * audio then comes out of a later FEED or of the FLUSH - which this
+         * helper already allows for: it takes every block's timestamp from the
+         * engine and drains on FLUSH. On by default for TrueHD and E-AC-3,
+         * where decoding is a third or more of the work - more than half for
+         * E-AC-3 with Atmos objects; PCM has nothing worth a thread. OPEN's
+         * `decode_thread` overrides the default either way. An engine without
+         * the option renders inline. */
+        const char* decode_thread = a.decode_thread;
+        if (!decode_thread && a.codec &&
+            (strcmp(a.codec, "truehd") == 0 || strcmp(a.codec, "eac3") == 0))
+          decode_thread = "on";
+        int threaded = 0;
+        if (decode_thread && api.set_option)
+          threaded = api.set_option(renderer, "decode_thread", decode_thread) == 0 &&
+                     strcmp(decode_thread, "on") == 0;
+
+        emit_status(ST_OK, "open codec=%s rate=%u engine=%u.%u decode_thread=%s",
+                    a.codec ? a.codec : "(sniffed)", (unsigned)cfg.sample_rate,
+                    api.version_major(), api.version_minor ? api.version_minor() : 0,
+                    threaded ? "on" : "off");
         break;
       }
 
@@ -839,45 +868,51 @@ int main(void)
           break;
         }
 
-        uintptr_t frames = 0;
-        uint32_t channels = 0;
-        int64_t pts_out = 0;
-        int rc;
-
-        /* A positive result retains the rendered tail inside the engine. Grow
-         * and retry before accepting more input, just as the ABI requires. */
+        /* One packet's audio per call, oldest first, until 0 frames say nothing
+         * is left. */
         for (;;)
         {
-          rc = api.drain(renderer, out, out_floats, &frames, &channels, &pts_out);
-          if (rc <= 0)
-            break;
-          if (out_floats >= OUT_FLOATS_MAX)
-          {
-            emit_status(ST_DECODE, "drain needed more than %u floats of output",
-                        OUT_FLOATS_MAX);
-            break;
-          }
-          size_t want = out_floats * 2;
-          if (want > OUT_FLOATS_MAX)
-            want = OUT_FLOATS_MAX;
-          float* grown = (float*)realloc(out, want * sizeof(float));
-          if (!grown)
-          {
-            emit_status(ST_DECODE, "out of memory growing the drain buffer");
-            break;
-          }
-          out = grown;
-          out_floats = want;
-        }
+          uintptr_t frames = 0;
+          uint32_t channels = 0;
+          int64_t pts_out = 0;
+          int rc;
 
-        if (rc != 0)
-        {
-          decode_errors++;
-          if (rc < 0)
-            emit_status(ST_DECODE, "engine drain failed");
-        }
-        else if (rc == 0 && frames)
-        {
+          /* A positive result retains the rendered audio inside the engine.
+           * Grow and retry before accepting more input, just as the ABI
+           * requires. */
+          for (;;)
+          {
+            rc = api.drain(renderer, out, out_floats, &frames, &channels, &pts_out);
+            if (rc <= 0)
+              break;
+            if (out_floats >= OUT_FLOATS_MAX)
+            {
+              emit_status(ST_DECODE, "drain needed more than %u floats of output",
+                          OUT_FLOATS_MAX);
+              break;
+            }
+            size_t want = out_floats * 2;
+            if (want > OUT_FLOATS_MAX)
+              want = OUT_FLOATS_MAX;
+            float* grown = (float*)realloc(out, want * sizeof(float));
+            if (!grown)
+            {
+              emit_status(ST_DECODE, "out of memory growing the drain buffer");
+              break;
+            }
+            out = grown;
+            out_floats = want;
+          }
+
+          if (rc != 0)
+          {
+            decode_errors++;
+            if (rc < 0)
+              emit_status(ST_DECODE, "engine drain failed");
+            break;
+          }
+          if (!frames)
+            break;
           report_stream_info(renderer, channels, &stream_info);
           if (channels != 2)
           {

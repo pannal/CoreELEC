@@ -27,7 +27,8 @@ OrenderRenderer* orender_create(const OrenderConfig* config)
   FakeRenderer* r = (FakeRenderer*)calloc(1, sizeof(*r));
   if (r)
   {
-    r->tail_pending = 1;
+    /* Two packets held, as on the decode thread; drain returns one per call. */
+    r->tail_pending = 2;
     r->source_present = 1;
   }
   return (OrenderRenderer*)r;
@@ -145,6 +146,16 @@ uint32_t orender_hrir_in_use(const OrenderRenderer* renderer, char* out, uint32_
   return n;
 }
 
+/* Knows the one option the helper sets, so the default it picks per codec
+ * shows on the open line. */
+int orender_set_option(OrenderRenderer* renderer, const char* key, const char* value)
+{
+  (void)renderer;
+  if (strcmp(key, "decode_thread") != 0)
+    return -1;
+  return strcmp(value, "on") == 0 || strcmp(value, "off") == 0 ? 0 : -2;
+}
+
 int orender_drain(OrenderRenderer* renderer,
                   float* out,
                   uintptr_t out_cap_samples,
@@ -163,7 +174,7 @@ int orender_drain(OrenderRenderer* renderer,
     return 1;
   for (uintptr_t i = 0; i < samples; i++)
     out[i] = (i & 1) ? -0.125f : 0.125f;
-  r->tail_pending = 0;
+  r->tail_pending--;
   r->drained = 1;
   *out_frames = samples / 2;
   return 0;
