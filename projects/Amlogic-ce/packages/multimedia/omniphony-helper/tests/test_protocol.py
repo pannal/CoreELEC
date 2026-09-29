@@ -30,9 +30,10 @@ h.send(OP_OPEN, f"lib={library_path}\n".encode())
 wait_for(h, lambda: any(code == ST_OK and text.startswith("open ")
                          for code, text in h.status))
 
-# The fake's first FEED is held entirely; FLUSH must grow its output buffer,
-# retry without losing the retained tail, report metadata, emit audio, and only
-# then acknowledge completion.
+# The fake's first FEED is held entirely, as two packets that drain returns one
+# per call; FLUSH must grow its output buffer, retry without losing the retained
+# audio, call drain until it returns nothing, report metadata, emit audio, and
+# only then acknowledge completion.
 h.send(OP_FEED, b"held packet")
 h.send(OP_FLUSH)
 wait_for(h, lambda: any(code == ST_OK and text == "flush" for code, text in h.status))
@@ -40,7 +41,7 @@ wait_for(h, lambda: any(code == ST_OK and text == "flush" for code, text in h.st
 flush_at = next(i for i, event in enumerate(h.events)
                 if event[0] == "status" and event[2] == "flush")
 audio_before = [event for event in h.events[:flush_at] if event[0] == "audio"]
-assert sum(event[1] for event in audio_before) == 40000
+assert [event[1] for event in audio_before] == [40000, 40000]
 assert not any(event[0] == "audio" for event in h.events[flush_at + 1:])
 
 lines = [text for code, text in h.status if code == ST_INFO]
@@ -71,4 +72,22 @@ assert second_events[-1][0] == "status" and second_events[-1][2] == "flush"
 h.send(OP_CLOSE)
 rc, stderr = h.finish()
 assert rc == 0, stderr
+
+# The decode thread's default follows the codec - on for TrueHD and E-AC-3,
+# whose decoding is a large share of the work, off otherwise - and OPEN's
+# decode_thread key overrides it.
+for extra, want in (("codec=truehd\n", "on"), ("codec=eac3\n", "on"),
+                    ("codec=dts\n", "off"), ("", "off"),
+                    ("codec=eac3\ndecode_thread=off\n", "off")):
+    h = Helper(helper_path)
+    h.send(OP_OPEN, f"lib={library_path}\n{extra}".encode())
+    wait_for(h, lambda: any(code == ST_OK and text.startswith("open ")
+                             for code, text in h.status))
+    opened = next(text for code, text in h.status
+                  if code == ST_OK and text.startswith("open "))
+    assert opened.endswith(f"decode_thread={want}"), (extra, opened)
+    h.send(OP_CLOSE)
+    rc, stderr = h.finish()
+    assert rc == 0, stderr
+
 print("helper protocol: PASS")

@@ -2,8 +2,8 @@
 # Copyright (C) 2026-present Team CoreELEC (https://coreelec.org)
 
 PKG_NAME="omniphony"
-PKG_VERSION="89d402f11f667e8ee9f989c6725b7cc606cc07a7"
-PKG_SHA256="891c25286693cb8fc95c4d9f2711feb21ab41e94b4f382806144a13730179dc6"
+PKG_VERSION="a69f591cfdc79da6d5ca6f7db389d75a2c6fae91"
+PKG_SHA256="379e2fb73cd2a6fa495b39759d8cc4feb633507ebce266ebf2f26b6bdb073c1c"
 PKG_LICENSE="GPL-3.0-or-later"
 PKG_SITE="https://github.com/mgth/Omniphony"
 # The fork rather than PKG_SITE. It follows the current upstream interfaces and
@@ -19,17 +19,22 @@ PKG_SITE="https://github.com/mgth/Omniphony"
 #     and for DTS-HD MA the one it can name is the core's 48 kHz while an XLL
 #     extension riding that core decodes at 96, so the codec opens at its guess
 #     and re-opens at what the engine says.
-#   - orender_drain renders what the decoder is still holding when the input
-#     ends. The helper calls it from FLUSH and sends the resulting audio before
-#     acknowledging end of stream. The Harletty pin implements the paired
-#     bridge_api 0.4 method.
+#   - orender_drain renders what the engine still holds when the input ends:
+#     what the decode thread has not returned yet, then what the decoder is
+#     still holding, one packet's audio per call. The helper calls it from
+#     FLUSH until it returns nothing and sends the audio before acknowledging
+#     end of stream. The Harletty pin implements the paired bridge_api 0.4
+#     method.
 #   - orender_hrir_in_use names the HRIR set the binaural path is convolving
 #     with. The helper passes it on as hrir= and the codec shows it as the head
 #     model, so a SOFA file the engine could not load reads Built-in.
 #
 # ABI 8 supplies the upstream height-tier labels, ABI 9 the NUL-terminated
-# orender_source_label query, and this fork's decoded-rate, drain and HRIR
-# additions are ABI 10. Every optional symbol is probed with dlsym;
+# orender_source_label query, ABI 10 the decode thread (orender_set_option's
+# `decode_thread`, which the helper turns on for TrueHD and E-AC-3) and
+# orender_drain, ABI 11 the thread's live option and
+# orender_output_packet_pts, and this fork's decoded-rate, decoder-drain and
+# HRIR additions are ABI 12. Every optional symbol is probed with dlsym;
 # major-version mismatch is still fatal. The build produces both orender_ffi
 # and pcm_bridge from this same pin so the C ABI and Rust bridge_api stay
 # paired.
