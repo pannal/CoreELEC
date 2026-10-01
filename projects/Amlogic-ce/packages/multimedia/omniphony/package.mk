@@ -2,8 +2,8 @@
 # Copyright (C) 2026-present Team CoreELEC (https://coreelec.org)
 
 PKG_NAME="omniphony"
-PKG_VERSION="a69f591cfdc79da6d5ca6f7db389d75a2c6fae91"
-PKG_SHA256="379e2fb73cd2a6fa495b39759d8cc4feb633507ebce266ebf2f26b6bdb073c1c"
+PKG_VERSION="4545dad161009001d91efdca895ab0ff7649f984"
+PKG_SHA256="b0b99aab64c140adb5d6691b78db9434cc17cbb83ec3f98fd9abea2b4469154f"
 PKG_LICENSE="GPL-3.0-or-later"
 PKG_SITE="https://github.com/mgth/Omniphony"
 # The fork rather than PKG_SITE. It follows the current upstream interfaces and
@@ -53,29 +53,18 @@ PKG_TOOLCHAIN="manual"
 # always built aarch64, and this package has two jobs depending on which pass
 # is running it:
 #
-#   aarch64  build liborender.so, and pull in the other two 64-bit packages so
-#            one command produces the whole 64-bit side. On an aarch64 image
-#            that is also the end of it - everything installs natively.
-#   arm      compile nothing; assemble what the aarch64 pass left behind into
-#            the image, together with the 64-bit runtime it needs to start
-#
-# glibc and gcc are in the aarch64 list for their install trees, not for
-# anything they compile: they own the loader, the C library and libgcc_s that a
-# 64-bit process needs on a 32-bit image. Without them here, gcc:target is
-# never built by a `scripts/build omniphony` - only the virtual image package
-# pulls it - and libgcc_s.so.1 exists nowhere the 32-bit pass can find it.
+#   aarch64  build liborender.so, and pull in the other two 64-bit packages.
+#            On an aarch64 image that is the end of it - everything installs
+#            natively. For a 32-bit image, omniphony-bundle packs what this
+#            pass built.
+#   arm      compile nothing; install the configuration below, and pull in
+#            omniphony-bundle, which installs the 64-bit side - from a pinned
+#            download, or with OMNIPHONY_FROM_SOURCE=yes from the aarch64 pass.
 if [ "${TARGET_ARCH}" = "aarch64" ]; then
-  PKG_DEPENDS_TARGET="toolchain cargo:host harletty-bridge omniphony-helper glibc gcc"
+  PKG_DEPENDS_TARGET="toolchain cargo:host harletty-bridge omniphony-helper"
 else
-  PKG_DEPENDS_TARGET="toolchain"
+  PKG_DEPENDS_TARGET="toolchain omniphony-bundle"
 fi
-
-# This package's stamp has to move with the other two. The arm pass copies
-# their aarch64 builds into the image, and nothing else would tell it they
-# changed; the aarch64 pass is started as `scripts/build omniphony`, which
-# returns on a matching stamp before it looks at its dependencies. Without
-# this, a new helper or a re-pinned bridge left the image shipping the old one.
-PKG_NEED_UNPACK="$(get_pkg_directory harletty-bridge) $(get_pkg_directory omniphony-helper)"
 
 # The cargo workspace sits in a subdirectory of the repository; the rest of the
 # repo (the standalone player, the studio GUIs) is not built here.
@@ -89,84 +78,6 @@ PKG_OMNIPHONY_MANIFEST="omniphony-renderer/Cargo.toml"
 # is /usr/lib/kodi, so the payload sits one level below it.
 PKG_OMNIPHONY_DIR="/usr/lib/kodi/omniphony"
 
-# config/path composes BUILD from ${TARGET_ARCH} and appends -${BUILD_SUFFIX}
-# when one is set. Nothing else in the name changes between the two passes, and
-# the aarch64 pass is run with the same suffix, so its tree is a deterministic
-# sibling of this one: the suffix comes off, the architecture changes, and the
-# suffix goes back on.
-OMNI_BUILD_SUFFIX="${BUILD_SUFFIX:+-${BUILD_SUFFIX}}"
-OMNI_A64_BUILD="${BUILD%"${OMNI_BUILD_SUFFIX}"}"
-OMNI_A64_BUILD="${OMNI_A64_BUILD%".${TARGET_ARCH}-${OS_MAJOR}"}.aarch64-${OS_MAJOR}${OMNI_BUILD_SUFFIX}"
-
-# Where a package installed to in the aarch64 pass. PKG_INSTALL is composed
-# from ${BUILD}, which is the only part of the path that differs between the
-# passes, so the substitution is enough - no second copy of the naming rule.
-omni_a64_install_dir() {
-  local _dir="$(get_install_dir "${1}")"
-  echo "${_dir/${BUILD}/${OMNI_A64_BUILD}}"
-}
-
-# ELF header: e_ident[EI_CLASS] at offset 4 is 2 for 64-bit, and the low byte of
-# the little-endian e_machine at offset 18 is 183, EM_AARCH64. Read with od
-# because readelf is target-prefixed in this pass and an unprefixed one is not
-# guaranteed to be on PATH.
-omni_is_aarch64() {
-  [ -f "${1}" ] || return 1
-  [ "$(od -An -tu1 -j4 -N1 "${1}" | tr -d ' ')" = "2" ] || return 1
-  [ "$(od -An -tu1 -j18 -N1 "${1}" | tr -d ' ')" = "183" ]
-}
-
-# Install the first candidate that really is an aarch64 object, or return 1.
-# The architecture check is part of the choice rather than an assertion after
-# it, so a host copy sharing a name is skipped instead of being fatal.
-omni_try_a64_libs() {
-  local _dest="${1}" _cand
-  shift
-
-  for _cand in "$@"; do
-    [ -e "${_cand}" ] || continue
-    OMNI_TRIED+="
-    ${_cand}"
-    if omni_is_aarch64 "${_cand}"; then
-      cp -L "${_cand}" "${_dest}"
-      return 0
-    fi
-  done
-  return 1
-}
-
-# Where one 64-bit runtime library is expected to be, best first.
-omni_a64_lib_candidates() {
-  local _name="${1}"
-
-  # The compiler that built the objects knows which copy they were linked
-  # against, and it is a host binary, so this pass can simply ask it. This is
-  # the only source that is right by construction rather than by convention.
-  [ -n "${OMNI_A64_CC}" ] && ${OMNI_A64_CC} -print-file-name=${_name}
-
-  # The install trees glibc and gcc produce in that pass: the same files, and
-  # what a 64-bit image would ship.
-  echo "$(omni_a64_install_dir glibc)/usr/lib/${_name}"
-  echo "$(omni_a64_install_dir gcc)/usr/lib/${_name}"
-  echo ${OMNI_A64_BUILD}/toolchain/aarch64-*/sysroot/usr/lib/${_name}
-}
-
-omni_install_a64_lib() {
-  local _dest="${1}" _name="${2}"
-  OMNI_TRIED=""
-
-  omni_try_a64_libs "${_dest}" $(omni_a64_lib_candidates "${_name}") && return 0
-
-  # Not where it was expected. Widen to a bounded search of that pass's whole
-  # toolchain before giving up - reached only when the layout is not what this
-  # package believes, which is exactly when guessing harder is worth the walk.
-  omni_try_a64_libs "${_dest}" \
-    $(find ${OMNI_A64_BUILD}/toolchain -name "${_name}" -type f 2>/dev/null) && return 0
-
-  die "omniphony: the aarch64 pass has no ${_name}.
-Existing files considered, none of them aarch64 objects:${OMNI_TRIED:-
-    (none)}"
-}
 
 make_target() {
   # Only the 64-bit pass compiles anything.
@@ -204,9 +115,9 @@ makeinstall_target() {
   if [ "${TARGET_ARCH}" = "aarch64" ]; then
     # On a 64-bit image this is the whole job: the engine here, the bridge and
     # the helper from their own packages, all native, nothing to bridge across
-    # a word size. On a 32-bit image the same install_pkg is instead what the
-    # 32-bit pass below copies from. Strip here either way, where ${STRIP} is
-    # the aarch64 one - the 32-bit pass could not strip these if it tried.
+    # a word size. For a 32-bit image the same install_pkg is instead what
+    # omniphony-bundle packs. Strip here either way, where ${STRIP} is the
+    # aarch64 one - the 32-bit pass could not strip these if it tried.
     local _out="${PKG_BUILD}/.${TARGET_NAME}/target/${TARGET_NAME}/release"
 
     # The real file takes the soname the engine's build.rs stamps into it, and
@@ -221,81 +132,5 @@ makeinstall_target() {
 
     debug_strip ${INSTALL}${PKG_OMNIPHONY_DIR}/liborender.so.0 \
                 ${INSTALL}${PKG_OMNIPHONY_DIR}/libpcm_bridge.so
-    return 0
   fi
-
-  # --- the 32-bit pass: assemble what the image ships -----------------------
-
-  if [ ! -d "${OMNI_A64_BUILD}" ]; then
-    die "omniphony: no aarch64 build at ${OMNI_A64_BUILD}.
-
-Binaural audio decodes and renders in a 64-bit helper process, so that pass
-has to happen before the image is built:
-
-  PROJECT=${PROJECT} DEVICE=${DEVICE} ARCH=aarch64 ${BUILD_SUFFIX:+BUILD_SUFFIX=${BUILD_SUFFIX} }./scripts/build omniphony
-
-That builds the engine, the decoder bridges and the helper. Then build the
-image as usual."
-  fi
-
-  local _a64_omni="$(omni_a64_install_dir omniphony)"
-  local _a64_bridge="$(omni_a64_install_dir harletty-bridge)"
-  local _a64_helper="$(omni_a64_install_dir omniphony-helper)"
-
-  # Taken by explicit path rather than a wildcard, so a tree left over from an
-  # older version is a hard error instead of a silent mismatch: the bridge ABI
-  # is abi_stable-checked when the engine loads it, and a mismatched pair fails
-  # at runtime rather than here.
-  local _dir
-  for _dir in "${_a64_omni}" "${_a64_bridge}" "${_a64_helper}"; do
-    [ -d "${_dir}${PKG_OMNIPHONY_DIR}" ] || \
-      die "omniphony: the aarch64 pass has not installed ${_dir}${PKG_OMNIPHONY_DIR}"
-  done
-
-  cp -a ${_a64_omni}${PKG_OMNIPHONY_DIR}/liborender.so.0 ${INSTALL}${PKG_OMNIPHONY_DIR}/
-  ln -sf liborender.so.0 ${INSTALL}${PKG_OMNIPHONY_DIR}/liborender.so
-  cp -a ${_a64_omni}${PKG_OMNIPHONY_DIR}/libpcm_bridge.so ${INSTALL}${PKG_OMNIPHONY_DIR}/
-  cp -a ${_a64_bridge}${PKG_OMNIPHONY_DIR}/libharletty_bridge.so ${INSTALL}${PKG_OMNIPHONY_DIR}/
-  cp -a ${_a64_helper}${PKG_OMNIPHONY_DIR}/omniphony-helper ${INSTALL}${PKG_OMNIPHONY_DIR}/
-
-  # The 64-bit runtime. A 64-bit process cannot borrow this image's libraries,
-  # so it brings its own - taken from the aarch64 pass that built the objects,
-  # so the loader, the C library and the objects are one matched set.
-  #
-  # That pass's compiler is a host binary sitting in the sibling tree, so it
-  # runs here and can be asked directly where each library is, rather than this
-  # pass having to know the toolchain's layout.
-  OMNI_A64_CC="$(ls ${OMNI_A64_BUILD}/toolchain/bin/aarch64-*-gcc 2>/dev/null | head -1)"
-
-  mkdir -p ${INSTALL}${PKG_OMNIPHONY_DIR}/lib
-  local _lib
-  for _lib in libc.so.6 libm.so.6 libgcc_s.so.1; do
-    omni_install_a64_lib "${INSTALL}${PKG_OMNIPHONY_DIR}/lib/${_lib}" "${_lib}"
-  done
-
-  # The loader is the one file that cannot live in a private directory: the
-  # linker bakes its path into the helper's PT_INTERP, and the kernel resolves
-  # that before anything in the process can influence a search. So it goes
-  # where the aarch64 ABI says it goes. Nothing collides - this image's own
-  # loader is ld-linux-armhf.so.3 - and scripts/image links /lib to /usr/lib,
-  # so both spellings of the interpreter path resolve to this file.
-  mkdir -p ${INSTALL}/usr/lib
-  omni_install_a64_lib "${INSTALL}/usr/lib/ld-linux-aarch64.so.1" ld-linux-aarch64.so.1
-
-  # --force-rpath writes DT_RPATH instead of DT_RUNPATH. Either tag would do
-  # here, because every object that needs the private directory is given one
-  # directly - the engine and the bridge are dlopened rather than linked, so
-  # neither is reached through the helper's own tag. RPATH is chosen because it
-  # is inherited down the dependency chain where RUNPATH is not, so it keeps
-  # covering these four if they pick up a new dependency later. The usual
-  # reason to prefer RUNPATH, that it can be overridden with LD_LIBRARY_PATH,
-  # does not apply: nothing on this image sets one for Kodi.
-  #
-  # Every dlopened object needs its own tag, so a bridge added here without
-  # being added to this list would load on a developer's box and fail on the
-  # image, where libgcc_s lives only in the private directory.
-  local _obj
-  for _obj in omniphony-helper liborender.so.0 libharletty_bridge.so libpcm_bridge.so; do
-    patchelf --force-rpath --set-rpath '$ORIGIN/lib' ${INSTALL}${PKG_OMNIPHONY_DIR}/${_obj}
-  done
 }
