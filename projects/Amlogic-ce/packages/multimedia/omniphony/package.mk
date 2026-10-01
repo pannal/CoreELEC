@@ -2,8 +2,8 @@
 # Copyright (C) 2026-present Team CoreELEC (https://coreelec.org)
 
 PKG_NAME="omniphony"
-PKG_VERSION="a69f591cfdc79da6d5ca6f7db389d75a2c6fae91"
-PKG_SHA256="379e2fb73cd2a6fa495b39759d8cc4feb633507ebce266ebf2f26b6bdb073c1c"
+PKG_VERSION="4545dad161009001d91efdca895ab0ff7649f984"
+PKG_SHA256="b0b99aab64c140adb5d6691b78db9434cc17cbb83ec3f98fd9abea2b4469154f"
 PKG_LICENSE="GPL-3.0-or-later"
 PKG_SITE="https://github.com/mgth/Omniphony"
 # The fork rather than PKG_SITE. It follows the current upstream interfaces and
