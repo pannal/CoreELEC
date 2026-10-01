@@ -34,8 +34,8 @@ PKG_TOOLCHAIN="manual"
 
 # 64-bit only, and deliberately so. Kodi's binaural codec runs the decode and
 # the render in a helper process precisely because this image's userspace is
-# 32-bit, where the same work costs roughly twice as much. The omniphony
-# package copies what this produces into the 32-bit image.
+# 32-bit, where the same work costs roughly twice as much. omniphony-bundle
+# packs what this produces for the 32-bit image.
 PKG_ARCH="aarch64"
 
 # Where the codec expects to find the bridge - see omniphony/package.mk.
@@ -62,8 +62,8 @@ make_target() {
 }
 
 makeinstall_target() {
-  # This pass builds no image; it installs so the 32-bit pass has somewhere to
-  # copy from. Strip here, where ${STRIP} is the aarch64 one.
+  # This pass builds no image; it installs so omniphony-bundle has somewhere to
+  # pack from. Strip here, where ${STRIP} is the aarch64 one.
   mkdir -p ${INSTALL}${PKG_OMNIPHONY_DIR}
   cp ${PKG_BUILD}/.${TARGET_NAME}/target/${TARGET_NAME}/release/libharletty_bridge.so \
      ${INSTALL}${PKG_OMNIPHONY_DIR}/
