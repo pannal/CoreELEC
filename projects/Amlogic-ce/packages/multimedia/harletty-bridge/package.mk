@@ -2,17 +2,24 @@
 # Copyright (C) 2026-present Team CoreELEC (https://coreelec.org)
 
 PKG_NAME="harletty-bridge"
-PKG_VERSION="8f4d88f6f9281d05cdaccab5191205ed8787ab9f"
-PKG_SHA256="9bdcd9970ed9d536dc34ea882f24c45cc3c8fa75a6473501b4121ffa07059d9c"
-PKG_LICENSE="Apache-2.0"
+PKG_VERSION="ec6516ff878fd9c5be75a4acd64310b995a897ca"
+PKG_SHA256="7b415107407288a069f5049a24290b27d28f131504a7235f8abc3a26d9726377"
+# The sources are Apache-2.0, but the library links bridge_api, spdif and sys
+# from Omniphony, which are GPL-3.0-or-later, so the built bridge is too - as
+# bridge/Cargo.toml states.
+PKG_LICENSE="GPL-3.0-or-later"
 PKG_SITE="https://github.com/harletty/harletty-bridge"
 # The fork rather than PKG_SITE. Its parent is the updated main branch, which
 # now supplies the former fork fixes, source labels/families, Auro layouts,
 # corrected DTS side positions and DTS-HD HRA decoding (including the examined
-# lossy-carrier DTS:X 7.1.4 form). Two feature commits are retained. One decides
-# a presentation from one parse, avoids redundant bed clones and drains the
-# final buffered access unit. The other forwards the bridge's own log records
-# to the host - not its decoders' per-block traces - and reports a DTS:X
+# lossy-carrier DTS:X 7.1.4 form), recomputes the bed fold of a DTS:X object
+# the encoder panned into the bed from its position, inspects each E-AC-3
+# access unit at most once, and builds releases with thin LTO and its TrueHD
+# decoder from its own truehd fork, a git dependency cargo fetches with the
+# rest. Two feature commits are retained. One hands the decoded core back from
+# object reconstruction rather than cloning it for every object frame, and
+# drains the final buffered access unit. The other forwards the bridge's own log
+# records to the host - not its decoders' per-block traces - and reports a DTS:X
 # extension that never decodes, so those warnings reach kodi.log rather than
 # being dropped.
 #
@@ -53,8 +60,9 @@ pre_make_target() {
 make_target() {
   export RUSTC_LINKER="${CC}"
 
-  # No `neon` feature: it gates the 32-bit ARM QMF path, and on aarch64 the
-  # vector unit is baseline and the compiler is already using it.
+  # Nothing to enable for the vector code: the E-AC-3 QMF and IMDCT choose
+  # their NEON kernels by target_arch, so every aarch64 build takes them, and
+  # the AVX2 and AVX-512 paths are x86-64 only.
   cargo build --manifest-path ${PKG_BUILD}/Cargo.toml \
               --target ${TARGET_NAME} \
               --release \

@@ -2,8 +2,8 @@
 # Copyright (C) 2026-present Team CoreELEC (https://coreelec.org)
 
 PKG_NAME="omniphony"
-PKG_VERSION="4545dad161009001d91efdca895ab0ff7649f984"
-PKG_SHA256="b0b99aab64c140adb5d6691b78db9434cc17cbb83ec3f98fd9abea2b4469154f"
+PKG_VERSION="fbf31ec96ab09778c9c535e11d311cc48aaf8e4f"
+PKG_SHA256="37d315dfe99c8354201ae45285fafa3f6b9e0b594e58205f8aac9e784c52777a"
 PKG_LICENSE="GPL-3.0-or-later"
 PKG_SITE="https://github.com/mgth/Omniphony"
 # The fork rather than PKG_SITE. It follows the current upstream interfaces and
@@ -33,8 +33,9 @@ PKG_SITE="https://github.com/mgth/Omniphony"
 # orender_source_label query, ABI 10 the decode thread (orender_set_option's
 # `decode_thread`, which the helper turns on for TrueHD and E-AC-3) and
 # orender_drain, ABI 11 the thread's live option and
-# orender_output_packet_pts, and this fork's decoded-rate, decoder-drain and
-# HRIR additions are ABI 12. Every optional symbol is probed with dlsym;
+# orender_output_packet_pts, ABI 12 upstream's heard_us, which this tree's
+# helper does not use, and this fork's decoded-rate, decoder-drain and HRIR
+# additions are ABI 13. Every optional symbol is probed with dlsym;
 # major-version mismatch is still fatal. The build produces both orender_ffi
 # and pcm_bridge from this same pin so the C ABI and Rust bridge_api stay
 # paired.

@@ -230,31 +230,15 @@ if [ -n "$(git -C "${ROOT}" branch -r --contains "${HEAD_SHA}" 2>/dev/null)" ]; 
 else
   echo "note: ${HEAD_SHA:0:12} is not on any remote branch, so GitHub tags its default branch" >&2
 fi
-# Where a pinned source is downloaded from, as https://github.com/<owner>/<repo>.
-src_repo() {
-  sed -n 's|^PKG_URL="\(https://github.com/[^/]*/[^/]*\)/archive/.*|\1|p' \
-    "${ROOT}/projects/Amlogic-ce/packages/multimedia/${1}/package.mk"
-}
-DIRTY="$(git -C "${ROOT}" status --porcelain -- projects/Amlogic-ce/packages/multimedia | grep -v "omniphony-bundle/package.mk" || true)"
 
-{
-  echo "Omniphony bundle ${VERSION} for 32-bit Amlogic-ng images: the engine, the decoder bridges, the helper and their 64-bit runtime, installed by the omniphony-bundle package."
-  echo
-  echo "Built from:"
-  echo '```'
-  cat "${MANIFEST}"
-  echo '```'
-  echo "CoreELEC commit ${HEAD_SHA}${DIRTY:+ with uncommitted package changes}."
-  echo
-  echo "Sources: $(src_repo omniphony)/tree/$(sed -n 's/^omniphony=//p' "${MANIFEST}") and $(src_repo harletty-bridge)/tree/$(sed -n 's/^harletty-bridge=//p' "${MANIFEST}"); the helper is projects/Amlogic-ce/packages/multimedia/omniphony-helper in this repository. The 64-bit glibc and libgcc_s are the CoreELEC toolchain's."
-  echo
-  echo "sha256: \`${SHA}\`"
-} > "${TMP}/notes.md"
+# The release notes are the manifest and nothing else: what the bundle was
+# built from, one pin per line.
+cp "${MANIFEST}" "${TMP}/notes.md"
 
 python3 - "${TAG}" "${TARGET}" "${TMP}/notes.md" > "${TMP}/create.json" <<'EOF'
 import json, sys
 tag, target, notes = sys.argv[1], sys.argv[2], open(sys.argv[3]).read()
-body = {"tag_name": tag, "name": tag, "body": notes, "draft": True, "make_latest": "false"}
+body = {"tag_name": tag, "name": tag, "body": notes, "draft": True}
 if target:
     body["target_commitish"] = target
 print(json.dumps(body))
@@ -273,8 +257,9 @@ if [ -n "${DIGEST}" ] && [ "${DIGEST}" != "sha256:${SHA}" ]; then
   die "GitHub stored ${DIGEST}, not sha256:${SHA}; release ${TAG} is left as a draft"
 fi
 
-say "publishing ${TAG}"
-echo '{"draft": false, "make_latest": "false"}' > "${TMP}/publish.json"
+# The new bundle takes the repository's "Latest" label from the one before it.
+say "publishing ${TAG} as the latest release"
+echo '{"draft": false, "make_latest": "true"}' > "${TMP}/publish.json"
 api PATCH "${API}/repos/${REPO}/releases/${RELEASE_ID}" "${TMP}/publish.json" > "${TMP}/published.json"
 
 # --- 4. the check ----------------------------------------------------------
