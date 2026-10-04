@@ -2,8 +2,8 @@
 # Copyright (C) 2026-present Team CoreELEC (https://coreelec.org)
 
 PKG_NAME="harletty-bridge"
-PKG_VERSION="ec6516ff878fd9c5be75a4acd64310b995a897ca"
-PKG_SHA256="7b415107407288a069f5049a24290b27d28f131504a7235f8abc3a26d9726377"
+PKG_VERSION="f3211cccdfe78d2e4d6d0c53b16b8e56fdd2a3c7"
+PKG_SHA256="e164c4e5eb6c810449b02c7cea576acc032e9730048cf63306829cacb00afe4b"
 # The sources are Apache-2.0, but the library links bridge_api, spdif and sys
 # from Omniphony, which are GPL-3.0-or-later, so the built bridge is too - as
 # bridge/Cargo.toml states.
