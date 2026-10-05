@@ -1,0 +1,295 @@
+#!/bin/bash
+
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026-present Team CoreELEC (https://coreelec.org)
+
+# Build the Omniphony bundle and publish it as a GitHub release, then pin it.
+#
+#   tools/omniphony-bundle-publish [--dry-run] [--force]
+#
+# Run from anywhere in the tree, with the omniphony, harletty-bridge and
+# omniphony-helper pins already as they will be committed. It:
+#
+#   1. picks the bundle's release number: PKG_VERSION as it stands if nothing
+#      is pinned under it yet, otherwise the next number - and past any number
+#      already published - and writes it to omniphony-bundle/package.mk;
+#   2. builds the bundle (ARCH=aarch64 scripts/build omniphony-bundle) and
+#      takes it from the output directory the build system resolves, checking
+#      the manifest inside it against this tree;
+#   3. creates a draft release tagged omniphony-bundle-<version>, uploads the
+#      tarball to it and publishes it - draft first, so it also works with
+#      release immutability on, where nothing can be added once published;
+#   4. downloads the published file and checks it against the local one;
+#   5. writes its checksum to PKG_SHA256 and commits package.mk alone, locally,
+#      as "omniphony: pin bundle-<version>".
+#
+# It pushes nothing, and its commit holds only package.mk: the pins it was
+# built from are committed as they are. If it stops part-way, package.mk keeps
+# the pin it had and nothing is committed.
+# --dry-run says which number it would use and stops there. If the pinned
+# bundle's own manifest is the one this tree would build, nothing it is built
+# from changed and it stops before building; --force publishes anyway, for a
+# change to how the bundle is assembled, which the manifest does not record.
+#
+# PROJECT and DEVICE default to Amlogic-ce and Amlogic-ng; ARCH is always
+# aarch64. BUILD_SUFFIX is passed on.
+#
+# The token: OMNIPHONY_BUNDLE_TOKEN if set, otherwise the file
+# ~/.config/omniphony-bundle/token - never a general GITHUB_TOKEN, which may
+# belong to something else. A fine-grained token for the repository the
+# bundle is published in, with Contents: read and write, is enough.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PKG_MK="${ROOT}/projects/Amlogic-ce/packages/multimedia/omniphony-bundle/package.mk"
+TOKEN_FILE="${HOME}/.config/omniphony-bundle/token"
+# Overridable only so the script can be tested against a stand-in server.
+API="${OMNIPHONY_BUNDLE_API:-https://api.github.com}"
+DOWNLOAD="${OMNIPHONY_BUNDLE_DOWNLOAD:-https://github.com}"
+
+DRY_RUN=no
+FORCE=no
+for _arg in "$@"; do
+  case "${_arg}" in
+    --dry-run) DRY_RUN=yes ;;
+    --force) FORCE=yes ;;
+    -h|--help) sed -n '/^# Build the Omniphony/,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "usage: ${0##*/} [--dry-run] [--force]" >&2; exit 2 ;;
+  esac
+done
+
+die() { echo "omniphony-bundle-publish: $*" >&2; exit 1; }
+say() { echo "==> $*"; }
+
+for _tool in curl python3 sha256sum git; do
+  command -v ${_tool} >/dev/null || die "${_tool} is not installed"
+done
+
+pkg_var() { sed -n "s/^${1}=\"\(.*\)\"$/\1/p" "${PKG_MK}"; }
+set_pkg_var() { sed -i "s/^${1}=\".*\"$/${1}=\"${2}\"/" "${PKG_MK}"; }
+
+# The repository is the one PKG_URL downloads from, so the two cannot drift.
+REPO="$(sed -n 's|.*"https://github.com/\([^/]*/[^/]*\)/releases/download/.*|\1|p' "${PKG_MK}")"
+[ -n "${REPO}" ] || die "no GitHub release URL in ${PKG_MK}"
+
+PKG_NAME="$(pkg_var PKG_NAME)"
+CUR_VERSION="$(pkg_var PKG_VERSION)"
+CUR_SHA="$(pkg_var PKG_SHA256)"
+[[ "${CUR_VERSION}" =~ ^[0-9]+$ ]] || die "PKG_VERSION \"${CUR_VERSION}\" is not a whole number"
+
+TOKEN="${OMNIPHONY_BUNDLE_TOKEN:-}"
+if [ -z "${TOKEN}" ] && [ -f "${TOKEN_FILE}" ]; then
+  if [ -n "$(find "${TOKEN_FILE}" -perm /077)" ]; then
+    echo "warning: ${TOKEN_FILE} can be read by other users; chmod 600 it" >&2
+  fi
+  TOKEN="$(tr -d '[:space:]' < "${TOKEN_FILE}")"
+fi
+[ -n "${TOKEN}" ] || die "no token: set OMNIPHONY_BUNDLE_TOKEN, or put one in ${TOKEN_FILE}"
+
+TMP="$(mktemp -d)"
+# package.mk is given a new number and an empty checksum for the build. Until
+# the new bundle is published and pinned, any way out - a failed build, a
+# refused upload, ^C - puts the pin it had back: that bundle is still
+# published, and an empty one would stop every ordinary arm build.
+PINNED=no
+on_exit() {
+  if [ "${PINNED}" != "yes" ] && [ -n "${CUR_VERSION:-}" ]; then
+    if [ "$(pkg_var PKG_VERSION)" != "${CUR_VERSION}" ] || [ "$(pkg_var PKG_SHA256)" != "${CUR_SHA}" ]; then
+      set_pkg_var PKG_VERSION "${CUR_VERSION}"
+      set_pkg_var PKG_SHA256 "${CUR_SHA}"
+      echo "omniphony-bundle-publish: package.mk is back to PKG_VERSION=${CUR_VERSION}, PKG_SHA256=${CUR_SHA:-empty}" >&2
+    fi
+  fi
+  rm -rf "${TMP}"
+}
+trap on_exit EXIT
+trap 'exit 130' INT TERM
+
+# One GitHub API call: api METHOD URL [body file] [content type]. Prints the
+# response body, and stops the script on any status but 2xx. The token goes to
+# curl on stdin, never on its command line, where any user could read it.
+api() {
+  local _method="${1}" _url="${2}" _body="${3:-}" _type="${4:-application/json}" _code
+  local _args=(-sS -K - -X "${_method}" -o "${TMP}/response" -w '%{http_code}'
+               -H "Accept: application/vnd.github+json")
+  [ -n "${_body}" ] && _args+=(-H "Content-Type: ${_type}" --data-binary "@${_body}")
+
+  _code="$(printf 'header = "Authorization: Bearer %s"\n' "${TOKEN}" | curl "${_args[@]}" "${_url}")" \
+    || die "${_method} ${_url}: request failed"
+  case "${_code}" in
+    2??) ;;
+    *) die "${_method} ${_url}: HTTP ${_code}
+$(cat "${TMP}/response" 2>/dev/null)" ;;
+  esac
+  cat "${TMP}/response"
+}
+
+json() { python3 -c "import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1]))" "${1}"; }
+
+# Ask the build system, as the aarch64 pass sees it: config/options reads
+# .coreelec/options and ~/.coreelec/options, so TARGET_DIR set there moves
+# target/, and the package's own function says what the manifest must be.
+ce() {
+  ( cd "${ROOT}" && PROJECT="${PROJECT:-Amlogic-ce}" DEVICE="${DEVICE:-Amlogic-ng}" ARCH=aarch64 \
+      bash -c ". config/options ${PKG_NAME} >/dev/null && ${1}" )
+}
+
+# The manifest inside a bundle tarball.
+tar_manifest() {
+  tar -xOJf "${1}" "${2}/usr/lib/kodi/omniphony/bundle.manifest"
+}
+
+# --- 1. the release number -------------------------------------------------
+
+say "asking the build system for the output directory and the manifest"
+TARGET_IMG="$(ce 'echo "${TARGET_IMG}"')"
+ce omni_bundle_manifest > "${TMP}/expected.manifest"
+[ -n "${TARGET_IMG}" ] && [ -s "${TMP}/expected.manifest" ] || die "config/options gave no TARGET_IMG or manifest"
+
+say "checking access to ${REPO}"
+api GET "${API}/repos/${REPO}" > /dev/null
+
+# Every release, drafts included (they are listed to anyone who can push).
+api GET "${API}/repos/${REPO}/releases?per_page=100" > "${TMP}/releases.json"
+published() {
+  python3 - "${TMP}/releases.json" "${1}" <<'EOF'
+import json, sys
+sys.exit(0 if any(r["tag_name"] == sys.argv[2] and not r["draft"] for r in json.load(open(sys.argv[1]))) else 1)
+EOF
+}
+
+# A pinned PKG_SHA256 means PKG_VERSION is already out, so the next one is due.
+VERSION="${CUR_VERSION}"
+[ -n "${CUR_SHA}" ] && VERSION=$((VERSION + 1))
+while published "${PKG_NAME}-${VERSION}"; do
+  VERSION=$((VERSION + 1))
+done
+TAG="${PKG_NAME}-${VERSION}"
+
+say "bundle ${VERSION} (package.mk has PKG_VERSION=${CUR_VERSION}, PKG_SHA256=${CUR_SHA:-empty}); release ${TAG}"
+
+# The pinned bundle itself says what it was built from - its manifest, not
+# its release notes, which are free text. The same manifest means the same
+# pins and helper, so a new release would be the same bundle under a new
+# number; checked before anything is built or changed.
+if [ -n "${CUR_SHA}" ] && [ "${FORCE}" != "yes" ]; then
+  _pinned="${PKG_NAME}-${CUR_VERSION}"
+  say "fetching the pinned ${_pinned} to compare"
+  curl -sSfL -o "${TMP}/pinned.tar.xz" "${DOWNLOAD}/${REPO}/releases/download/${_pinned}/${_pinned}.tar.xz" \
+    || die "the pinned ${_pinned} cannot be downloaded; --force publishes without comparing"
+  [ "$(sha256sum "${TMP}/pinned.tar.xz" | cut -d' ' -f1)" = "${CUR_SHA}" ] \
+    || die "the published ${_pinned} does not match PKG_SHA256; --force publishes without comparing"
+  if tar_manifest "${TMP}/pinned.tar.xz" "${_pinned}" | cmp -s - "${TMP}/expected.manifest"; then
+    die "the pinned ${_pinned} was built from these same pins and helper, so there is nothing new to publish; package.mk is untouched. --force publishes anyway."
+  fi
+fi
+
+if [ "${DRY_RUN}" = "yes" ]; then
+  say "dry run: nothing changed"
+  exit 0
+fi
+
+set_pkg_var PKG_VERSION "${VERSION}"
+set_pkg_var PKG_SHA256 ""
+
+# --- 2. the build ----------------------------------------------------------
+
+say "building: ARCH=aarch64 scripts/build ${PKG_NAME}"
+( cd "${ROOT}" && PROJECT="${PROJECT:-Amlogic-ce}" DEVICE="${DEVICE:-Amlogic-ng}" ARCH=aarch64 \
+    ./scripts/build "${PKG_NAME}" )
+
+TARBALL="${TARGET_IMG}/${TAG}.tar.xz"
+MANIFEST="${TARGET_IMG}/${TAG}.manifest"
+[ -f "${TARBALL}" ] && [ -f "${MANIFEST}" ] || die "the build left no ${TARBALL} and ${MANIFEST}"
+SHA="$(sha256sum "${TARBALL}" | cut -d' ' -f1)"
+[ "${SHA}" = "$(cat "${TARBALL}.sha256")" ] || die "${TARBALL} does not match ${TARBALL}.sha256"
+# What is inside the tarball, not the file beside it, has to be this tree's.
+tar_manifest "${TARBALL}" "${TAG}" | cmp -s - "${TMP}/expected.manifest" \
+  || die "${TARBALL} was not built from this tree's pins and helper"
+say "built ${TARBALL##*/}, sha256 ${SHA}"
+
+# --- 3. the release --------------------------------------------------------
+
+# A draft for this tag is left over from a run that stopped before
+# publishing. Nobody could download it, so it goes.
+for _id in $(python3 - "${TMP}/releases.json" "${TAG}" <<'EOF'
+import json, sys
+print(" ".join(str(r["id"]) for r in json.load(open(sys.argv[1])) if r["tag_name"] == sys.argv[2] and r["draft"]))
+EOF
+); do
+  say "removing an unpublished draft of ${TAG} left by an earlier run"
+  api DELETE "${API}/repos/${REPO}/releases/${_id}" > /dev/null
+done
+
+# The tag goes on the commit the bundle was built from when GitHub has it.
+HEAD_SHA="$(git -C "${ROOT}" rev-parse HEAD)"
+TARGET=""
+if [ -n "$(git -C "${ROOT}" branch -r --contains "${HEAD_SHA}" 2>/dev/null)" ]; then
+  TARGET="${HEAD_SHA}"
+else
+  echo "note: ${HEAD_SHA:0:12} is not on any remote branch, so GitHub tags its default branch" >&2
+fi
+
+# The release notes are the manifest and nothing else: what the bundle was
+# built from, one pin per line.
+cp "${MANIFEST}" "${TMP}/notes.md"
+
+python3 - "${TAG}" "${TARGET}" "${TMP}/notes.md" > "${TMP}/create.json" <<'EOF'
+import json, sys
+tag, target, notes = sys.argv[1], sys.argv[2], open(sys.argv[3]).read()
+body = {"tag_name": tag, "name": tag, "body": notes, "draft": True}
+if target:
+    body["target_commitish"] = target
+print(json.dumps(body))
+EOF
+
+say "creating draft release ${TAG}"
+api POST "${API}/repos/${REPO}/releases" "${TMP}/create.json" > "${TMP}/release.json"
+RELEASE_ID="$(json 'd["id"]' < "${TMP}/release.json")"
+UPLOAD_URL="$(json 'd["upload_url"]' < "${TMP}/release.json")"
+UPLOAD_URL="${UPLOAD_URL%%\{*}"
+
+say "uploading ${TARBALL##*/}"
+api POST "${UPLOAD_URL}?name=${TAG}.tar.xz" "${TARBALL}" application/octet-stream > "${TMP}/asset.json"
+DIGEST="$(json 'd.get("digest") or ""' < "${TMP}/asset.json")"
+if [ -n "${DIGEST}" ] && [ "${DIGEST}" != "sha256:${SHA}" ]; then
+  die "GitHub stored ${DIGEST}, not sha256:${SHA}; release ${TAG} is left as a draft"
+fi
+
+# The new bundle takes the repository's "Latest" label from the one before it.
+say "publishing ${TAG} as the latest release"
+echo '{"draft": false, "make_latest": "true"}' > "${TMP}/publish.json"
+api PATCH "${API}/repos/${REPO}/releases/${RELEASE_ID}" "${TMP}/publish.json" > "${TMP}/published.json"
+
+# --- 4. the check ----------------------------------------------------------
+
+# The URL the arm pass will download, built the way PKG_URL builds it - not the
+# one the API reports - so a mismatch between them fails here, not in a build.
+URL="${DOWNLOAD}/${REPO}/releases/download/${TAG}/${TAG}.tar.xz"
+say "downloading ${URL}"
+for _try in 1 2 3 4 5; do
+  if curl -sSfL -o "${TMP}/check.tar.xz" "${URL}"; then break; fi
+  [ ${_try} -eq 5 ] && die "${URL} cannot be downloaded"
+  sleep $((_try * 2))
+done
+[ "$(sha256sum "${TMP}/check.tar.xz" | cut -d' ' -f1)" = "${SHA}" ] \
+  || die "${URL} does not match the local tarball"
+
+# --- 5. the pin ------------------------------------------------------------
+
+set_pkg_var PKG_SHA256 "${SHA}"
+PINNED=yes
+
+say "published https://github.com/${REPO}/releases/tag/${TAG}"
+echo
+echo "Pinned in ${PKG_MK#${ROOT}/}:"
+echo "  PKG_VERSION=\"${VERSION}\""
+echo "  PKG_SHA256=\"${SHA}\""
+echo
+
+# Only package.mk, whatever else is staged or changed.
+COMMIT_TITLE="omniphony: pin bundle-${VERSION}"
+git -C "${ROOT}" commit -q -m "${COMMIT_TITLE}" -- "${PKG_MK}" \
+  || die "${TAG} is published and pinned, but committing ${PKG_MK#${ROOT}/} failed; commit it by hand as \"${COMMIT_TITLE}\""
+say "committed $(git -C "${ROOT}" log -1 --format='%h %s')"

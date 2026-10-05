@@ -20,7 +20,7 @@ PKG_TOOLCHAIN="manual"
 # takes the word size of whoever loads it, so an engine loaded by Kodi would be
 # 32-bit; measured on an S922X, Dolby Digital Plus Atmos decodes at 0.419 of
 # realtime in 32-bit against 0.204 in 64-bit, and the process boundary itself
-# costs nothing. The omniphony package copies this binary into the 32-bit image.
+# costs nothing. omniphony-bundle packs this binary for the 32-bit image.
 PKG_ARCH="aarch64"
 
 # Where the codec expects to find the helper - see omniphony/package.mk.
@@ -37,8 +37,8 @@ make_target() {
 }
 
 makeinstall_target() {
-  # This pass builds no image; it installs so the 32-bit pass has somewhere to
-  # copy from. Strip here, where ${STRIP} is the aarch64 one.
+  # This pass builds no image; it installs so omniphony-bundle has somewhere to
+  # pack from. Strip here, where ${STRIP} is the aarch64 one.
   mkdir -p ${INSTALL}${PKG_OMNIPHONY_DIR}
   cp ${PKG_BUILD}/omniphony-helper ${INSTALL}${PKG_OMNIPHONY_DIR}/
 

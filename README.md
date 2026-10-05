@@ -52,25 +52,42 @@ set -Ux ARCH arm
 
 Don't use `~/.coreelec/options` for these three: the build system sources that file after the target defaults are resolved, so `DEVICE=Amlogic-ng` set there still leaves `ARCH=aarch64` and you end up with a broken hybrid build tree. That file is fine for build tweaks like `CONCURRENCY_MAKE_LEVEL`, not for target selection.
 
-### Binaural audio needs a second, 64-bit pass (Amlogic-ng only)
+### Binaural audio: the 64-bit side (Amlogic-ng only)
 
 Kodi renders audio binaurally for headphones (Dolby Atmos and DTS:X objects, Auro-3D heights and ordinary channel layouts alike) by running the decoder and the spatial renderer in a **64-bit helper process**. That is not a preference: a shared library takes the word size of whoever loads it, and in the 32-bit userspace an Amlogic-ng image ships, the same work costs roughly twice as much — measured on an S922X, Dolby Digital Plus Atmos decodes at 0.419 of realtime in 32-bit against 0.204 in 64-bit.
 
-So on `ARCH=arm` the three 64-bit pieces are built in their own tree first, and the image build copies them in:
+Those three 64-bit pieces — the engine and its PCM bridge (`omniphony`), the decoder bridge (`harletty-bridge`) and the helper (`omniphony-helper`) — together with the 64-bit runtime they start with, travel to the image as one prebuilt **bundle**, the `omniphony-bundle` package. So on `ARCH=arm` a normal build needs no aarch64 build tree at all:
 
 ```sh
-# once, and again whenever omniphony or harletty-bridge moves
-PROJECT=Amlogic-ce DEVICE=Amlogic-ng ARCH=aarch64 ./scripts/build omniphony
-
-# then the image as usual
 PROJECT=Amlogic-ce DEVICE=Amlogic-ng ARCH=arm make release
 ```
 
-That one command builds all three — the engine and its PCM bridge (`omniphony`), the decoder bridge (`harletty-bridge`) and the helper (`omniphony-helper`) — because the first pulls in the other two. It also builds an aarch64 toolchain the first time, which is slow; the arm image build reuses nothing from that tree but the finished objects.
+It downloads the bundle pinned in `omniphony-bundle/package.mk` and checks it against the `omniphony` and `harletty-bridge` pins and the helper's source in this tree. A bundle built from anything else stops the build and says which pin differs.
 
-Skipping the pass does not leave you with a quietly broken image: the `omniphony` package stops the build and prints the command above.
+**Building the 64-bit side from source instead.** Build it in its own tree, then build the image from that rather than the download:
 
-**On `ARCH=aarch64` (Amlogic-ne) there is nothing extra to do.** The image is already 64-bit, so one normal build produces everything.
+```sh
+# once, and again whenever omniphony, harletty-bridge or omniphony-helper moves
+PROJECT=Amlogic-ce DEVICE=Amlogic-ng ARCH=aarch64 ./scripts/build omniphony-bundle
+
+PROJECT=Amlogic-ce DEVICE=Amlogic-ng ARCH=arm OMNIPHONY_FROM_SOURCE=yes make release
+```
+
+The first command builds all three pieces and an aarch64 toolchain the first time, which is slow; later runs return at once unless something moved. Forgetting it after a re-pin is caught by the same check. It has to be `omniphony-bundle`, not `omniphony`: `./scripts/build omniphony` builds the engine, bridges and helper but not the assembly with their 64-bit runtime that the image installs, so `OMNIPHONY_FROM_SOURCE=yes` stops and asks for the command above. Packing the tarball on the way adds little to that build; you need not upload it.
+
+**When a bundle stops matching.** The check compares three things only: the `omniphony` pin, the `harletty-bridge` pin, and the helper's `package.mk` and `sources/`. Every other change to the tree, Kodi included, builds with the same bundle. A commit that changes one of the three needs a new bundle pinned in the same commit, or `OMNIPHONY_FROM_SOURCE=yes` until it has one. As long as published releases are kept, an older commit still builds with the bundle it pins.
+
+**Making a new bundle.** With the three pins already as they will be committed, run
+
+```sh
+tools/omniphony-bundle-publish            # --dry-run: only say which number it would use
+```
+
+It takes the next bundle number (the current one if nothing is pinned under it yet), builds the bundle with the aarch64 command above, publishes it as a GitHub release tagged `omniphony-bundle-<version>` on [v-lix/CoreELEC](https://github.com/v-lix/CoreELEC/releases) - a draft first, so it works with release immutability on - downloads it back to check it, writes `PKG_VERSION` and `PKG_SHA256` into `omniphony-bundle/package.mk` and commits that file alone, locally, as `omniphony: pin bundle-<version>`. It pushes nothing, and the pins it was built from are committed as they are. If nothing the bundle is built from changed since the pinned one, it stops instead; `--force` publishes anyway. It needs a fine-grained GitHub token for v-lix/CoreELEC with **Contents: Read and write**, in `OMNIPHONY_BUNDLE_TOKEN` or in `~/.config/omniphony-bundle/token` (mode 600).
+
+By hand it is the same steps: raise `PKG_VERSION`, run the aarch64 command, upload `target/omniphony-bundle-<version>.tar.xz` as the only asset of a release with that tag (its `.manifest` beside it says what it was built from), and set `PKG_SHA256` to the `.tar.xz.sha256` beside it. Never replace the asset of a published release: the pin would no longer match it.
+
+**On `ARCH=aarch64` (Amlogic-ne) there is nothing extra to do.** The image is already 64-bit, so one normal build produces everything, and the bundle is not used.
 
 ### Local source checkouts (branch `coreelec-21_local`)
 
