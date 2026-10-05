@@ -1,0 +1,602 @@
+[
+  {
+    "adrp_text_offset": 1232,
+    "ldr_text_offset": 1240,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 1280,
+    "ldr_text_offset": 1284,
+    "original_adrp_word": 3577233675,
+    "original_ldr_word": 4181927275
+  },
+  {
+    "adrp_text_offset": 2880,
+    "ldr_text_offset": 2888,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 3052,
+    "ldr_text_offset": 3056,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 3116,
+    "ldr_text_offset": 3124,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 3412,
+    "ldr_text_offset": 3416,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 3476,
+    "ldr_text_offset": 3484,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 3740,
+    "ldr_text_offset": 3744,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 4512,
+    "ldr_text_offset": 4516,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 13728,
+    "ldr_text_offset": 13732,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 15124,
+    "ldr_text_offset": 15128,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 20808,
+    "ldr_text_offset": 20812,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 30036,
+    "ldr_text_offset": 30044,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 38064,
+    "ldr_text_offset": 38068,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 39464,
+    "ldr_text_offset": 39472,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 40860,
+    "ldr_text_offset": 40864,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 43268,
+    "ldr_text_offset": 43276,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 44084,
+    "ldr_text_offset": 44088,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 44256,
+    "ldr_text_offset": 44260,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 45544,
+    "ldr_text_offset": 45548,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 45676,
+    "ldr_text_offset": 45680,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 45864,
+    "ldr_text_offset": 45868,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 46772,
+    "ldr_text_offset": 46780,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 49084,
+    "ldr_text_offset": 49088,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 50120,
+    "ldr_text_offset": 50128,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 57368,
+    "ldr_text_offset": 57372,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 60248,
+    "ldr_text_offset": 60252,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 60888,
+    "ldr_text_offset": 60892,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 62452,
+    "ldr_text_offset": 62476,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 62756,
+    "ldr_text_offset": 62760,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 62836,
+    "ldr_text_offset": 62844,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 63752,
+    "ldr_text_offset": 63756,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 63992,
+    "ldr_text_offset": 63996,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 65516,
+    "ldr_text_offset": 65520,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 85932,
+    "ldr_text_offset": 85936,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 86920,
+    "ldr_text_offset": 86924,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 87180,
+    "ldr_text_offset": 87188,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 87576,
+    "ldr_text_offset": 87580,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 87672,
+    "ldr_text_offset": 87680,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 88152,
+    "ldr_text_offset": 88156,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 88252,
+    "ldr_text_offset": 88272,
+    "original_adrp_word": 3577233673,
+    "original_ldr_word": 4181927209
+  },
+  {
+    "adrp_text_offset": 88364,
+    "ldr_text_offset": 88368,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 88432,
+    "ldr_text_offset": 88440,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 88620,
+    "ldr_text_offset": 88624,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 88712,
+    "ldr_text_offset": 88728,
+    "original_adrp_word": 3577233673,
+    "original_ldr_word": 4181927209
+  },
+  {
+    "adrp_text_offset": 88820,
+    "ldr_text_offset": 88824,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 90088,
+    "ldr_text_offset": 90096,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 90152,
+    "ldr_text_offset": 90156,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 90216,
+    "ldr_text_offset": 90224,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 90296,
+    "ldr_text_offset": 90300,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 90356,
+    "ldr_text_offset": 90364,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 90620,
+    "ldr_text_offset": 90624,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 90680,
+    "ldr_text_offset": 90688,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 90876,
+    "ldr_text_offset": 90880,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 91036,
+    "ldr_text_offset": 91044,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 91384,
+    "ldr_text_offset": 91388,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 91608,
+    "ldr_text_offset": 91616,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 91708,
+    "ldr_text_offset": 91712,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 91796,
+    "ldr_text_offset": 91800,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 92036,
+    "ldr_text_offset": 92040,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 92096,
+    "ldr_text_offset": 92104,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 92368,
+    "ldr_text_offset": 92372,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 92504,
+    "ldr_text_offset": 92512,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 92928,
+    "ldr_text_offset": 92932,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 93008,
+    "ldr_text_offset": 93012,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 93476,
+    "ldr_text_offset": 93480,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 94184,
+    "ldr_text_offset": 94192,
+    "original_adrp_word": 3577233673,
+    "original_ldr_word": 4181927209
+  },
+  {
+    "adrp_text_offset": 94496,
+    "ldr_text_offset": 94500,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 94768,
+    "ldr_text_offset": 94776,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 95020,
+    "ldr_text_offset": 95024,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 95080,
+    "ldr_text_offset": 95088,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 95284,
+    "ldr_text_offset": 95288,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 95560,
+    "ldr_text_offset": 95564,
+    "original_adrp_word": 3577233673,
+    "original_ldr_word": 4181927209
+  },
+  {
+    "adrp_text_offset": 95652,
+    "ldr_text_offset": 95656,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 95820,
+    "ldr_text_offset": 95824,
+    "original_adrp_word": 3577233673,
+    "original_ldr_word": 4181927209
+  },
+  {
+    "adrp_text_offset": 95904,
+    "ldr_text_offset": 95908,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 96096,
+    "ldr_text_offset": 96100,
+    "original_adrp_word": 3577233673,
+    "original_ldr_word": 4181927209
+  },
+  {
+    "adrp_text_offset": 96164,
+    "ldr_text_offset": 96168,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 96372,
+    "ldr_text_offset": 96376,
+    "original_adrp_word": 3577233674,
+    "original_ldr_word": 4181927242
+  },
+  {
+    "adrp_text_offset": 96440,
+    "ldr_text_offset": 96444,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 101892,
+    "ldr_text_offset": 101896,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 102364,
+    "ldr_text_offset": 102368,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 102488,
+    "ldr_text_offset": 102492,
+    "original_adrp_word": 3577233674,
+    "original_ldr_word": 4181927242
+  },
+  {
+    "adrp_text_offset": 102832,
+    "ldr_text_offset": 102836,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 105240,
+    "ldr_text_offset": 105244,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 106360,
+    "ldr_text_offset": 106364,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 140032,
+    "ldr_text_offset": 140040,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 145388,
+    "ldr_text_offset": 145392,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 146308,
+    "ldr_text_offset": 146312,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 147496,
+    "ldr_text_offset": 147500,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 147764,
+    "ldr_text_offset": 147772,
+    "original_adrp_word": 3577233673,
+    "original_ldr_word": 4181927209
+  },
+  {
+    "adrp_text_offset": 148580,
+    "ldr_text_offset": 148584,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 149984,
+    "ldr_text_offset": 149992,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 158796,
+    "ldr_text_offset": 158800,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 160096,
+    "ldr_text_offset": 160104,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 163156,
+    "ldr_text_offset": 163160,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 166536,
+    "ldr_text_offset": 166544,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 166856,
+    "ldr_text_offset": 166860,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 167168,
+    "ldr_text_offset": 167172,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  },
+  {
+    "adrp_text_offset": 167460,
+    "ldr_text_offset": 167464,
+    "original_adrp_word": 3577233672,
+    "original_ldr_word": 4181927176
+  }
+]

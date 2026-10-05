@@ -141,7 +141,7 @@
   # additional packages to install:
   # Space separated list is supported,
   # e.g. ADDITIONAL_PACKAGES="PACKAGE1 PACKAGE2"
-    ADDITIONAL_PACKAGES+=" tmate pulseaudio-modules-bt zram"
+    ADDITIONAL_PACKAGES+=" tmate pulseaudio-modules-bt zram dovi5-prepare"
 
   # zram compressed-swap defaults (size in MiB, on/off)
     ZRAM_SIZE_MB="1024"
