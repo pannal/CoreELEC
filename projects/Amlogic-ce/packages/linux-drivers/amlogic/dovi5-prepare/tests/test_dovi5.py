@@ -21,11 +21,21 @@ import dovi5_prepare as prep
 
 fixture_parser = argparse.ArgumentParser(add_help=False)
 fixture_parser.add_argument('--fixture', type=Path, default=os.environ.get('DOVI5_TEST_SOURCE'))
+fixture_parser.add_argument('--reference', type=Path, action='append', help='external built or installed native shim; repeat to check each artifact')
+fixture_parser.add_argument('--versions', type=Path, help='matching actual kernel Module.symvers')
+fixture_parser.add_argument('--exports', type=Path, help='matching System.map (host exports) or captured kallsyms')
+fixture_parser.add_argument('--reference-report', type=Path, help='write actual artifact hashes and results outside the source tree')
 fixture_parser.add_argument('--loader', type=Path, default=os.environ.get('DOVI5_TEST_LOADER'))
 fixture_args, unittest_args = fixture_parser.parse_known_args()
 BLOB = fixture_args.fixture
 if BLOB is not None and not BLOB.is_file():
     raise SystemExit('Explicit Dolby module test fixture is not a regular file')
+REFERENCES = fixture_args.reference or []
+if REFERENCES or fixture_args.versions or fixture_args.exports or fixture_args.reference_report:
+    if not (REFERENCES and fixture_args.versions and fixture_args.exports and BLOB):
+        raise SystemExit('Actual-reference tests require --fixture, --reference, --versions and --exports together')
+    for path in [*REFERENCES, fixture_args.versions, fixture_args.exports]:
+        if not path.is_file(): raise SystemExit('External target input is not a file: ' + str(path))
 LOADER = fixture_args.loader
 if LOADER is None:
     for ancestor in HERE.parents:
@@ -131,6 +141,28 @@ class ELFValidation(unittest.TestCase):
             with self.subTest(mutation=digest_short(mutated)):
                 with self.assertRaises(p.Rejected): p.ELF(mutated)
 
+    def test_module_info_repeated_descriptions_and_strict_singletons(self):
+        suffix = (b'parmtype=dvshim_mp_calls:ulong\0parmtype=dv_shim_debug:uint\0'
+                  b'parm=dvshim_mp_calls:parser calls\0parm=dv_shim_debug:debug flags\0'
+                  b'alias=first\0alias=second\0firmware=one.bin\0firmware=two.bin\0'
+                  b'author=one\0author=two\0description=first\0description=second\0')
+        elf = p.ELF(REF); original = elf.byname['.modinfo']['data']
+        elf.byname['.modinfo']['data'] = original + suffix
+        info = elf.module_info()
+        self.assertEqual(info[b'parmtype'], [b'dvshim_mp_calls:ulong', b'dv_shim_debug:uint'])
+        self.assertEqual(info[b'parm'], [b'dvshim_mp_calls:parser calls', b'dv_shim_debug:debug flags'])
+        self.assertEqual(info[b'alias'], [b'first', b'second'])
+        self.assertEqual(p.target_reference(elf.encode())[2:5], (832, 24, 56))
+        for record in (b'vermagic=duplicate\0', b'name=dv_compat_shim\0',
+                       b'depends=one\0depends=two\0', b'license=GPL\0license=GPL\0',
+                       b'unknown=one\0unknown=two\0', b'no_separator\0', b'=value\0',
+                       b'bad key=value\0', b'\xff=value\0'):
+            with self.subTest(record=record):
+                invalid = p.ELF(REF); invalid.byname['.modinfo']['data'] = original + record
+                with self.assertRaises(p.Rejected): invalid.module_info()
+        elf.byname['.modinfo']['data'] = original.rstrip(b'\0')
+        with self.assertRaises(p.Rejected): elf.module_info()
+
     def test_bad_reference_semantics(self):
         elf = p.ELF(REF)
         for mutate in ('duplicate_init', 'bad_addend', 'wrong_reloc', 'wrong_name', 'bad_constant'):
@@ -168,6 +200,31 @@ class ExactBlob(unittest.TestCase):
         self.assertIn(p.GUARD, out.imports())
         for name in ('.bss', '.data', '.rodata', '.init.text', '.exit.text'):
             self.assertEqual(out.byname[name]['data'], p.ELF(self.source).byname[name]['data'])
+
+    def test_canonical_preserves_repeated_descriptive_records_and_symbol_offsets(self):
+        elf = p.ELF(self.source)
+        modinfo = elf.byname['.modinfo']
+        first = b'parmtype=first:ulong\0'; second = b'parmtype=second:uint\0'
+        first_offset = len(modinfo['data']); second_offset = first_offset + len(first)
+        modinfo['data'] += first + second + b'parm=first:first parameter\0parm=second:second parameter\0'
+        symbols = [sym for sym in elf.symbols if sym['index'] == modinfo['index'] and sym['size']]
+        # Reuse two native local modinfo objects to exercise per-occurrence remapping.
+        for sym, offset, record in zip(symbols[:2], (first_offset, second_offset), (first, second)):
+            sym['value'], sym['size'] = offset, len(record)
+        source = elf.encode()
+        # Only this synthetic reconstruction test admits its deliberately modified fixture.
+        # Production admission retains the exact proprietary fingerprint unchanged.
+        with patch.object(p, 'SOURCE_SHA', p.digest(source)):
+            result = p.canonical(source, REF, VERSIONS, KERNEL_EXPORTS, PROFILE)
+            self.assertEqual(result, p.canonical(source, REF, VERSIONS, KERNEL_EXPORTS, PROFILE))
+        out = p.ELF(result); info = out.module_info()
+        self.assertEqual(info[b'parmtype'], [b'first:ulong', b'second:uint'])
+        self.assertEqual(info[b'parm'], [b'first:first parameter', b'second:second parameter'])
+        self.assertEqual(info[b'name'], [b'dovi5'])
+        self.assertEqual(info[b'depends'], [b'dv_compat_shim'])
+        for sym, expected in zip(symbols[:2], (first, second)):
+            _, rewritten = out.symbol(sym['name'])
+            self.assertEqual(out.byname['.modinfo']['data'][rewritten['value']:rewritten['value'] + rewritten['size']], expected)
 
     def test_guard_instructions_relocations_preserve_comparisons(self):
         original, out = p.ELF(self.source), p.ELF(self.result)
@@ -259,9 +316,9 @@ class ExactBlob(unittest.TestCase):
         ksyms.write_text('\n'.join('0000000000000000 r __ksymtab_' + n for n in KERNEL_EXPORTS) + '\n')
         return (root, ref, versions, ksyms, '4.9.269')
 
-    def overlay_reference_fixture(self, root):
+    def overlay_reference_fixture(self, root, release='4.9.269'):
         args = list(self.generation_fixture(root))
-        suffix = Path('4.9.269/kernel/drivers/amlogic/media/enhancement/amdolby_vision/dv_compat_shim.ko')
+        suffix = Path(release + '/kernel/drivers/amlogic/media/enhancement/amdolby_vision/dv_compat_shim.ko')
         target = root / 'usr/lib/kernel-overlays/base/lib/modules' / suffix
         target.parent.mkdir(parents=True)
         args[1].rename(target)
@@ -278,6 +335,7 @@ class ExactBlob(unittest.TestCase):
         modinfo.write_text('#!/bin/sh\n[ "$1" = -n ] && [ "$2" = dv_compat_shim ] || exit 1\nprintf "%s\\n" "$SHIM_TEST_REFERENCE"\n')
         modinfo.chmod(0o755)
         args[1] = None
+        args[4] = release
         environment = dict(PATH=str(bin_dir) + os.pathsep + os.environ['PATH'], SHIM_TEST_REFERENCE=str(installed))
         return tuple(args), installed, target, environment
 
@@ -376,6 +434,69 @@ class ExactBlob(unittest.TestCase):
                 with self.assertRaises((p.Rejected, OSError)): prep.validate_load(*args)
                 self.assertFalse(marker.exists())
                 self.assertEqual((root / 'storage/.config/dovi5.ko').read_bytes(), self.source)
+
+
+@unittest.skipUnless(REFERENCES, 'optional actual-reference check: pass --reference, --versions and --exports')
+class ActualReference(unittest.TestCase):
+    def test_complete_preparation_load_validation_and_standalone_with_actual_artifacts(self):
+        source = BLOB.read_bytes()
+        versions = fixture_args.versions.read_bytes()
+        export_bytes = fixture_args.exports.read_bytes()
+        exports = p.kernel_exports(fixture_args.exports)
+        records = []
+        outputs = []
+        for ref_path in REFERENCES:
+            with self.subTest(reference=str(ref_path)), tempfile.TemporaryDirectory() as tmp:
+                ref_data = p.read_module_reference(ref_path)
+                ref, vermagic, size, offset, length, entries = p.target_reference(ref_data)
+                release = vermagic.split()[0].decode('ascii')
+                expected = p.canonical(source, ref_data, versions, exports, PROFILE)
+                out = p.ELF(expected)
+                self.assertEqual(out.module_info()[b'vermagic'], [vermagic])
+                self.assertEqual(out.module_info()[b'name'], [b'dovi5'])
+                self.assertEqual(out.versions()['module_layout'], ref.versions()['module_layout'])
+                root = Path(tmp)
+                fixture = ExactBlob(); fixture.source = source
+                args, installed, target, environment = fixture.overlay_reference_fixture(root, release)
+                target.write_bytes(ref_data); args[2].write_bytes(versions); args[3].write_bytes(export_bytes)
+                env = dict(os.environ, **environment)
+                options = ['--root', str(root), '--versions', str(args[2]), '--ksyms', str(args[3]), '--kernel-release', release]
+                prepare_command = [sys.executable, str(SCRIPTS / 'dovi5_prepare.py')]
+                subprocess.run(prepare_command + ['prepare'] + options, env=env, check=True, capture_output=True)
+                result = subprocess.run(prepare_command + ['validate-load'] + options, env=env, check=True, capture_output=True, text=True)
+                output = Path(result.stdout.strip())
+                self.assertEqual(output.read_bytes(), expected)
+                self.assertEqual((root / 'run/dovi5-path').read_text(), str(output) + '\n')
+                with patch.dict(os.environ, environment):
+                    self.assertEqual(prep.validate_load(*args), output)
+                standalone = root / 'standalone.ko'
+                patch_command = [sys.executable, str(SCRIPTS / 'dv5_patch.py')]
+                patch_options = [str(root / 'storage/.config/dovi5.ko'), str(standalone), '--ref', str(installed),
+                                 '--versions', str(args[2]), '--ksyms', str(args[3])]
+                subprocess.run(patch_command + ['patch'] + patch_options, check=True, capture_output=True)
+                subprocess.run(patch_command + ['validate'] + patch_options, check=True, capture_output=True)
+                self.assertEqual(standalone.read_bytes(), expected)
+                # Exact canonical bytes via a symlink must still fail prepared-output admission.
+                preserved = root / 'preserved.ko'; output.rename(preserved); output.symlink_to(preserved)
+                invalid = subprocess.run(prepare_command + ['validate-load'] + options, env=env, capture_output=True)
+                self.assertNotEqual(invalid.returncode, 0)
+                self.assertFalse((root / 'run/dovi5-path').exists())
+                self.assertEqual(preserved.read_bytes(), expected)
+                self.assertEqual(target.read_bytes(), ref_data)
+                self.assertEqual((root / 'storage/.config/dovi5.ko').read_bytes(), source)
+                self.assertEqual(p.read_module_reference(ref_path), ref_data)
+                outputs.append(p.digest(expected))
+                records.append(dict(reference=str(ref_path), reference_sha256=p.digest(ref_data), reference_size=len(ref_data),
+                                    versions=str(fixture_args.versions), versions_sha256=p.digest(versions),
+                                    exports_source=str(fixture_args.exports), exports_sha256=p.digest(export_bytes),
+                                    source_sha256=p.digest(source), profile_sha256=p.digest((SCRIPTS / 'canary-profile.json').read_bytes()),
+                                    native_module_size=size, name_offset=offset, name_size=length, relocations=entries,
+                                    metadata_counts={k.decode('ascii'): len(v) for k, v in ref.module_info().items()},
+                                    output_size=len(expected), output_sha256=p.digest(expected), prepare=True, validate_load=True,
+                                    standalone=True, prepared_symlink_rejected=True, device_loaded=False))
+        self.assertEqual(len(set(outputs)), 1, 'equivalent native references must produce identical canonical output')
+        if fixture_args.reference_report:
+            fixture_args.reference_report.write_text(json.dumps(records, indent=2) + '\n')
 
 
 class Loader(unittest.TestCase):

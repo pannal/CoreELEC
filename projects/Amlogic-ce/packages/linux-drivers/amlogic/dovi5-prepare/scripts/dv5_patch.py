@@ -6,12 +6,16 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import struct
 import tempfile
 
 SOURCE_SHA = 'f6c26659a255447685ceac9441e399c999b1fae9c6435c48d70e14a14dd7f8f7'
 MAX_BYTES = 64 * 1024 * 1024
+# These descriptive tags have one record per parameter, alias, firmware or author.
+# All other fields, including identity, compatibility and license, stay singleton.
+REPEATED_MODINFO = {b'parm', b'parmtype', b'alias', b'firmware', b'author', b'description'}
 RENAME = {'register_dv_functions': 'register_dv5shim_func',
           'unregister_dv_functions': 'unregister_dv5shim_func'}
 GUARD = 'dv5_stack_chk_guard'
@@ -184,8 +188,9 @@ class ELF:
             if not item:
                 continue
             key, sep, value = item.partition(b'=')
-            require(sep and key not in result, 'invalid or duplicate module info key')
-            result[key] = value
+            require(sep and re.fullmatch(rb'[A-Za-z_][A-Za-z0-9_]*', key), 'invalid module info key')
+            require(key not in result or key in REPEATED_MODINFO, 'duplicate singleton module info key: ' + key.decode('ascii'))
+            result.setdefault(key, []).append(value)
         return result
 
     def versions(self):
@@ -245,10 +250,10 @@ class ELF:
 def target_reference(data):
     elf = ELF(data)
     info = elf.module_info()
-    vermagic = info.get(b'vermagic', b'')
+    vermagic = info.get(b'vermagic', [b''])[0]
     require(vermagic.endswith(b' modversions aarch64') and b' mod_unload ' in vermagic,
             'reference lacks required version/architecture/unload checks')
-    require(info.get(b'name', b'dv_compat_shim') == b'dv_compat_shim', 'wrong reference module')
+    require(info.get(b'name', [b'dv_compat_shim'])[0] == b'dv_compat_shim', 'wrong reference module')
     tm = elf.section('.gnu.linkonce.this_module', 1)
     require(tm['flags'] & 3 == 3 and 0 < tm['size'] <= 4096, 'invalid native module layout')
     _, symbol = elf.symbol('__this_module')
@@ -325,24 +330,29 @@ def canonical(source, reference, symvers_data, exports, profile):
             require(module == 'vmlinux' and name in exports, 'kernel export owner mismatch: ' + name)
     info = elf.module_info()
     old_info_offsets = {}
+    occurrences = {}
     position = 0
     for item in elf.byname['.modinfo']['data'].split(b'\0'):
         if item:
-            old_info_offsets[position] = item.partition(b'=')[0]
+            key = item.partition(b'=')[0]
+            occurrence = occurrences.get(key, 0)
+            old_info_offsets[position] = key, occurrence
+            occurrences[key] = occurrence + 1
         position += len(item) + 1
-    info.update({b'vermagic': vermagic, b'name': b'dovi5', b'depends': b'dv_compat_shim'})
+    info.update({b'vermagic': [vermagic], b'name': [b'dovi5'], b'depends': [b'dv_compat_shim']})
     info_data = bytearray()
     new_info_offsets = {}
-    for key, value in sorted(info.items()):
-        entry = key + b'=' + value + b'\0'
-        new_info_offsets[key] = (len(info_data), len(entry))
-        info_data.extend(entry)
+    for key, values in sorted(info.items()):
+        for occurrence, value in enumerate(values):
+            entry = key + b'=' + value + b'\0'
+            new_info_offsets[key, occurrence] = (len(info_data), len(entry))
+            info_data.extend(entry)
     for sym in elf.symbols:
         if sym['index'] != elf.byname['.modinfo']['index'] or not sym['size']:
             continue
         require(sym['value'] in old_info_offsets, 'unrecognized module info object')
-        key = old_info_offsets[sym['value']]
-        sym['value'], sym['size'] = new_info_offsets[key]
+        record = old_info_offsets[sym['value']]
+        sym['value'], sym['size'] = new_info_offsets[record]
     elf.byname['.modinfo']['data'] = bytes(info_data)
     tm = elf.section('.gnu.linkonce.this_module', 1)
     _, records = elf.relocations[tm['index']]

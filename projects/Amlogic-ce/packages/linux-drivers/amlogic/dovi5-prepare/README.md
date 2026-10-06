@@ -20,6 +20,8 @@ Preparation reads these files and writes a separate private copy under `/storage
 
 The image must contain the paired kernel changes, configured `dv_compat_shim`, Python3 and the exact kernel/shim `Module.symvers` installed by this package. Preparation checks the native module layout, running kernel release, readable kernel exports and each imported symbol's target CRC. The kernel enforces strict version checks for `dovi5` and `dv_compat_shim` while retaining the original vendor module's existing compatibility policy. A mismatch rejects the second backend.
 
+Native module metadata may contain repeated parameter types/descriptions, aliases, firmware, author and description records. These records are preserved; identity and compatibility fields, including name, vermagic, depends and license, remain strict singletons.
+
 Installed module references may follow CoreELEC kernel-overlay symlinks to a regular target. Broken or looping links, nonregular targets and incompatible module contents reject preparation. Generated modules, manifests, markers and their directories retain strict link rejection.
 
 To opt out, create `/storage/.config/dovi5.conf` containing:
@@ -41,3 +43,17 @@ DOVI5_TEST_SOURCE=/path/to/unmodified/dovi5.ko python3 projects/Amlogic-ce/packa
 ```
 
 `--fixture /path/to/unmodified/dovi5.ko` is equivalent. Tests resolve the repository's actual opentee loader; `--loader /path/to/dovi-loader.sh` is available for isolated staging. Without a supplied module, real-module cases are explicitly skipped and synthetic validation tests still run. Never add a module fixture to the repository.
+
+To verify complete preparation and load validation against external native build artifacts, pass the matching shim, kernel manifest and exports explicitly. Repeat `--reference` to include installed or stripped shim artifacts from the same kernel:
+
+```sh
+python3 projects/Amlogic-ce/packages/linux-drivers/amlogic/dovi5-prepare/tests/test_dovi5.py \
+  --fixture /path/to/unmodified/dovi5.ko \
+  --reference /path/to/built/dv_compat_shim.ko \
+  --reference /path/to/installed/dv_compat_shim.ko \
+  --versions /path/to/matching/Module.symvers \
+  --exports /path/to/matching/System.map \
+  --reference-report /tmp/dovi5-reference-report.json
+```
+
+These checks model the installed overlay symlink path and run the production preparation/load-validation and standalone patcher entry points. `System.map` supplies host export evidence; it does not verify the running device's `/proc/kallsyms` or load a module. External artifacts are never included in the package.
