@@ -259,6 +259,76 @@ class ExactBlob(unittest.TestCase):
         ksyms.write_text('\n'.join('0000000000000000 r __ksymtab_' + n for n in KERNEL_EXPORTS) + '\n')
         return (root, ref, versions, ksyms, '4.9.269')
 
+    def overlay_reference_fixture(self, root):
+        args = list(self.generation_fixture(root))
+        suffix = Path('4.9.269/kernel/drivers/amlogic/media/enhancement/amdolby_vision/dv_compat_shim.ko')
+        target = root / 'usr/lib/kernel-overlays/base/lib/modules' / suffix
+        target.parent.mkdir(parents=True)
+        args[1].rename(target)
+        runtime = root / 'run/kernel-overlays/modules' / suffix
+        runtime.parent.mkdir(parents=True)
+        runtime.symlink_to(target)
+        (root / 'usr/lib/modules').symlink_to(root / 'run/kernel-overlays/modules', target_is_directory=True)
+        (root / 'lib').symlink_to('usr/lib', target_is_directory=True)
+        installed = root / 'lib/modules' / suffix
+        # Stub only modinfo discovery. The real subprocess, symlink traversal,
+        # regular-file reader, canonical patching and load validation all run.
+        bin_dir = root / 'bin'; bin_dir.mkdir()
+        modinfo = bin_dir / 'modinfo'
+        modinfo.write_text('#!/bin/sh\n[ "$1" = -n ] && [ "$2" = dv_compat_shim ] || exit 1\nprintf "%s\\n" "$SHIM_TEST_REFERENCE"\n')
+        modinfo.chmod(0o755)
+        args[1] = None
+        environment = dict(PATH=str(bin_dir) + os.pathsep + os.environ['PATH'], SHIM_TEST_REFERENCE=str(installed))
+        return tuple(args), installed, target, environment
+
+    def test_installed_reference_overlay_prepare_load_and_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); args, installed, target, environment = self.overlay_reference_fixture(root)
+            with patch.dict(os.environ, environment):
+                prep.prepare(*args)
+                output = prep.validate_load(*args)
+            self.assertEqual(output.read_bytes(), self.result)
+            self.assertEqual(target.read_bytes(), REF)
+            self.assertEqual((root / 'storage/.config/dovi5.ko').read_bytes(), self.source)
+            standalone = root / 'standalone.ko'
+            command = [sys.executable, str(SCRIPTS / 'dv5_patch.py')]
+            options = [str(root / 'storage/.config/dovi5.ko'), str(standalone), '--ref', str(installed),
+                       '--versions', str(args[2]), '--ksyms', str(args[3])]
+            subprocess.run(command + ['patch'] + options, check=True, capture_output=True)
+            subprocess.run(command + ['validate'] + options, check=True, capture_output=True)
+            self.assertEqual(standalone.read_bytes(), self.result)
+            # A linked installed reference never makes generated outputs link-safe.
+            standalone.unlink(); standalone.symlink_to(output)
+            rejected = subprocess.run(command + ['validate'] + options, capture_output=True)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertEqual(output.read_bytes(), self.result)
+
+    def test_installed_reference_failures_retain_legacy_and_source(self):
+        for kind in ('broken', 'loop', 'directory', 'fifo', 'identity', 'release', 'malformed'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp); args, installed, target, environment = self.overlay_reference_fixture(root)
+                with patch.dict(os.environ, environment):
+                    prep.prepare(*args)
+                    marker = root / 'run/dovi5-path'; output = Path(marker.read_text().strip())
+                    before = output.read_bytes()
+                    if kind == 'broken': target.unlink()
+                    if kind == 'loop': target.unlink(); target.symlink_to(installed)
+                    if kind == 'directory': target.unlink(); target.mkdir()
+                    if kind == 'fifo': target.unlink(); os.mkfifo(target)
+                    if kind in ('identity', 'release'):
+                        elf = p.ELF(REF)
+                        data = elf.byname['.modinfo']['data']
+                        data = data.replace(b'name=dv_compat_shim', b'name=wrong_shim') if kind == 'identity' else data.replace(b'4.9.269', b'4.9.270')
+                        elf.byname['.modinfo']['data'] = data; target.write_bytes(elf.encode())
+                    if kind == 'malformed': target.write_bytes(b'not an ELF')
+                    with self.assertRaises(p.Rejected): prep.validate_load(*args)
+                    self.assertFalse(marker.exists())
+                    marker.write_text('stale\n')
+                    with self.assertRaises(p.Rejected): prep.prepare(*args)
+                    self.assertFalse(marker.exists())
+                    self.assertEqual(output.read_bytes(), before)
+                    self.assertEqual((root / 'storage/.config/dovi5.ko').read_bytes(), self.source)
+
     def test_interrupted_generation_preserves_complete_previous_pair(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); args = self.generation_fixture(root)
@@ -280,7 +350,8 @@ class ExactBlob(unittest.TestCase):
             self.assertEqual((root / 'storage/.config/dovi5.ko').read_bytes(), self.source)
 
     def test_load_validation_rejects_manifest_output_live_exports_and_links(self):
-        for kind in ('stamp', 'payload', 'live_exports', 'symlink', 'hardlink', 'marker'):
+        for kind in ('stamp', 'payload', 'live_exports', 'symlink', 'hardlink', 'marker',
+                     'stamp_symlink', 'stamp_hardlink', 'marker_symlink', 'generation_symlink'):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp); args = self.generation_fixture(root); prep.prepare(*args)
                 marker = root / 'run/dovi5-path'; output = Path(marker.read_text().strip())
@@ -292,6 +363,16 @@ class ExactBlob(unittest.TestCase):
                 if kind == 'hardlink':
                     original = root / 'storage/.config/dovi5.ko'; output.unlink(); os.link(original, output)
                 if kind == 'marker': marker.write_text('/storage/.config/dovi5.ko\n')
+                if kind in ('stamp_symlink', 'stamp_hardlink', 'marker_symlink'):
+                    linked = marker if kind == 'marker_symlink' else output.with_name('state.json')
+                    preserved = root / 'preserved'; preserved.write_bytes(linked.read_bytes())
+                    linked.unlink()
+                    if kind == 'stamp_hardlink': os.link(preserved, linked)
+                    else: linked.symlink_to(preserved)
+                if kind == 'generation_symlink':
+                    generation = output.parent
+                    preserved_dir = root / 'preserved-generation'
+                    generation.rename(preserved_dir); generation.symlink_to(preserved_dir, target_is_directory=True)
                 with self.assertRaises((p.Rejected, OSError)): prep.validate_load(*args)
                 self.assertFalse(marker.exists())
                 self.assertEqual((root / 'storage/.config/dovi5.ko').read_bytes(), self.source)

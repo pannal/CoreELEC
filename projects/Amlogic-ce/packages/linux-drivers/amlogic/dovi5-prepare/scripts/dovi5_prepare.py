@@ -14,7 +14,7 @@ import sys
 import tempfile
 
 from dv5_patch import (Rejected, SOURCE_SHA, atomic_write, canonical, digest, kernel_exports,
-                       read_regular, require, safe_directory, target_reference)
+                       read_module_reference, read_regular, require, safe_directory, target_reference)
 
 
 def config_value(path, value='yes'):
@@ -67,7 +67,7 @@ def context(root, ref=None, versions=None, ksyms=None, release=None):
     versions = versions or root / 'usr/lib/coreelec/dovi5-Module.symvers'
     ksyms = ksyms or root / 'proc/kallsyms'
     release = release or os.uname().release
-    reference = read_regular(ref)
+    reference = read_module_reference(ref)
     _, vermagic, *_ = target_reference(reference)
     require(vermagic.split()[0].decode('ascii') == release, 'shim reference differs from running kernel release')
     symvers = read_regular(versions)

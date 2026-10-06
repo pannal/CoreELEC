@@ -20,6 +20,8 @@ Preparation reads these files and writes a separate private copy under `/storage
 
 The image must contain the paired kernel changes, configured `dv_compat_shim`, Python3 and the exact kernel/shim `Module.symvers` installed by this package. Preparation checks the native module layout, running kernel release, readable kernel exports and each imported symbol's target CRC. The kernel enforces strict version checks for `dovi5` and `dv_compat_shim` while retaining the original vendor module's existing compatibility policy. A mismatch rejects the second backend.
 
+Installed module references may follow CoreELEC kernel-overlay symlinks to a regular target. Broken or looping links, nonregular targets and incompatible module contents reject preparation. Generated modules, manifests, markers and their directories retain strict link rejection.
+
 To opt out, create `/storage/.config/dovi5.conf` containing:
 
 ```ini

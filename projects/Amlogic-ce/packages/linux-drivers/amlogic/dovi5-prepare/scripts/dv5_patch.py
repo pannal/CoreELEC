@@ -54,6 +54,19 @@ def read_regular(path, allow_links=False):
         os.close(fd)
 
 
+def read_module_reference(path):
+    """Read an installed input module through normal kernel-overlay symlinks.
+
+    Resolve strictly, then use the unchanged regular-file checks on the target.
+    This is only for reference inputs; generated files must remain link-free.
+    """
+    try:
+        resolved = Path(path).resolve(strict=True)
+        return read_regular(resolved)
+    except (OSError, RuntimeError, Rejected) as exc:
+        raise Rejected('cannot read installed module reference ' + str(path) + ': ' + str(exc)) from exc
+
+
 def string(table, offset):
     require(0 <= offset < len(table), 'string offset outside table')
     end = table.find(b'\0', offset)
@@ -456,7 +469,7 @@ def main():
     parser.add_argument('--profile', default=str(Path(__file__).with_name('canary-profile.json')))
     args = parser.parse_args()
     source = read_regular(args.source, allow_links=True)
-    output = canonical(source, read_regular(args.ref), read_regular(args.versions), kernel_exports(args.ksyms),
+    output = canonical(source, read_module_reference(args.ref), read_regular(args.versions), kernel_exports(args.ksyms),
                        json.loads(read_regular(args.profile)))
     if args.command == 'patch':
         atomic_write(args.output, output, args.source)
