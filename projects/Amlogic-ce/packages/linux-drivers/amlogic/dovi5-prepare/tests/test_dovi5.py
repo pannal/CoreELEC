@@ -503,9 +503,9 @@ class Loader(unittest.TestCase):
     @unittest.skipUnless(LOADER is not None, 'repository loader unavailable; pass --loader for isolated fixture')
     def test_ne_unchanged_and_original_required_with_fallbacks(self):
         loader = LOADER.read_text()
-        # Pin the existing ne code, version check and license prefix without workstation paths.
+        # Pin the ne code and version policy, now including successful-load provenance.
         self.assertEqual(hashlib.sha256(loader[:loader.index('original_dovi_loaded()')].encode()).hexdigest(),
-                         '81ed84422797a0f5adebb6abea5546bd743a8805c6d83e7f644358589edc4b37')
+                         '6c83d056b91000c40e2cd79df0ac412bd329f2e70017bcc43f4219184fafe2f3')
         self.assertIn('DOVI5_KO=$(/usr/lib/coreelec/dovi5-prepare validate-load)', loader)
         body = loader[loader.index('original_dovi_loaded()'):loader.index('\nmessage "run dovi')]
         scenarios = [('missing', False, False, False, False),
@@ -519,12 +519,16 @@ class Loader(unittest.TestCase):
         for name, oldfile, oldsuccess, validation, newattempt in scenarios:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
-                for path in ('storage/.config', 'flash', 'android/vendor/lib/modules'):
+                for path in ('storage/.config', 'flash', 'android/vendor/lib/modules', 'run'):
                     (root / path).mkdir(parents=True)
+                (root / 'run/dovi-loaded-path').write_text('stale-original\n')
+                (root / 'run/dovi5-loaded-path').write_text('stale-new\n')
                 if oldfile: (root / 'storage/.config/dovi.ko').write_bytes(b'original')
                 if name.startswith('vendor_'): (root / 'android/vendor/lib/modules/dovi.ko').write_bytes(b'original')
                 adapted = body.replace('/storage/', str(root / 'storage') + '/').replace('/flash/', str(root / 'flash') + '/')
                 adapted = adapted.replace('/android/', str(root / 'android') + '/')
+                adapted = adapted.replace('/run/', str(root / 'run') + '/')
+                adapted = adapted.replace('/sys/module/', str(root / 'sys/module') + '/')
                 adapted = adapted.replace('/usr/lib/coreelec/dovi5-prepare validate-load', 'mock_validate_load')
                 adapted = adapted.replace('[ -b /dev/vendor ]', '[ "$MOCK_VENDOR_BLOCK" = yes ]')
                 mock = '''
@@ -558,6 +562,48 @@ load_dovi_ng
                     self.assertNotIn('shim', calls); self.assertNotIn('validate', calls)
                 self.assertNotIn('unexpected_', calls)
                 self.assertEqual('umount\n' in calls, name == 'vendor_owned')
+                old_record, new_record = root / 'run/dovi-loaded-path', root / 'run/dovi5-loaded-path'
+                self.assertEqual(old_record.exists(), oldsuccess)
+                self.assertEqual(new_record.exists(), newattempt and name != 'new_load_failed')
+                if oldsuccess:
+                    expected = root / ('android/vendor/lib/modules/dovi.ko' if name.startswith('vendor_') else 'storage/.config/dovi.ko')
+                    self.assertEqual(old_record.read_text(), str(expected) + '\n')
+                if new_record.exists():
+                    self.assertEqual(new_record.read_text(), '/storage/.dovi5/generations/example/dovi5.ko\n')
+                self.assertFalse(list((root / 'run').glob('*.tmp')))
+
+
+
+    def test_cleanup_retains_failed_unload_and_ne_records_success(self):
+        loader = LOADER.read_text()
+        body = loader[loader.index('original_dovi_loaded()'):loader.index('\nmessage "run dovi')]
+        ne = loader[loader.index('insmod_dovi_ne()'):loader.index('load_dovi_ne()')]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'run').mkdir()
+            for module in ('dovi', 'dovi5'):
+                (root / ('sys/module/' + module)).mkdir(parents=True)
+                (root / ('run/' + module + '-loaded-path')).write_text('/known/' + module + '.ko\n')
+            adapted = body.replace('/run/', str(root / 'run') + '/').replace('/sys/module/', str(root / 'sys/module') + '/')
+            # Preloaded modules have no invented path; failed unload retains
+            # existing provenance, successful unload clears it.
+            subprocess.run(['bash', '-c', adapted + '\nrmmod() { return 1; }\ncleanup_dovi_ng'], check=True)
+            self.assertTrue((root / 'run/dovi-loaded-path').exists())
+            self.assertTrue((root / 'run/dovi5-loaded-path').exists())
+            for module in ('dovi', 'dovi5'):
+                (root / ('sys/module/' + module)).rmdir()
+            subprocess.run(['bash', '-c', adapted + '\nrmmod() { return 0; }\ncleanup_dovi_ng'], check=True)
+            self.assertFalse((root / 'run/dovi-loaded-path').exists())
+            self.assertFalse((root / 'run/dovi5-loaded-path').exists())
+            source = root / 'dovi.ko'; source.write_text('original')
+            mock = '\nmessage() { :; }\nmodinfo() { :; }\ncheck_dovi_version() { return 0; }\n'
+            success = adapted + ne + mock + '\ninsmod() { return 0; }\ninsmod_dovi_ne "' + str(source) + '"'
+            subprocess.run(['bash', '-c', success], check=True)
+            self.assertEqual((root / 'run/dovi-loaded-path').read_text(), str(source) + '\n')
+            (root / 'run/dovi-loaded-path').unlink()
+            failure = adapted + ne + mock + '\ninsmod() { return 1; }\ninsmod_dovi_ne "' + str(source) + '"'
+            self.assertNotEqual(subprocess.run(['bash', '-c', failure]).returncode, 0)
+            self.assertFalse((root / 'run/dovi-loaded-path').exists())
 
 
 class FilesystemSafety(unittest.TestCase):

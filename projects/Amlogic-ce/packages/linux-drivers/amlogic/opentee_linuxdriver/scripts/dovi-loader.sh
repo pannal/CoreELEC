@@ -38,7 +38,10 @@ insmod_dovi_ne() {
     message "loading '${DOVI_KO}' module"
     modinfo ${DOVI_KO}
     if check_dovi_version ${DOVI_KO} 5 4 210; then
-      insmod ${DOVI_KO} && return 0
+      if insmod "${DOVI_KO}"; then
+        record_dovi_load dovi "${DOVI_KO}"
+        return 0
+      fi
     else
       cat > /tmp/dovi.message << 'EOF'
 [TITLE]CoreELEC Dolby Vision Media Playback[/TITLE]
@@ -91,6 +94,7 @@ load_dovi_ne() {
 
 cleanup_dovi_ne() {
   rmmod dovi 2>/dev/null
+  original_dovi_loaded || rm -f /run/dovi-loaded-path
   mountpoint -q /android/odm && umount /android/odm
   mountpoint -q /android/oem && umount /android/oem
   # unmount only if mounted from this script
@@ -102,15 +106,31 @@ original_dovi_loaded() {
   [ -d /sys/module/dovi ]
 }
 
+# Records only successful insmod paths; prepared candidates are not load evidence.
+record_dovi_load() {
+  DOVI_LOAD_RECORD="/run/${1}-loaded-path"
+  if printf '%s\n' "${2}" > "${DOVI_LOAD_RECORD}.tmp"; then
+    mv -f "${DOVI_LOAD_RECORD}.tmp" "${DOVI_LOAD_RECORD}" || rm -f "${DOVI_LOAD_RECORD}.tmp"
+  else
+    rm -f "${DOVI_LOAD_RECORD}.tmp"
+  fi
+}
+
 load_dovi_ng() {
   DOVI_VENDOR_OWNED=no
   DOVI_ORIGINAL_LOADED=no
-  original_dovi_loaded && DOVI_ORIGINAL_LOADED=yes
+  if original_dovi_loaded; then
+    DOVI_ORIGINAL_LOADED=yes
+  else
+    rm -f /run/dovi-loaded-path
+  fi
+  [ -d /sys/module/dovi5 ] || rm -f /run/dovi5-loaded-path
   if [ "${DOVI_ORIGINAL_LOADED}" != yes ]; then
     for DOVI_KO in /storage/.config/dovi.ko /flash/dovi.ko /storage/dovi.ko; do
       if [ -f "${DOVI_KO}" ]; then
         message "loading original dovi '${DOVI_KO}'"
         if insmod "${DOVI_KO}"; then
+          record_dovi_load dovi "${DOVI_KO}"
           DOVI_ORIGINAL_LOADED=yes
           break
         fi
@@ -129,6 +149,7 @@ load_dovi_ng() {
     if [ "${DOVI_VENDOR_READY}" = yes ]; then
       for DOVI_KO in /android/vendor/lib/modules/dovi.ko /android/vendor/lib/modules/dovi_vs10.ko; do
         if [ -f "${DOVI_KO}" ] && insmod "${DOVI_KO}"; then
+          record_dovi_load dovi "${DOVI_KO}"
           DOVI_ORIGINAL_LOADED=yes
           break
         fi
@@ -150,6 +171,7 @@ load_dovi_ng() {
     return 0
   fi
   if insmod "${DOVI5_KO}"; then
+    record_dovi_load dovi5 "${DOVI5_KO}"
     message "loaded validated dovi5 '${DOVI5_KO}' alongside original dovi"
   else
     message "dovi5 load failed; retaining original dovi"
@@ -160,6 +182,8 @@ load_dovi_ng() {
 cleanup_dovi_ng() {
   rmmod dovi5 2>/dev/null
   rmmod dovi 2>/dev/null
+  original_dovi_loaded || rm -f /run/dovi-loaded-path
+  [ -d /sys/module/dovi5 ] || rm -f /run/dovi5-loaded-path
 }
 
 message "run dovi '${1}' for ${COREELEC_DEVICE:8:2}"
