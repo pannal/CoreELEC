@@ -8,6 +8,8 @@ PKG_SITE="https://coreelec.org"
 # Using local service.coreelec.settings checkout for development
 PKG_URL="file://${ROOT}/sources/service.coreelec.settings/service.coreelec.settings-local"
 PKG_SOURCE_NAME="service.coreelec.settings-local"
+# Local source edits must invalidate the cached addon package.
+PKG_NEED_UNPACK="${PKG_URL#file://}/src ${PKG_URL#file://}/language"
 PKG_DEPENDS_TARGET="toolchain Python3 connman dbussy"
 PKG_LONGDESC="CoreELEC-settings: is a settings dialog for CoreELEC"
 
