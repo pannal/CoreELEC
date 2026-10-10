@@ -1,0 +1,10 @@
+--- a/src/libaacs/aacs.c
++++ b/src/libaacs/aacs.c
+@@ -637,6 +637,7 @@
+     }
+ 
+     if (!_ensure_config(aacs)) {
++        mkb_close(mkb);
+         return AACS_ERROR_NO_CONFIG;
+     }
+ 
