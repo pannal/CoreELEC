@@ -38,10 +38,14 @@
  *
  *   OPEN  (1)  payload is `key=value` lines, one per line: `lib` (required,
  *              the engine to load), and `config`, `layout`, `bridge`, `codec`,
- *              `rate` and `decode_thread` (`on` or `off`; unset means on for
- *              TrueHD, off otherwise). Must come first. Unknown keys are
- *              ignored, so a newer host can send a key this build does not
- *              know.
+ *              `rate`, `decode_thread` (`on`, `off`, or `live` to follow the
+ *              config; unset means on for TrueHD and E-AC-3, off otherwise),
+ *              and `override`, `override_layout` and `override_decode_thread`:
+ *              a complete config the host built for this stream, played in
+ *              place of `config`, and what replaces `layout` and
+ *              `decode_thread` when it plays (see OVERRIDE below). Must come
+ *              first. Unknown keys are ignored, so a newer host can send a
+ *              key this build does not know.
  *   FEED  (2)  payload is input for the bridge named in OPEN, passed on
  *              as it is. For the Harletty bridge that is one raw encoded
  *              packet, exactly as it comes off Kodi's stream parser before
@@ -66,17 +70,82 @@
  *
  * FLUSH AND RESET
  *
- * FLUSH is an end-of-stream operation. It calls the optional `orender_drain`
- * entry point until it returns no audio - one packet's per call - emits the
- * final metadata and audio using the same framing as FEED, then writes the
- * `flush` acknowledgement. The acknowledgement therefore
- * means every preceding output byte belongs to the completed stream. Older
- * engines without the symbol still acknowledge, with a diagnostic that drain
- * was unavailable.
+ * FLUSH is an end-of-stream operation. It calls `orender_drain` until it
+ * returns no audio - one packet's per call - emits the final metadata and
+ * audio using the same framing as FEED, then writes the `flush`
+ * acknowledgement. The acknowledgement therefore means every preceding
+ * output byte belongs to the completed stream.
  *
  * RESET is deliberately different: a seek discards decoder and renderer state
  * and must not play the audio being sought away from. Never implement RESET in
  * terms of FLUSH.
+ *
+ *
+ * OVERRIDE
+ *
+ * With `override=<path>`, the host hands a complete config of its own making
+ * - Kodi's, merged from its `config` and a file the listener edits - to be
+ * played in place of `config` when the engine takes it as written. This
+ * helper only checks it (`orender_check_config`) and never writes it; what
+ * the listener may set, and the layout and decode thread that follow from
+ * it, are the host's to decide. Only while it plays, `override_layout`
+ * replaces `layout` (empty for none: the config's own) and
+ * `override_decode_thread` replaces `decode_thread`, so that a config the
+ * engine refuses leaves the session exactly as `config` alone would have it.
+ * The open acknowledgement then ends with `override=applied` (the renderer
+ * is created from it) or `override=rejected` (the renderer is created from
+ * `config`, and an `override_error <reason>` INFO frame follows the
+ * acknowledgement).
+ *
+ *
+ * THE STREAM LINE
+ *
+ * An INFO frame reports what the stream turned out to be, whenever any of it
+ * changes: `stream objects= spatial= channels= rate= hrir= brir= latency=
+ * render= source_label= bed=`. `brir` is the room's state (`none`, `loading`,
+ * `ready`, `failed`), `latency` the renderer's constant delay in samples at
+ * the session's rate, `render` how the frames reached the headphones as the
+ * session rendered them (`direct`, `cascade:N`, `room:N` - N loudspeakers -
+ * or `speakers:N`), whatever chose it. `bed` stays last because the host
+ * reads it to the end of the line, and a
+ * new key must not contain an old one, because the host finds them by
+ * substring.
+ *
+ *
+ * OUTSIDE A STREAM
+ *
+ *   omniphony-helper --prepare-brir <liborender.so> <out.room> [<kept.room>] <size>
+ *
+ * reads exactly <size> bytes of a room-response SOFA file from stdin,
+ * describes them as `--describe` does, and writes the prepared room
+ * (`orender_brir_prepare`) to <out.room>, through <out.room>.part - in one
+ * pass over the bytes, so a host choosing a room runs this alone. The room
+ * carries the identity of the file it was made from, `source=` in the line
+ * and in what `--describe` says of the room. When <kept.room> is the room
+ * already prepared from the same bytes, nothing is written. It prints one
+ * line and exits 0 or 1: `prepared <description>`, the description with
+ * the room's `seconds=` and `bytes=`; `kept <description>`; `failed
+ * reason=notroom <description>` when the room stage does not take the file
+ * (an HRTF set, a prepared room, or neither); or `failed reason=<word>
+ * <detail>`.
+ *
+ *   omniphony-helper --prepare-hrtf <liborender.so> <hrtf.sofa> <hrtf.grid> <rate> <eq>
+ *
+ * builds the finished HRIR grid of the local SOFA set <hrtf.sofa> and keeps
+ * it in <hrtf.grid> (`orender_hrtf_prepare`), as a stream at <rate> Hz with
+ * diffuse-field equalisation <eq> (1 or 0) whose `hrtf_grid_cache` names
+ * that file would at its start; nothing is built when the file already holds
+ * it. It prints `prepared grid=built …` or `prepared grid=kept …`, or
+ * `failed reason=<word> <detail>`, and exits 0 or 1.
+ *
+ *   omniphony-helper --describe <liborender.so> <size>
+ *
+ * reads exactly <size> bytes of a SOFA file or prepared room from stdin and
+ * prints what it holds, which binaural stage takes it and the identity of
+ * the SOFA file it is or was made from (`orender_sofa_describe`):
+ * `described hrtf=yes|no room=yes|no … source=…`, or
+ * `failed reason=<word> <detail>`. It exits 0 or 1. A room of a format this
+ * engine does not read is `failed`, with the reason.
  *
  *
  * ON DEADLOCK
@@ -171,6 +240,10 @@ typedef struct
   uint32_t (*decoded_sample_rate)(const OrenderRenderer*);
   int (*drain)(OrenderRenderer*, float*, uintptr_t, uintptr_t*, uint32_t*, int64_t*);
   int (*set_option)(OrenderRenderer*, const char*, const char*);
+  int (*brir_state)(const OrenderRenderer*);
+  uint64_t (*output_latency)(const OrenderRenderer*);
+  uint32_t (*render_path)(const OrenderRenderer*, char*, uint32_t);
+  int (*check_config)(const char*, char*, uint32_t);
   uint32_t (*version_major)(void);
   uint32_t (*version_minor)(void);
 } Api;
@@ -283,6 +356,9 @@ typedef struct
   const char* codec;
   const char* rate;
   const char* decode_thread;
+  const char* override;
+  const char* override_layout;
+  const char* override_decode_thread;
 } OpenArgs;
 
 static void parse_open(char* text, size_t len, OpenArgs* out)
@@ -318,6 +394,12 @@ static void parse_open(char* text, size_t len, OpenArgs* out)
         out->rate = v;
       else if (strcmp(k, "decode_thread") == 0)
         out->decode_thread = v;
+      else if (strcmp(k, "override") == 0)
+        out->override = v;
+      else if (strcmp(k, "override_layout") == 0)
+        out->override_layout = v;
+      else if (strcmp(k, "override_decode_thread") == 0)
+        out->override_decode_thread = v;
       /* Unknown keys are ignored on purpose: a newer host may send a key this
        * build does not know, and refusing the whole stream over it would be a
        * worse failure than proceeding without it. */
@@ -355,24 +437,26 @@ static int bind_engine(const char* path)
                 api.version_major(), ORENDER_ABI_MAJOR);
     return -1;
   }
+  /* The engine this helper ships with, in the same bundle: every entry point
+   * it uses is there, and one that is not is a broken install. */
+  SYM(version_minor, "orender_version_minor");
   SYM(create, "orender_create");
   SYM(destroy, "orender_destroy");
   SYM(reset, "orender_reset");
   SYM(process, "orender_process");
+  SYM(drain, "orender_drain");
+  SYM(set_option, "orender_set_option");
+  SYM(check_config, "orender_check_config");
+  SYM(object_count, "orender_object_count");
+  SYM(has_objects, "orender_has_objects");
+  SYM(bed_layout, "orender_bed_layout");
+  SYM(source_label, "orender_source_label");
+  SYM(decoded_sample_rate, "orender_decoded_sample_rate");
+  SYM(hrir_in_use, "orender_hrir_in_use");
+  SYM(brir_state, "orender_brir_state");
+  SYM(output_latency, "orender_output_latency_samples");
+  SYM(render_path, "orender_render_path");
 #undef SYM
-
-  /* Optional, and probed rather than required: they exist to tell the host what
-   * the stream turned out to contain, and an engine without them should still
-   * render. */
-  *(void**)(&api.object_count) = dlsym(lib_handle, "orender_object_count");
-  *(void**)(&api.has_objects) = dlsym(lib_handle, "orender_has_objects");
-  *(void**)(&api.bed_layout) = dlsym(lib_handle, "orender_bed_layout");
-  *(void**)(&api.source_label) = dlsym(lib_handle, "orender_source_label");
-  *(void**)(&api.hrir_in_use) = dlsym(lib_handle, "orender_hrir_in_use");
-  *(void**)(&api.decoded_sample_rate) = dlsym(lib_handle, "orender_decoded_sample_rate");
-  *(void**)(&api.drain) = dlsym(lib_handle, "orender_drain");
-  *(void**)(&api.set_option) = dlsym(lib_handle, "orender_set_option");
-  *(void**)(&api.version_minor) = dlsym(lib_handle, "orender_version_minor");
   return 0;
 }
 
@@ -397,14 +481,11 @@ static const char* const CHANNEL_LABELS[] = {
  * "7.1.4 + 5 Objects", or "7.1 + 4 Heights" when the presentation places a
  * quartet and carries nothing above it - so a bed is also worth exporting when
  * it places height channels and carries no objects at all. Empty for plain
- * multichannel, for an engine too old to export the call, and on any error -
- * all three mean the same thing to the host, which is "say nothing about a
- * bed" rather than "say there is none". */
+ * multichannel and on any error - both mean the same thing to the host, which
+ * is "say nothing about a bed" rather than "say there is none". */
 static void describe_bed(OrenderRenderer* r, char* out, size_t cap)
 {
   out[0] = '\0';
-  if (!api.bed_layout)
-    return;
 
   /* Query, then fill. The ABI writes nothing unless cap >= N, so a bed wider
    * than this buffer yields an empty description rather than a truncated one -
@@ -435,9 +516,9 @@ static void describe_bed(OrenderRenderer* r, char* out, size_t cap)
 /* The bridge's declaration-level source label, such as
  * "DTS-HD HRA + DTS:X 7.1.4" or "DTS-HD MA + Auro-3D 11.1".
  *
- * Empty from an engine too old to export the symbol, from one that has not
- * decoded a frame yet, and from a stream with nothing to add; as with the bed,
- * all three mean "say nothing" to the host rather than "there is none".
+ * Empty from an engine that has not decoded a frame yet and from a stream with
+ * nothing to add; as with the bed, both mean "say nothing" to the host rather
+ * than "there is none".
  *
  * The name carries a space, so unlike the bed it cannot be read to the end of
  * the line. It is written with the spaces turned into underscores and the host
@@ -446,7 +527,7 @@ static void describe_bed(OrenderRenderer* r, char* out, size_t cap)
 static void describe_source_label(OrenderRenderer* r, char* out, size_t cap)
 {
   out[0] = '\0';
-  if (!api.source_label || cap == 0)
+  if (cap == 0)
     return;
 
   /* ABI 9 returns N excluding the terminator and writes only when cap > N.
@@ -472,14 +553,14 @@ static void describe_source_label(OrenderRenderer* r, char* out, size_t cap)
  * load reads "saf", and it is live: the configured set is built after the
  * first rendered block, so the answer can change a moment into a stream.
  *
- * Empty from an engine without the symbol and on any mismatch in the query,
- * which the host reads as "say nothing" rather than as either set. A
+ * Empty on any mismatch in the query, which the host reads as "say nothing"
+ * rather than as either set. A
  * selector is one word, but anything carrying whitespace is refused too so
  * the status line stays splittable. */
 static void describe_hrir(OrenderRenderer* r, char* out, size_t cap)
 {
   out[0] = '\0';
-  if (!api.hrir_in_use || cap == 0)
+  if (cap == 0)
     return;
 
   const uint32_t n = api.hrir_in_use(r, NULL, 0);
@@ -499,6 +580,46 @@ static void describe_hrir(OrenderRenderer* r, char* out, size_t cap)
   }
 }
 
+/* Where the session's room stands, by `orender_brir_state`: it is requested
+ * with the first rendered block and loaded off the audio thread, so this goes
+ * from `loading` to `ready` (or `failed`, the reason in the engine's log) a
+ * moment into the stream, while the embedded set renders the room's
+ * loudspeakers meanwhile. `none` when no room is selected. */
+static void describe_brir(OrenderRenderer* r, char* out, size_t cap)
+{
+  static const char* const STATES[] = {"none", "loading", "ready", "failed"};
+  out[0] = '\0';
+  if (cap == 0)
+    return;
+  const int state = api.brir_state(r);
+  if (state >= 0 && state < (int)(sizeof(STATES) / sizeof(STATES[0])))
+    snprintf(out, cap, "%s", STATES[state]);
+}
+
+/* The renderer's constant delay, in samples at the session's rate: a room
+ * convolves with a latency of its own, which the host takes off the
+ * timestamps it presents. Live, like the rest of the line. */
+static void describe_latency(OrenderRenderer* r, char* out, size_t cap)
+{
+  out[0] = '\0';
+  if (cap == 0)
+    return;
+  snprintf(out, cap, "%llu", (unsigned long long)api.output_latency(r));
+}
+
+/* How the frames reached the headphones, by `orender_render_path`: what the
+ * session rendered, which a config the listener wrote can have chosen in
+ * place of the host's settings. Empty for an answer too long for the line. */
+static void describe_render(OrenderRenderer* r, char* out, size_t cap)
+{
+  out[0] = '\0';
+  if (cap == 0)
+    return;
+  const uint32_t n = api.render_path(r, out, (uint32_t)cap);
+  if (n == 0 || n >= cap || strchr(out, ' '))
+    out[0] = '\0';
+}
+
 typedef struct
 {
   int reported;
@@ -508,6 +629,9 @@ typedef struct
   char bed[128];
   char source_label[64];
   char hrir[16];
+  char brir[16];
+  char latency[24];
+  char render[32];
 } StreamInfoState;
 
 static void clear_stream_info(StreamInfoState* state)
@@ -519,33 +643,46 @@ static void clear_stream_info(StreamInfoState* state)
   state->bed[0] = '\0';
   state->source_label[0] = '\0';
   state->hrir[0] = '\0';
+  state->brir[0] = '\0';
+  state->latency[0] = '\0';
+  state->render[0] = '\0';
 }
 
 static void report_stream_info(OrenderRenderer* renderer,
                                uint32_t channels,
                                StreamInfoState* state)
 {
-  const int objects = api.object_count ? api.object_count(renderer) : -1;
-  const int spatial = api.has_objects ? api.has_objects(renderer) : -1;
-  const uint32_t rate = api.decoded_sample_rate ? api.decoded_sample_rate(renderer) : 0;
+  const int objects = api.object_count(renderer);
+  const int spatial = api.has_objects(renderer);
+  const uint32_t rate = api.decoded_sample_rate(renderer);
   char bed[128];
   char source_label[64];
   char hrir[16];
+  char brir[16];
+  char latency[24];
+  char render[32];
 
   describe_bed(renderer, bed, sizeof(bed));
   describe_source_label(renderer, source_label, sizeof(source_label));
   describe_hrir(renderer, hrir, sizeof(hrir));
+  describe_brir(renderer, brir, sizeof(brir));
+  describe_latency(renderer, latency, sizeof(latency));
+  describe_render(renderer, render, sizeof(render));
   if (!state->reported || objects != state->objects || spatial != state->spatial ||
       rate != state->rate || strcmp(bed, state->bed) != 0 ||
-      strcmp(source_label, state->source_label) != 0 || strcmp(hrir, state->hrir) != 0)
+      strcmp(source_label, state->source_label) != 0 || strcmp(hrir, state->hrir) != 0 ||
+      strcmp(brir, state->brir) != 0 || strcmp(latency, state->latency) != 0 ||
+      strcmp(render, state->render) != 0)
   {
     /* bed stays last because the host reads it to the end of the line. An
      * explicit empty source_label clears a label reported by an earlier frame,
-     * and hrir= is re-sent when the configured set lands after the first
-     * rendered block. */
+     * and hrir=, brir=, latency= and render= are re-sent when the configured
+     * set or room lands after the first rendered block. */
     emit_status(ST_INFO,
-                "stream objects=%d spatial=%d channels=%u rate=%u hrir=%s source_label=%s bed=%s",
-                objects, spatial, channels, rate, hrir, source_label, bed);
+                "stream objects=%d spatial=%d channels=%u rate=%u hrir=%s brir=%s latency=%s "
+                "render=%s source_label=%s bed=%s",
+                objects, spatial, channels, rate, hrir, brir, latency, render, source_label,
+                bed);
     state->reported = 1;
     state->objects = objects;
     state->spatial = spatial;
@@ -553,12 +690,316 @@ static void report_stream_info(OrenderRenderer* renderer,
     snprintf(state->bed, sizeof(state->bed), "%s", bed);
     snprintf(state->source_label, sizeof(state->source_label), "%s", source_label);
     snprintf(state->hrir, sizeof(state->hrir), "%s", hrir);
+    snprintf(state->brir, sizeof(state->brir), "%s", brir);
+    snprintf(state->latency, sizeof(state->latency), "%s", latency);
+    snprintf(state->render, sizeof(state->render), "%s", render);
   }
+}
+
+/* ---- the host's override ------------------------------------------------ */
+
+/* What came of OPEN's `override`. */
+typedef struct
+{
+  const char* status; /* NULL when none was asked for */
+  char reason[384];
+} Override;
+
+/* Check OPEN's `override`, the host's config for this stream. One the engine
+ * refuses leaves the session on the host's `config`, with the engine's reason
+ * kept for the host: the listener asked for something and should hear why it
+ * did not happen, not find out by ear. */
+static void check_override(const OpenArgs* a, Override* ov)
+{
+  memset(ov, 0, sizeof(*ov));
+  if (!a->override)
+    return;
+  const int rc = api.check_config(a->override, ov->reason, (uint32_t)sizeof(ov->reason));
+  if (rc == 0)
+    ov->status = "applied";
+  else
+  {
+    ov->status = "rejected";
+    if (!ov->reason[0])
+      snprintf(ov->reason, sizeof(ov->reason), "the engine could not check it (%d)", rc);
+  }
+}
+
+/* ---- outside a stream --------------------------------------------------- */
+
+/* Load the engine for a one-off command, or say why not on stdout. */
+static void* cli_engine(const char* path)
+{
+  void* handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+  if (!handle)
+  {
+    printf("failed reason=engine %s\n", dlerror());
+    return NULL;
+  }
+  uint32_t (*major)(void) = NULL;
+  *(void**)(&major) = dlsym(handle, "orender_version_major");
+  if (!major || major() != ORENDER_ABI_MAJOR)
+  {
+    printf("failed reason=engine %s is not an engine of ABI major %u\n", path, ORENDER_ABI_MAJOR);
+    dlclose(handle);
+    return NULL;
+  }
+  return handle;
+}
+
+/* MemAvailable, in bytes, or -1 when the kernel does not say. */
+static long long mem_available(void)
+{
+  FILE* f = fopen("/proc/meminfo", "r");
+  if (!f)
+    return -1;
+  char line[256];
+  long long kb = -1;
+  while (fgets(line, sizeof(line), f))
+  {
+    if (sscanf(line, "MemAvailable: %lld kB", &kb) == 1)
+      break;
+  }
+  fclose(f);
+  return kb < 0 ? -1 : kb * 1024;
+}
+
+/* Largest file a one-off command takes: the engine's reader refuses a dataset
+ * past 4 GiB, and the largest room set published, TuBuRo's, is 1.6 GB. */
+#define PREPARE_MAX_BYTES (4ULL << 30)
+/* Room left beside the file's own bytes. Preparing reads the geometry, then
+ * only the chunks holding the front orientation: the BBC 7.1.4 set (274 MB)
+ * peaks at its own size plus under 16 MB. A quarter of the file and 64 MiB
+ * more covers files stored in larger chunks or with longer responses; past
+ * that guess, the kernel takes this process rather than Kodi (oom_score_adj). */
+#define PREPARE_HEADROOM (64ULL << 20)
+
+/* The file a one-off command is handed on stdin, exactly `size_text` bytes,
+ * or NULL after saying on stdout why not. Refuses before reading a byte when
+ * the box cannot hold the file: one that runs out of memory does so with
+ * Kodi beside it, and asking first costs nothing. If the guess is wrong, this
+ * is the process to lose. */
+static uint8_t* cli_input(const char* size_text, unsigned long long* out_size)
+{
+  char* end = NULL;
+  errno = 0;
+  const unsigned long long size = strtoull(size_text, &end, 10);
+  if (errno || end == size_text || *end || size == 0 || size > PREPARE_MAX_BYTES)
+  {
+    printf("failed reason=input the size must be 1 to %llu bytes, not %s\n", PREPARE_MAX_BYTES,
+           size_text);
+    return NULL;
+  }
+
+  const unsigned long long need = size + size / 4 + PREPARE_HEADROOM;
+  const long long available = mem_available();
+  if (available >= 0 && need > (unsigned long long)available)
+  {
+    printf("failed reason=memory needs %llu MB, %lld MB available\n", need >> 20,
+           available >> 20);
+    return NULL;
+  }
+
+  FILE* oom = fopen("/proc/self/oom_score_adj", "w");
+  if (oom)
+  {
+    fputs("1000", oom);
+    fclose(oom);
+  }
+
+  uint8_t* bytes = (uint8_t*)malloc((size_t)size);
+  if (!bytes)
+  {
+    printf("failed reason=memory cannot hold %llu bytes\n", size);
+    return NULL;
+  }
+  size_t got = 0;
+  while (got < size)
+  {
+    const ssize_t n = read(STDIN_FILENO, bytes + got, (size_t)size - got);
+    if (n > 0)
+      got += (size_t)n;
+    else if (n < 0 && errno == EINTR)
+      continue;
+    else
+      break;
+  }
+  if (got < size)
+  {
+    printf("failed reason=input stdin ended after %zu of %llu bytes\n", got, size);
+    free(bytes);
+    return NULL;
+  }
+  *out_size = size;
+  return bytes;
+}
+
+/* The engine entry point a one-off command calls, or NULL after saying on
+ * stdout that the engine is missing it: a broken install, as for OPEN. */
+static void* cli_symbol(const char* lib, const char* name, void** handle)
+{
+  *handle = cli_engine(lib);
+  if (!*handle)
+    return NULL;
+  void* symbol = dlsym(*handle, name);
+  if (!symbol)
+  {
+    printf("failed reason=engine the engine is missing %s\n", name);
+    dlclose(*handle);
+    *handle = NULL;
+  }
+  return symbol;
+}
+
+/* --prepare-brir: a room chosen in Kodi's settings, prepared once. Kodi
+ * streams the file through stdin, wherever it lives, and keeps only what this
+ * writes. The process is short-lived and disposable: whatever goes wrong,
+ * Kodi is told in one line and the room it had stays in place. */
+static int cli_prepare(const char* lib,
+                       const char* out_path,
+                       const char* size_text,
+                       const char* kept_path)
+{
+  void* handle = NULL;
+  int (*prepare)(const uint8_t*, uintptr_t, const char*, const char*, char*, uint32_t) = NULL;
+  *(void**)(&prepare) = cli_symbol(lib, "orender_brir_prepare", &handle);
+  if (!prepare)
+    return 1;
+
+  unsigned long long size = 0;
+  uint8_t* bytes = cli_input(size_text, &size);
+  if (!bytes)
+  {
+    dlclose(handle);
+    return 1;
+  }
+
+  char summary[1024] = "";
+  const int rc = prepare(bytes, (uintptr_t)size, kept_path, out_path, summary,
+                         (uint32_t)sizeof(summary));
+  free(bytes);
+  dlclose(handle);
+  if (rc == 0 || rc == 1)
+  {
+    printf("%s %s\n", rc == 0 ? "prepared" : "kept", summary);
+    return 0;
+  }
+  printf("failed reason=%s %s\n",
+         rc == 2    ? "notroom"
+         : rc == -1 ? "unusable"
+         : rc == -2 ? "write"
+                    : "internal",
+         summary);
+  return 1;
+}
+
+/* --prepare-hrtf: the grid of an HRTF set chosen in Kodi's settings, built
+ * when it is chosen rather than at the start of the first film. The set is
+ * the local copy Kodi staged, which the engine reads by its path as a stream
+ * does. */
+static int cli_prepare_hrtf(const char* lib,
+                            const char* sofa_path,
+                            const char* grid_path,
+                            const char* rate_text,
+                            const char* eq_text)
+{
+  char* end = NULL;
+  const unsigned long rate = strtoul(rate_text, &end, 10);
+  if (end == rate_text || *end != '\0' || rate == 0 || rate > 768000 ||
+      (strcmp(eq_text, "0") != 0 && strcmp(eq_text, "1") != 0))
+  {
+    printf("failed reason=internal bad rate or equalisation: %s %s\n", rate_text, eq_text);
+    return 1;
+  }
+
+  void* handle = NULL;
+  int (*prepare)(const char*, const char*, uint32_t, int, char*, uint32_t) = NULL;
+  *(void**)(&prepare) = cli_symbol(lib, "orender_hrtf_prepare", &handle);
+  if (!prepare)
+    return 1;
+
+  char summary[1024] = "";
+  const int rc = prepare(sofa_path, grid_path, (uint32_t)rate, eq_text[0] == '1', summary,
+                         (uint32_t)sizeof(summary));
+  dlclose(handle);
+  if (rc == 0 || rc == 1)
+  {
+    printf("prepared %s\n", summary);
+    return 0;
+  }
+  printf("failed reason=%s %s\n", rc == -1 ? "unusable" : rc == -2 ? "write" : "internal",
+         summary);
+  return 1;
+}
+
+/* --describe: what a file chosen in Kodi's settings holds, and which of the
+ * two binaural stages takes it, before anything is copied or prepared. Of a
+ * SOFA file only its shape and geometry are read, so a room of hundreds of MB
+ * costs the read from stdin and little else. */
+static int cli_describe(const char* lib, const char* size_text)
+{
+  void* handle = NULL;
+  int (*describe)(const uint8_t*, uintptr_t, char*, uint32_t) = NULL;
+  *(void**)(&describe) = cli_symbol(lib, "orender_sofa_describe", &handle);
+  if (!describe)
+    return 1;
+
+  unsigned long long size = 0;
+  uint8_t* bytes = cli_input(size_text, &size);
+  if (!bytes)
+  {
+    dlclose(handle);
+    return 1;
+  }
+
+  char line[2048] = "";
+  const int rc = describe(bytes, (uintptr_t)size, line, (uint32_t)sizeof(line));
+  free(bytes);
+  dlclose(handle);
+  if (rc >= 0)
+  {
+    printf("described %s\n", line);
+    return 0;
+  }
+  /* The line is `reason=…` alone when the bytes are not a file it reads. */
+  const char* why = strncmp(line, "reason=", 7) == 0 ? line + 7 : line;
+  printf("failed reason=%s %s\n", rc == -1 ? "unusable" : "internal", why);
+  return 1;
+}
+
+static int usage(void)
+{
+  fprintf(stderr, "usage: omniphony-helper                (the stream protocol on stdin/stdout)\n"
+                  "       omniphony-helper --prepare-brir <liborender.so> <out.room> "
+                  "[<kept.room>] <size>\n"
+                  "       omniphony-helper --prepare-hrtf <liborender.so> <hrtf.sofa> "
+                  "<hrtf.grid> <rate> <eq>\n"
+                  "       omniphony-helper --describe <liborender.so> <size>\n");
+  return 2;
 }
 
 /* ---- main --------------------------------------------------------------- */
 
-int main(void)
+static int run_protocol(void);
+
+int main(int argc, char** argv)
+{
+  if (argc == 1)
+    return run_protocol();
+  /* The size of what stdin holds comes last, as for every command with an
+   * input: the host adds it after the arguments it built. */
+  if (argc == 5 && strcmp(argv[1], "--prepare-brir") == 0)
+    return cli_prepare(argv[2], argv[3], argv[4], NULL);
+  if (argc == 6 && strcmp(argv[1], "--prepare-brir") == 0)
+    return cli_prepare(argv[2], argv[3], argv[5], argv[4]);
+  if (argc == 7 && strcmp(argv[1], "--prepare-hrtf") == 0)
+    return cli_prepare_hrtf(argv[2], argv[3], argv[4], argv[5], argv[6]);
+  if (argc == 4 && strcmp(argv[1], "--describe") == 0)
+    return cli_describe(argv[2], argv[3]);
+  return usage();
+}
+
+static int run_protocol(void)
 {
   OrenderRenderer* renderer = NULL;
   float* out = NULL;
@@ -696,11 +1137,21 @@ int main(void)
         cfg.bridge_path = a.bridge;
         cfg.codec = a.codec;
 
+        Override ov;
+        check_override(&a, &ov);
+        const int overridden = ov.status && strcmp(ov.status, "applied") == 0;
+        if (overridden)
+        {
+          cfg.config_yaml_path = a.override;
+          if (a.override_layout)
+            cfg.speaker_layout_path = a.override_layout[0] ? a.override_layout : NULL;
+        }
+
         renderer = api.create(&cfg);
         if (!renderer)
         {
           emit_status(ST_OPEN_FAILED, "orender_create failed - check the bridge path in %s",
-                      a.config ? a.config : "(default config)");
+                      cfg.config_yaml_path ? cfg.config_yaml_path : "(default config)");
           exit_code = 3;
           goto done;
         }
@@ -713,21 +1164,27 @@ int main(void)
          * engine and drains on FLUSH. On by default for TrueHD and E-AC-3,
          * where decoding is a third or more of the work - more than half for
          * E-AC-3 with Atmos objects; PCM has nothing worth a thread. OPEN's
-         * `decode_thread` overrides the default either way. An engine without
-         * the option renders inline. */
-        const char* decode_thread = a.decode_thread;
+         * `decode_thread` overrides the default either way: `live` has the
+         * engine follow the config. */
+        const char* decode_thread =
+            overridden && a.override_decode_thread ? a.override_decode_thread : a.decode_thread;
         if (!decode_thread && a.codec &&
             (strcmp(a.codec, "truehd") == 0 || strcmp(a.codec, "eac3") == 0))
           decode_thread = "on";
-        int threaded = 0;
-        if (decode_thread && api.set_option)
-          threaded = api.set_option(renderer, "decode_thread", decode_thread) == 0 &&
-                     strcmp(decode_thread, "on") == 0;
+        const char* thread_mode = "off";
+        if (decode_thread && api.set_option(renderer, "decode_thread", decode_thread) == 0)
+          thread_mode = decode_thread;
 
-        emit_status(ST_OK, "open codec=%s rate=%u engine=%u.%u decode_thread=%s",
+        char override_note[64] = "";
+        if (ov.status)
+          snprintf(override_note, sizeof(override_note), " override=%s", ov.status);
+        emit_status(ST_OK, "open codec=%s rate=%u engine=%u.%u decode_thread=%s%s",
                     a.codec ? a.codec : "(sniffed)", (unsigned)cfg.sample_rate,
-                    api.version_major(), api.version_minor ? api.version_minor() : 0,
-                    threaded ? "on" : "off");
+                    api.version_major(), api.version_minor(),
+                    thread_mode, override_note);
+        /* After the acknowledgement, so a host reading for it finds it first. */
+        if (ov.status && strcmp(ov.status, "rejected") == 0)
+          emit_status(ST_INFO, "override_error %s", ov.reason);
         break;
       }
 
@@ -862,12 +1319,6 @@ int main(void)
           exit_code = 5;
           goto done;
         }
-        if (!api.drain)
-        {
-          emit_status(ST_OK, "flush drain=unavailable");
-          break;
-        }
-
         /* One packet's audio per call, oldest first, until 0 frames say nothing
          * is left. */
         for (;;)

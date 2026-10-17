@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
-"""Run the Phase 1 acceptance checks and print a pass/fail table.
+"""Drive the real helper, engine and PCM bridge, and print a pass/fail table.
 
-    test_phase1.py <liborender.so> <libpcm_bridge.so>
+    test_real_engine.py <liborender.so> <libpcm_bridge.so>
 
-Every check drives the real helper, the real engine and the real PCM bridge
-with bytes this script makes itself: an OPCM stream header and a synthesised
-tone. Nothing here needs a soundtrack, which is why nothing here is skipped -
-the encoded test streams this used to want are commercial audio that cannot
-live in the tree, so the checks that needed them could never be run by anyone
-who had not been handed the files privately.
+The protocol test (test_protocol.py) runs the helper against a fake engine;
+this runs it against the engine and bridge the box ships, with bytes it
+makes itself: an OPCM stream header and a synthesised tone. Nothing here
+needs a soundtrack, and anyone with the built libraries can run all of it
+but the grid of an HRTF set, which needs a set (OMNI_HRTF) and says so when
+it is skipped.
 
-The PCM bridge rather than the object bridge for the same reason: it accepts
-audio a test can generate, so what is exercised end to end is the helper's
-framing, the engine's construction at a named rate, and the reset boundary the
-host relies on - the parts that are not codec-specific and were never what the
-soundtracks were proving.
+The PCM bridge rather than the object bridge because it accepts audio a test
+can generate. What is exercised end to end is the helper's refusal of bad
+input, its framing, the engine's construction at a named rate, the reset
+boundary the host relies on, and the decoded rate the stream line reports -
+the parts that are not codec-specific - then a config Kodi merged handed over
+as an override, an HRTF set's grid built when it is chosen and read by the
+first stream, and a room prepared when it is chosen, in one pass, and kept
+when it is chosen again.
 
     OMNI_HELPER   the helper binary to run. Not in the tree - it is built by
                   package.mk, or by hand:
@@ -22,14 +25,27 @@ soundtracks were proving.
                          -o omniphony-helper ../sources/omniphony-helper.c -ldl
                   Defaults to ./omniphony-helper.
     OMNI_CONFIG   the engine's config. Defaults to direct.yaml beside this.
+    OMNI_HRTF     a SOFA HRTF set, for the grid built when one is chosen (the
+                  engine repository's renderer/tests/sofa/tester.sofa will do);
+                  without it only the refusal of a file that is none is run.
+                  Chosen as a room, it is refused as the HRTF set it is.
+    OMNI_ROOM     a SOFA room, for the room prepared when one is chosen (the
+                  engine repository's
+                  renderer/tests/sofa/chunked_multispeaker_brir.sofa will do).
     OMNI_RATE     the rate to open the renderer at. Defaults to 48000. The
                   engine builds its head model at this rate, and every rate but
                   48000 resamples it first, so a non-default value here is also
                   a check that the helper survives the slow open.
+    OMNI_TEMPLATE the listener's config.yaml template, whose keys the filled
+                  fixture (config.filled.yaml) must hold exactly. Defaults to
+                  ../../omniphony/config/config.template.yaml.
 """
 import os
+import shutil
+import subprocess
 import struct
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -42,7 +58,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 args = [a for a in sys.argv[1:] if not a.startswith("-")]
 if len(args) < 2 or any(a in ("-h", "--help") for a in sys.argv[1:]):
     print(__doc__.strip())
-    sys.exit(0 if len(sys.argv) > 1 else 2)
+    sys.exit(0 if any(a in ("-h", "--help") for a in sys.argv[1:]) else 2)
 
 LIB, BRIDGE = args[0], args[1]
 EXE = os.environ.get("OMNI_HELPER", "./omniphony-helper")
@@ -295,6 +311,197 @@ lines = stream_lines(h)
 check(bool(lines) and all(t.rfind("bed=") > t.rfind("rate=") for t in lines),
       "rate= comes before bed=, so bed= is still read to end of line",
       lines[-1] if lines else "no stream line")
+
+# ---- 5. a config Kodi merged plays when this engine takes it -------------
+print()
+print("=" * 74)
+print(" 5. a config Kodi merged plays when this engine takes it")
+print("=" * 74)
+
+
+def key_paths(text):
+    """Every key path of a block-style YAML document, list items aside."""
+    paths, stack = set(), []
+    for line in text.splitlines():
+        content = line.strip()
+        if not content or content.startswith("#") or content.startswith("-") \
+                or ":" not in content:
+            continue
+        indent = len(line) - len(line.lstrip())
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        key = content.split(":", 1)[0].strip()
+        paths.add(".".join([k for _, k in stack] + [key]))
+        stack.append((indent, key))
+    return paths
+
+
+def open_override(text):
+    """OPEN with `text` handed over as Kodi hands its merge: the
+    acknowledgement, the reasons that followed it, and whether the file is
+    still as written."""
+    work = tempfile.mkdtemp(prefix="omni-override-")
+    # The filled template names two files, which Kodi makes absolute and the
+    # engine's check finds there.
+    for name in ("Pulse.sofa", "chunked_multispeaker_brir.sofa"):
+        open(os.path.join(work, name), "wb").close()
+        text = text.replace(f'"{name}"', f'"{os.path.join(work, name)}"')
+    path = os.path.join(work, "effective.yaml")
+    with open(path, "w") as f:
+        f.write(text)
+    h = Helper(EXE, env())
+    h.send(OP_OPEN, open_payload(LIB, CONFIG, BRIDGE, rate=RATE) + f"\noverride={path}\n".encode())
+    for _ in range(OPEN_POLLS):
+        h.drain()
+        if any(t.startswith("open ") for _, t in h.status):
+            break
+        time.sleep(OPEN_POLL_S)
+    # The reason follows the acknowledgement.
+    for _ in range(10):
+        time.sleep(OPEN_POLL_S)
+        h.drain()
+    h.send(OP_CLOSE)
+    h.finish()
+    with open(path) as f:
+        unchanged = f.read() == text
+    shutil.rmtree(work)
+    ack = next((t for _, t in h.status if t.startswith("open ")), "no acknowledgement")
+    reasons = [t for _, t in h.status if t.startswith("override_error ")]
+    return ack, reasons, unchanged
+
+
+TEMPLATE = os.environ.get("OMNI_TEMPLATE",
+                          os.path.join(HERE, "..", "..", "omniphony", "config",
+                                       "config.template.yaml"))
+with open(TEMPLATE) as f:
+    template = f.read()
+with open(os.path.join(HERE, "config.filled.yaml")) as f:
+    filled = f.read()
+
+ack, reasons, unchanged = open_override(filled)
+check(ack.endswith(" override=applied") and not reasons and unchanged,
+      "filled in with its documented values, it plays", (reasons or [ack])[0][:60])
+ack, reasons, unchanged = open_override("render:\n  binaural:\n    hrir_sorce: saf\n")
+check(ack.endswith(" override=rejected") and len(reasons) == 1 and "hrir_sorce" in reasons[0]
+      and unchanged, "a key this engine does not know is refused, and why",
+      (reasons or [ack])[0][:60])
+template_keys = key_paths(template)
+filled_keys = {k for k in key_paths(filled) if not k.startswith("render.current_layout.")}
+check(template_keys == filled_keys and len(template_keys) > 30,
+      "the filled fixture holds exactly the template's keys",
+      f"{len(template_keys)} keys; differ: {sorted(template_keys ^ filled_keys)[:6]}")
+
+# ---- 6. an HRTF set's grid is built when it is chosen ----------------------
+print()
+print("=" * 74)
+print(" 6. an HRTF set's grid is built when it is chosen, and a stream reads it")
+print("=" * 74)
+
+work = tempfile.mkdtemp(prefix="omni-grid-")
+# As Kodi names them: one file per stream rate, in kHz.
+grid = os.path.join(work, f"hrtf{RATE // 1000}.grid")
+
+
+def prepare_hrtf(sofa):
+    run = subprocess.run([EXE, "--prepare-hrtf", LIB, sofa, grid, str(RATE), "1"],
+                         capture_output=True, text=True, env=env())
+    return run.returncode, run.stdout.strip()
+
+
+not_sofa = os.path.join(work, "not.sofa")
+with open(not_sofa, "wb") as f:
+    f.write(b"\x89HDF\r\n\x1a\n" + bytes(4096))
+rc, line = prepare_hrtf(not_sofa)
+check(rc == 1 and line.startswith("failed reason=unusable ") and not os.path.exists(grid),
+      "a file that is no HRTF set is refused, nothing kept", line[:60])
+
+# A real set is not something a test can make, so it is the caller's: the
+# engine repository's renderer/tests/sofa/tester.sofa will do.
+HRTF = os.environ.get("OMNI_HRTF")
+if HRTF:
+    sofa = os.path.join(work, "hrtf.sofa")
+    shutil.copyfile(HRTF, sofa)
+    rc, line = prepare_hrtf(sofa)
+    check(rc == 0 and line.startswith("prepared grid=built ") and os.path.exists(grid),
+          "the set's grid is built and kept", line)
+    kept = os.stat(grid).st_ino
+    rc, line = prepare_hrtf(sofa)
+    check(rc == 0 and line.startswith("prepared grid=kept ") and os.stat(grid).st_ino == kept,
+          "chosen again, it is found kept", line)
+
+    config = os.path.join(work, "render.yaml")
+    with open(config, "w") as f:
+        # Equalised, as the grid was built: a cache serves only sessions of
+        # its own setting, and the engine's default is off.
+        f.write(f"render:\n  binaural:\n    output_mode: binaural\n"
+                f"    hrir_source: sofa\n    hrtf_sofa_path: '{sofa}'\n"
+                f"    diffuse_field_eq: true\n"
+                f"    hrtf_grid_cache: {{ path: '{os.path.join(work, 'hrtf{khz}.grid')}', "
+                f"diffuse_field_eq: true }}\n")
+    h = Helper(EXE, dict(env(), RUST_LOG="info"))
+    h.send(OP_OPEN, open_payload(LIB, config, BRIDGE, rate=RATE))
+    h.send(OP_FEED, opcm_header(CHANNELS, RATE))
+    for i in range(OPEN_POLLS):
+        feed_pcm(h, BLOCK, start=i * BLOCK)
+        if any(" hrir=sofa " in t for t in stream_lines(h)):
+            break
+        time.sleep(OPEN_POLL_S)
+    h.send(OP_CLOSE)
+    h.finish()
+    heard = [t for t in stream_lines(h) if " hrir=" in t]
+    # The engine says where the set came from: the grid, not a build.
+    read = f"HRIR grid of '{sofa}' from".encode() in h.err
+    check(any(" hrir=sofa " in t for t in heard) and read and os.stat(grid).st_ino == kept,
+          "the first stream plays the set from that grid, unwritten",
+          (heard[-1][:60] if heard else "no stream line") + ("" if read else "; grid not read"))
+else:
+    print("  (OMNI_HRTF not set: the build and the stream reading it not exercised)")
+shutil.rmtree(work)
+
+# ---- 7. a room is prepared when it is chosen, in one pass ------------------
+print()
+print("=" * 74)
+print(" 7. a room is prepared when it is chosen, and kept when chosen again")
+print("=" * 74)
+
+work = tempfile.mkdtemp(prefix="omni-room-")
+room = os.path.join(work, "room.room")
+
+
+def prepare_room(sofa, out, kept=None):
+    with open(sofa, "rb") as f:
+        data = f.read()
+    # As Kodi builds it: its own arguments, then the size of what stdin holds.
+    run = subprocess.run([EXE, "--prepare-brir", LIB, out] + ([kept] if kept else []) +
+                         [str(len(data))], input=data, capture_output=True, env=env())
+    return run.returncode, run.stdout.decode().strip()
+
+
+not_sofa = os.path.join(work, "not.sofa")
+with open(not_sofa, "wb") as f:
+    f.write(b"\x89HDF\r\n\x1a\n" + bytes(4096))
+rc, line = prepare_room(not_sofa, room)
+check(rc == 1 and line.startswith("failed reason=unusable ") and not os.path.exists(room),
+      "a file that is no SOFA file is refused, nothing kept", line[:60])
+if HRTF:
+    rc, line = prepare_room(HRTF, room)
+    check(rc == 1 and line.startswith("failed reason=notroom hrtf=yes room=no ")
+          and not os.path.exists(room), "an HRTF set is refused as one, nothing kept", line[:60])
+ROOM = os.environ.get("OMNI_ROOM")
+if ROOM:
+    rc, line = prepare_room(ROOM, room)
+    check(rc == 0 and line.startswith("prepared hrtf=no room=yes prepared=no ")
+          and " seconds=" in line and os.path.exists(room),
+          "the room is described and prepared in one pass", line[:60])
+    kept = os.stat(room)
+    following = room + ".next"
+    rc, line = prepare_room(ROOM, following, room)
+    check(rc == 0 and line.startswith("kept hrtf=no room=yes ") and not os.path.exists(following)
+          and os.stat(room).st_mtime_ns == kept.st_mtime_ns,
+          "chosen again, the room kept for it stays, nothing written", line[:60])
+else:
+    print("  (OMNI_ROOM not set: a room prepared and kept not exercised)")
+shutil.rmtree(work)
 
 print()
 print("=" * 74)

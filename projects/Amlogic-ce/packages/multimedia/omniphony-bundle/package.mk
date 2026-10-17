@@ -5,14 +5,14 @@ PKG_NAME="omniphony-bundle"
 # The bundle's own release number, not a source pin. It names the tarball the
 # aarch64 pass writes and the GitHub release the arm pass downloads, so a new
 # bundle takes a new number before it is built - see makeinstall_target.
-PKG_VERSION="3"
-# Empty until a bundle is uploaded: the arm pass then refuses to build rather
-# than download something unchecked. The aarch64 pass writes the value to use
-# beside the tarball.
-PKG_SHA256="8ec3a5de75c971f2a5be985ef16d6f0a4d1b2bd835b163c2171d19679a12484f"
+PKG_VERSION="4"
+# The uploaded bundle's, which the aarch64 pass writes beside the tarball.
+# Emptied when PKG_VERSION moves on, until that bundle is uploaded: the arm
+# pass then refuses to build rather than download something unchecked.
+PKG_SHA256="f8a626a5c7857f518611bfcdc7a74ad7381bc64308352da605ca05e9dd53b001"
 PKG_LICENSE="GPL-3.0-or-later"
 PKG_SITE="https://github.com/v-lix/CoreELEC"
-PKG_LONGDESC="The 64-bit side of Kodi's binaural codec, built once: the Omniphony engine, its two decoder bridges, the helper process and the 64-bit runtime they start with, packed for a 32-bit image."
+PKG_LONGDESC="The 64-bit side of Kodi's binaural codec, built once: the Omniphony engine, its decoder bridges, the helper process and the 64-bit runtime they start with, packed for a 32-bit image."
 PKG_TOOLCHAIN="manual"
 
 # An Amlogic-ng image is 32-bit, but the binaural codec's engine, bridges and
@@ -181,7 +181,8 @@ omni_bundle_assemble() {
   cp -a ${_omni}${PKG_OMNIPHONY_DIR}/liborender.so.0 ${_dir}/
   ln -sf liborender.so.0 ${_dir}/liborender.so
   cp -a ${_omni}${PKG_OMNIPHONY_DIR}/libpcm_bridge.so ${_dir}/
-  cp -a ${_bridge}${PKG_OMNIPHONY_DIR}/libharletty_bridge.so ${_dir}/
+  cp -a ${_bridge}${PKG_OMNIPHONY_DIR}/libharletty_dolby_bridge.so ${_dir}/
+  cp -a ${_bridge}${PKG_OMNIPHONY_DIR}/libharletty_dts_bridge.so ${_dir}/
   cp -a ${_helper}${PKG_OMNIPHONY_DIR}/omniphony-helper ${_dir}/
 
   # The 64-bit runtime. A 64-bit process cannot borrow a 32-bit image's
@@ -206,7 +207,7 @@ omni_bundle_assemble() {
   # directly - the engine and the bridges are dlopened rather than linked, so
   # neither is reached through the helper's own tag. RPATH is chosen because it
   # is inherited down the dependency chain where RUNPATH is not, so it keeps
-  # covering these four if they pick up a new dependency later. The usual
+  # covering these five if they pick up a new dependency later. The usual
   # reason to prefer RUNPATH, that it can be overridden with LD_LIBRARY_PATH,
   # does not apply: nothing on the image sets one for Kodi.
   #
@@ -214,7 +215,8 @@ omni_bundle_assemble() {
   # being added to this list would load on a developer's box and fail on the
   # image, where libgcc_s lives only in the private directory.
   local _obj
-  for _obj in omniphony-helper liborender.so.0 libharletty_bridge.so libpcm_bridge.so; do
+  for _obj in omniphony-helper liborender.so.0 libharletty_dolby_bridge.so \
+              libharletty_dts_bridge.so libpcm_bridge.so; do
     patchelf --force-rpath --set-rpath '$ORIGIN/lib' ${_dir}/${_obj}
   done
 

@@ -1,0 +1,71 @@
+# Test fixture: the shipped override template (../../omniphony/config/
+# config.template.yaml) with every null replaced by its documented starting
+# value. Handed to the engine by test_real_engine.py as Kodi hands its merge,
+# the two file names made absolute beside stand-ins. Keep it in step with the
+# template: the test checks they hold the same keys.
+render:
+  binaural:
+    hrir_source: saf
+    hrtf_sofa_path: "Pulse.sofa"
+    brir_sofa_path: "chunked_multispeaker_brir.sofa"
+    mode: direct
+    sphere_coordinates: true
+    ear_gains: [1.0, 1.0]
+    ear_mutes: [false, false]
+    unit_scale_m: 2.0
+    head_radius_m: 0.0875
+    brir_max_length_s: 2.0
+    brir_tail_floor_db: 60.0
+    air_absorption: true
+    diffuse_field_eq: true
+    hrir_update_lattice: exact
+    reflections:
+      enabled: true
+      room_width_m: 4.0
+      room_depth_m: 5.0
+      room_height_m: 2.7
+      level: 0.5
+      wall_cutoff_hz: 6000.0
+    reverb:
+      enabled: true
+      level: 0.1
+      rt60_s: 0.35
+      predelay_ms: 20.0
+      size: 1.0
+      rt60_low_ratio: 1.0
+      rt60_high_ratio: 1.0
+  master_gain: -12.0
+  auto_gain: false
+  auto_gain_ceiling_db: -1.0
+  use_loudness: false
+  drc_mode: "Off"
+  drc_weight: 1.0
+  decode_thread: true
+  ramp_mode: frame
+  sample_ramp_stride: 8
+  surround_placement: side
+  synthetic_objects_enabled: false
+  object_generator_id: ""
+  phantom_extract_mode: off
+  crossover_type: lr4
+  crossover_fir_transition_ratio: 0.5
+  current_layout:
+    name: "fixture-5"
+    speakers:
+      - { name: "C", coord_mode: "polar", azimuth: 0.0, elevation: 0.0, spatialize: true, delay_ms: 0 }
+      - { name: "FL", coord_mode: "polar", azimuth: -30.0, elevation: 0.0, spatialize: true, delay_ms: 0 }
+      - { name: "FR", coord_mode: "polar", azimuth: 30.0, elevation: 0.0, spatialize: true, delay_ms: 0 }
+      - { name: "SL", coord_mode: "polar", azimuth: -110.0, elevation: 0.0, spatialize: true, delay_ms: 0 }
+      - { name: "SR", coord_mode: "polar", azimuth: 110.0, elevation: 0.0, spatialize: true, delay_ms: 0 }
+      - { name: "LFE", coord_mode: "polar", azimuth: 0.0, elevation: -30.0, spatialize: false, delay_ms: 0 }
+  placement:
+    generic:
+      mode: sphere
+      layout:
+        speakers:
+          - { name: LFE, coord_mode: cartesian, x: 0, y: 1, z: 0, spatialize: false, gain_db: 0.0 }
+          - { name: LFE2, coord_mode: cartesian, x: 0, y: 1, z: 0, spatialize: false, gain_db: 0.0 }
+  render_backend: vbap
+  backend_params: {}
+  generator_params: {}
+  phantom_extract_params: {}

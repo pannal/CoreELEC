@@ -1,0 +1,390 @@
+## Kodi / CoreELEC binaural headphones: advanced override
+##
+## HOW TO EDIT — NOTHING NEEDS TO BE UNCOMMENTED
+##
+## Lines beginning with ## are explanations. Leave them alone.
+## Lines without ## are the actual configuration.
+## Replace null with a value only when you want to override that setting.
+## Leave null to follow Kodi; change a value back to null to restore control.
+## All settings below start as null, so this template changes nothing.
+##
+## Example: to select a measured room, find these two entries below and edit:
+##   hrir_source → brir
+##   brir_sofa_path → "rooms/my-room.room"
+## Leave all other entries as null. Do not append a second render section.
+##
+## Use spaces for indentation, never tabs. Use unquoted true/false and numbers.
+## Quote file paths. Write null without quotes; "null" is a different value.
+## Arrays replace the whole array; never use null as an array element.
+## Write a { } mapping or a [ ] list on one line; anchors (&, *), tags (!)
+## and multi-line values (|, >) are not read.
+##
+## Kodi reads this file each time playback starts and writes it over its own
+## settings into effective.yaml beside it (not a file to edit). This file
+## applies whole or not at all: anything wrong in it - YAML Kodi does not
+## read, a key or value the engine does not know or takes out of range, a
+## file that is not there, or a setting Kodi keeps (below) - and playback
+## uses the GUI settings alone, while Kodi shows a notification with the
+## reason. While it applies, the Player Process Info row
+## Player.Process(omniphony.config) reads "config"; otherwise it is empty.
+## Stop and start playback after editing it. Kodi never rewrites this file.
+##
+## Location: special://profile/omniphony/config.yaml
+## Default CoreELEC profile: /storage/.kodi/userdata/omniphony/config.yaml
+## Relative file paths below start in this file's directory.
+## Use local paths here; choose network/VFS files through Kodi's browser.
+##
+## GUI: Settings > System > Audio, "Binaural rendering for headphones".
+## Its "Binaural response" is Built-in HRTF (HRIR), Custom HRTF (HRIR) or
+## Custom Room (BRIR). Choosing a custom one opens the file browser; the
+## "Custom HRTF file (SOFA)" or "Custom Room file (SOFA)" entry under it then
+## picks a file of the same kind, again or another. Built-in HRTF (HRIR)
+## clears both file choices; switching between the two custom ones clears the
+## other's. What Kodi makes from a chosen file is kept in the cache folder
+## beside this file, cache/ - an HRTF set as <name>.sofa with its grids
+## <name>-<kHz>.grid, a room as <name>.room - the two most recently used of
+## each kind, and stays there when the response changes. These GUI actions
+## do not delete your original SOFA files or edit this file. Values set here
+## take precedence over the GUI's response selection.
+##
+## Kodi keeps, and this file cannot change: the output mode (binaural), the
+## channel policy (spatial), the decoder bridge, the sample rate, input and
+## output, OSC, head tracking (Kodi has no head tracker) and where an HRTF
+## set's prepared grid is kept. Setting one of them refuses the file, with
+## that reason - unless it only repeats Kodi's own choice: output_mode
+## binaural, a channel_render_mode other than host, brir_head_tracking false.
+##
+## VALUE NOTES
+## "Kodi" = the GUI's default, or Kodi's fixed tuning, unless you changed it.
+## "Engine" = native default; Kodi may deliberately choose a different value.
+## These are starting points, not a universally best sound for every listener.
+## null is recommended unless you deliberately want to replace Kodi's choice.
+
+render:
+  ## RESPONSE AND BINAURAL PROCESSING
+  binaural:
+    ## Response: saf = Built-in HRTF (HRIR); sofa = Custom HRTF (HRIR);
+    ## brir = Custom Room (BRIR).
+    ## Kodi/engine starting choice: saf. It works without an external file.
+    ## sofa requires hrtf_sofa_path; brir requires brir_sofa_path.
+    ## BRIR already contains binaural filtering and room acoustics.
+    hrir_source: null
+
+    ## Custom HRIR (HRTF) SOFA file. Example: "my-hrtf.sofa".
+    ## No universal default file; null follows the GUI's Custom HRTF file.
+    ## Used only with hrir_source set to sofa. A path alone does not select it.
+    ## A set chosen in the GUI is prepared once for the stream's rate; one
+    ## named here is prepared again at every playback start (seconds on this
+    ## box), so prefer choosing it in the GUI. A free-field set only: a file
+    ## over 144 MB, a set of more than 2^24 samples, or one with fewer than
+    ## three directions is refused (the built-in plays) - those are rooms,
+    ## which belong in brir_sofa_path.
+    hrtf_sofa_path: null
+
+    ## Custom Room (BRIR) file. Example: "rooms/my-room.room".
+    ## A prepared room or a SOFA file of 64 MB or less. A larger
+    ## multi-orientation SOFA file must be prepared first, so it is not parsed
+    ## at every playback start:
+    ##   /usr/lib/kodi/omniphony/omniphony-helper --prepare-brir \
+    ##     /usr/lib/kodi/omniphony/liborender.so <out.room> <size> < file.sofa
+    ## where <size> is the file's size in bytes - or choose it once in the GUI
+    ## as Custom Room (BRIR) and copy cache/<name>.room out. Keep it out of
+    ## cache/: that is Kodi's, holds only the two rooms used last, and removes
+    ## an older one when a third is chosen, whatever names it here. A room
+    ## named here is not prepared again by Kodi when an engine update no
+    ## longer reads it; one chosen in the GUI is.
+    ## null follows the room prepared from the GUI's Custom Room file.
+    ## Used only with hrir_source set to brir. A path alone does not select it.
+    ## A 22.2 room that measured its two subwoofers (ITU-R BS.2051 System H,
+    ## as the IoSR listening room set) plays the LFE through them.
+    brir_sofa_path: null
+
+    ## HRIR path: direct or cascaded. Engine default: direct.
+    ## Kodi follows "Cascade mode (12 virtual speakers)"; null keeps it.
+    ## cascaded set here renders on Kodi's twelve unless current_layout names
+    ## others; direct set here renders without them.
+    ## A room always uses cascaded, onto the room's measured loudspeakers.
+    mode: null
+
+    ## Read object positions on the listener's sphere rather than in the room
+    ## cube. Kodi: true; engine: false. With it, an object at the room's front
+    ## corner is heard at 30 degrees, where L/R stand, rather than at 45, and
+    ## a top corner 45 degrees up rather than 35 - as Cascade and a room hear
+    ## them. Applies to the direct path only; cascaded and BRIR ignore it.
+    sphere_coordinates: null
+
+    ## Final left/right ear gains as LINEAR amplitudes, not decibels.
+    ## Starting value: [1.0, 1.0], neutral balance; each value must be 0..4.
+    ## Example [0.8, 1.0] attenuates the left ear. Applies to HRIR and BRIR.
+    ear_gains: null
+
+    ## Final left/right mute flags. Starting value: [false, false].
+    ## Both ears remain audible. Useful for diagnostics; applies in both modes.
+    ear_mutes: null
+
+    ## HRIR distance scale, metres per source-coordinate unit. Range: 0.01..100.
+    ## Kodi starting value: 2.0; engine: 1.0. null follows "Speaker distance".
+    ## Changes distance-dependent HRIR cues; it does not resize a measured BRIR.
+    unit_scale_m: null
+
+    ## Effective head radius for the HRIR analytic interaural time-delay model.
+    ## Starting value: 0.0875 metres; range: 0.05..0.15.
+    ## Preserves the established generic model. BRIR retains its measured delays.
+    head_radius_m: null
+
+    ## Maximum retained BRIR duration in seconds, after common lead removal.
+    ## Engine/recommended starting value: 2.0. Range: 0..10.
+    ## This bounds convolution resources.
+    ## 0 removes ONLY the duration cap (a prepared room keeps at most 10 s);
+    ## energy-tail trimming/fading still apply.
+    ## Shorter values can audibly shorten the room. This is not a wet/dry mix.
+    brir_max_length_s: null
+
+    ## BRIR tail threshold: remaining integrated energy below total, in dB.
+    ## Engine/recommended starting value: 60.0; range: 20..120.
+    ## Larger values retain quieter tails; smaller values trim sooner.
+    ## Preserves the engine's resource/decay compromise, with a short end fade.
+    ## The duration cap also applies. This is not output gain or a noise gate.
+    brir_tail_floor_db: null
+
+    ## Added distance-dependent high-frequency loss. Kodi/engine: true.
+    ## Preserves an existing distance cue; current direct HRIR filter bypasses
+    ## distances of 3 metres or less. Independent of "Room simulation".
+    ## Set false for HRIR without this added filter. Full BRIR bypasses it.
+    air_absorption: null
+
+    ## Diffuse-field equalization folded into prepared HRIR kernels.
+    ## Kodi: true; engine: false. Inherit Kodi to preserve its tonal tuning.
+    ## The same EQ is applied to both ears. false is a useful tonal comparison;
+    ## neither setting is universally best for every headphone/HRTF pairing.
+    ## Full BRIR bypasses this processing.
+    diffuse_field_eq: null
+
+    ## HRIR direction-update accuracy: exact, fine, balanced, or coarse.
+    ## Kodi/engine starting value: exact, preserving established fidelity.
+    ## Coarser choices reduce kernel updates; qualify their benefit on hardware.
+    ## This setting is not used by the measured BRIR convolver.
+    hrir_update_lattice: null
+
+    ## SYNTHETIC EARLY REFLECTIONS — HRIR only; full BRIR bypasses this section.
+    reflections:
+      ## Enable six first-order shoebox reflections: true or false.
+      ## Kodi: true unless "Room simulation" is Off. Engine: false.
+      ## null keeps the room cues chosen in Kodi.
+      enabled: null
+
+      ## Minimum room width along x, in metres; range: 1..20.
+      ## Kodi "Medium room"/engine: 4.0 (Small 3.0, Large 6.0).
+      ## The engine can expand the room to contain the distance-scaled scene.
+      room_width_m: null
+
+      ## Minimum front-to-back room extent along y, metres; range: 1..20.
+      ## Kodi "Medium room"/engine: 5.0 (Small 3.5, Large 8.0).
+      ## This is synthetic geometry, not a measurement of your physical room.
+      room_depth_m: null
+
+      ## Minimum vertical extent along z, metres; range: 1..20.
+      ## Kodi "Medium room"/engine: 2.7 (Small 2.4, Large 3.2).
+      ## As with width/depth, the renderer may expand it to contain the scene.
+      room_height_m: null
+
+      ## Per-reflection wall AMPLITUDE coefficient, 0..1.
+      ## Kodi/engine: 0.5, the established moderate wall gain.
+      ## Also scaled by image/direct distance ratios; not a 50% total wet mix.
+      level: null
+
+      ## Reflection wall low-pass cutoff, Hz; range: 1000..20000.
+      ## Kodi/engine: 6000.0, preserving furnished-room treble damping.
+      ## 20000 bypasses wall filtering. Direct sound and air loss are separate.
+      wall_cutoff_hz: null
+
+    ## SYNTHETIC LATE REVERB — HRIR only; full BRIR bypasses this section.
+    reverb:
+      ## Enable the late-reverberation network: true or false.
+      ## Kodi: true only with "Room simulation" on and a "Reverb amount" above
+      ## 0; engine: false. null follows those two. An explicit true enables
+      ## reverb independently of the early reflections.
+      enabled: null
+
+      ## Reverb return AMPLITUDE, 0..1. Kodi: "Reverb amount" / 100, 0.10 at
+      ## its default 10; engine: 0.25. It is not a normalized dry/wet
+      ## percentage: source sends also depend on distance.
+      level: null
+
+      ## Broadband decay time RT60, in seconds; range: 0.1..3.0.
+      ## Kodi/engine: 0.35. A short listening-room reference; the soundtrack
+      ## already contains the artistic reverberation mixed into the programme.
+      rt60_s: null
+
+      ## Delay before late reverb starts, milliseconds; range: 0..100.
+      ## Kodi/engine: 20.0. Separates initial attacks from the late tail.
+      ## This is an acoustic parameter, not an A/V-sync adjustment.
+      predelay_ms: null
+
+      ## Reverb delay-line length scale; range: 0.5..2.0.
+      ## Kodi/engine: 1.0, the nominal network. Smaller is denser/shorter-spaced,
+      ## larger is more widely spaced. RT60 remains a separate decay target.
+      size: null
+
+      ## Low-band decay relative to RT60, below about 250 Hz; range: 0.25..4.0.
+      ## Kodi/engine: 1.0. Unity adds no extra bass-decay bias.
+      ## Above 1 makes bass linger; below 1 shortens its tail.
+      rt60_low_ratio: null
+
+      ## High-band decay relative to RT60, above about 4 kHz; range: 0.25..4.0.
+      ## Kodi/engine: 1.0. Unity preserves the nominal additional ratio;
+      ## the network still has its existing damping. Below 1 shortens treble decay.
+      rt60_high_ratio: null
+
+  ## LEVEL, DECODING, AND OBJECT CONTROLS
+
+  ## Absolute final renderer gain in dB (at most +60).
+  ## Recommended: null: Kodi works it out per stream from "Binaural level" and
+  ## the channel count. A number replaces that; it is NOT an offset to it.
+  master_gain: null
+
+  ## Engine anti-clip reduction with no automatic gain recovery: true or false.
+  ## Kodi/engine: false. Preserves Kodi's separate limiter, which releases after
+  ## transients; avoids permanently quietening the rest of a film after a peak.
+  auto_gain: null
+
+  ## Engine auto-gain target, dBFS; range: -12..0. Engine: -1.0.
+  ## Leaves modest headroom. Inactive while auto_gain is false.
+  auto_gain_ceiling_db: null
+
+  ## Apply the dialogue level (dialnorm) a stream carries: true or false.
+  ## Engine/Kodi: false. Only Dolby TrueHD and E-AC-3 carry one; DTS and the
+  ## formats Kodi decodes itself do not. Enabling it lowers those streams by
+  ## their dialnorm, on top of "Binaural level".
+  use_loudness: null
+
+  ## Dynamic-range compression: "Off", "standard/line" or "heavy/RF".
+  ## Engine/Kodi: "Off", preserving the authored dynamic range. Only Dolby
+  ## TrueHD and E-AC-3 carry the compression it applies; DTS and the formats
+  ## Kodi decodes itself have none.
+  drc_mode: null
+
+  ## Weight on the stream's compression gain, 0..1. Engine: 1.0.
+  ## 1 applies the chosen mode fully; 0 bypasses it. Inactive with "Off".
+  drc_weight: null
+
+  ## Decode on a separate engine thread: true or false.
+  ## Recommended: null, keeping Kodi's per-codec choice: on for TrueHD and
+  ## E-AC-3, off otherwise. Engine default alone: false.
+  ## An explicit value replaces Kodi's choice for every codec.
+  decode_thread: null
+
+  ## Object movement/gain ramp mode: off, frame, interp, or sample.
+  ## Engine: frame. Preserve the default until alternate interpolation is tested.
+  ramp_mode: null
+
+  ## Samples between gain lookups in sample ramp mode; range: 1..32. Engine: 8.
+  ## An established cost/fidelity compromise; inactive with frame mode.
+  sample_ramp_stride: null
+
+  ## Position the 4.x/5.x surround pair at side or back. Engine: side.
+  ## Preserves the existing placement; 7.x with dedicated back channels ignores it.
+  surround_placement: null
+
+  ## Permit synthesized objects/upmix stages: true or false. Engine: false.
+  ## False preserves decoded source content without inventing height/object audio.
+  ## BRIR itself does not require this. Selecting a measured array is not upmixing.
+  synthetic_objects_enabled: null
+
+  ## Height generator: copy_up, pad or dirac. Engine: "" (none); "none" also
+  ## disables it. Keep it off unless deliberately upmixing channel-based
+  ## material. Also requires synthetic_objects_enabled.
+  object_generator_id: null
+
+  ## Phantom-source extraction: off, broadband, or spectral. Engine: off.
+  ## Off preserves the source mix. Also requires synthetic_objects_enabled.
+  phantom_extract_mode: null
+
+  ## VIRTUAL ARRAY AND CROSSOVERS
+
+  ## Crossover filter: lr4 or fir. Engine: lr4, with minimal algorithmic delay.
+  ## Applies only when the actual virtual array contains crossover bands.
+  ## A measured BRIR array normally has none; its measured responses are retained.
+  crossover_type: null
+
+  ## FIR transition width relative to lowest cutoff; range: 0.05..2.0.
+  ## Engine: 0.5. Smaller widths require more taps, latency, and ringing.
+  ## Inactive for lr4 or an array without crossovers.
+  crossover_fir_transition_ratio: null
+
+  ## Optional embedded virtual-speaker layout for mode cascaded (the
+  ## speaker-layout schema: name, radius_m, speakers), in place of Kodi's
+  ## twelve. Refused with Custom Room (BRIR), which always renders on the
+  ## room's measured loudspeakers. Recommended: null, keeping Kodi's
+  ## cascade-12 layout and avoiding guessed speaker poses.
+  current_layout: null
+
+  ## Per-family fixed-channel placement; other families inherit generic entries.
+  placement:
+    generic:
+      ## sphere, room, or manual. Headphone default when omitted: sphere.
+      ## Recommended: null, preserving native family inheritance and "LFE boost".
+      mode: null
+      layout:
+        ## Optional complete speaker-entry array. Recommended: null.
+        ## Replaces this ENTIRE array; it does not edit one existing row by name.
+        ## Kodi supplies LFE and LFE2 rows with spatialize=false and gain_db
+        ## set from "LFE boost".
+        ## Use the speaker-layout schema; preserve both rows and their direct
+        ## routing if changing trim. gain_db is dB, unlike binaural ear_gains.
+        speakers: null
+
+  ## PANNING BACKENDS AND GENERATOR PARAMETERS
+  ## Optional advanced controls, not extra synthetic-room settings. No
+  ## plugins are installed on CoreELEC: only the engine's built-in backends
+  ## and generators exist. Their parameter mappings are checked for type only.
+
+  ## Panning backend: vbap, volumetric, barycenter or hybrid. Engine: vbap.
+  ## Recommended: null, preserving the existing tuning. volumetric is vbap
+  ## that also weighs how far inside the loudspeakers an object sits, moving
+  ## that share towards a central spread, so an object crossing the room
+  ## moves through it rather than jumping across; its parameters go under
+  ## volumetric in backend_params. Applies where objects are panned onto
+  ## loudspeakers - cascaded, and a room's measured ones - not the direct
+  ## path, which places each object itself. Does not replace the HRIR/BRIR
+  ## selector.
+  render_backend: null
+
+  ## Mapping of backend ID to that backend's parameter mapping.
+  ## Recommended: null, keeping each plugin's declared defaults.
+  backend_params: null
+
+  ## Mapping of generator ID to that generator's parameter mapping.
+  ## Recommended: null. Relevant only to the selected object_generator_id.
+  generator_params: null
+
+  ## Parameter mapping for the selected phantom-extraction stage.
+  ## Recommended: null. Inactive when that stage or synthesized objects is off.
+  phantom_extract_params: null
+
+## QUICK RECIPES — EDIT THE ENTRIES ABOVE
+##
+## HRIR without added synthetic environmental processing:
+##   Set reflections.enabled, reverb.enabled, and air_absorption to false.
+##   Keep an HRIR source. Recorded soundtrack ambience remains in the audio.
+##   "Room simulation" Off alone disables the first two, not air_absorption.
+##
+## BRIR:
+##   Set hrir_source to brir and brir_sofa_path to your room file.
+##   No separate HRIR or added synthetic room is needed. Output/ear gain and
+##   "LFE boost" still apply. HRIR distance/room/EQ controls are inactive
+##   while the room renders.
+##
+## MORE PARAMETERS
+##   Other rendering keys of the engine's render section (panning,
+##   evaluation, spread and distance models) are accepted too; see the
+##   engine's configuration reference. dialogue_gain_db does nothing here (no
+##   stream Kodi plays through this renderer tags dialogue) and is refused.
+##
+## FAILURE BEHAVIOR
+##   Anything wrong refuses the whole file for that playback, and Kodi says
+##   why; the GUI settings play.
+##   A room that cannot be loaded renders on the embedded KEMAR set instead,
+##   and Player Process Info says so: its response row
+##   (Player.Process(omniphony.sofa)) reads Custom BRIR only once the room
+##   renders, Built-in HRIR until then.

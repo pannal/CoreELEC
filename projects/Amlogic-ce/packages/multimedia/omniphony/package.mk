@@ -2,8 +2,8 @@
 # Copyright (C) 2026-present Team CoreELEC (https://coreelec.org)
 
 PKG_NAME="omniphony"
-PKG_VERSION="fbf31ec96ab09778c9c535e11d311cc48aaf8e4f"
-PKG_SHA256="37d315dfe99c8354201ae45285fafa3f6b9e0b594e58205f8aac9e784c52777a"
+PKG_VERSION="f440560af967ea16d69cdbdf54d9b26f9b88b8cd"
+PKG_SHA256="4d1d9f04b2eb90dadaeaeec273f022ffceece26df6f76987234277e89ab2f92f"
 PKG_LICENSE="GPL-3.0-or-later"
 PKG_SITE="https://github.com/mgth/Omniphony"
 # The fork rather than PKG_SITE. It follows the current upstream interfaces and
@@ -12,8 +12,12 @@ PKG_SITE="https://github.com/mgth/Omniphony"
 #   - pcm_bridge presents host-decoded PCM as a channel bed, so the codec can
 #     render anything ffmpeg decodes rather than only the formats the object
 #     decoder handles. It supplies the original codec's source family to the
-#     placement policy: DTS and Auro use Sphere; Dolby, PCM and generic sources
-#     retain their upstream defaults.
+#     placement policy, and declares the Dolby and DTS families in its
+#     catalogue, since the renderer takes every family but generic and pcm
+#     from the bridge: both in the room, as the Harletty bridge declares
+#     them. That default is the speakers' one; on headphones, the only output
+#     Kodi uses, the renderer now places every family on the sphere unless a
+#     mode is set, and Kodi sets none.
 #   - orender_decoded_sample_rate reports the rate the bridge actually decoded
 #     at: a host must name a rate before it has seen a packet,
 #     and for DTS-HD MA the one it can name is the core's 48 kHz while an XLL
@@ -23,22 +27,52 @@ PKG_SITE="https://github.com/mgth/Omniphony"
 #     what the decode thread has not returned yet, then what the decoder is
 #     still holding, one packet's audio per call. The helper calls it from
 #     FLUSH until it returns nothing and sends the audio before acknowledging
-#     end of stream. The Harletty pin implements the paired bridge_api 0.4
-#     method.
+#     end of stream. The Harletty pin implements the paired bridge_api
+#     method, which is why both build against the fork's bridge_api 0.7, one
+#     minor past upstream's 0.6: a bridge loads only in a host of its own
+#     minor.
 #   - orender_hrir_in_use names the HRIR set the binaural path is convolving
 #     with. The helper passes it on as hrir= and the codec shows it as the head
-#     model, so a SOFA file the engine could not load reads Built-in.
+#     model, so a SOFA file the engine could not load reads Built-in; brir
+#     once a measured room renders.
+#   - Measured rooms. orender_brir_prepare reduces a room-response SOFA file
+#     to the head orientation a session renders, once, when the room is
+#     chosen (the helper's --prepare-brir), reading only that orientation's
+#     responses through sofar's lazy reader (mgth/sofar, the git dependency
+#     upstream pins, which cargo fetches with the rest); a session is built
+#     on the room's own loudspeakers, a prepared room's or a SOFA file's,
+#     ahead of any layout the host names. orender_brir_state says where the
+#     room stands, which the helper passes on as brir= beside the renderer's
+#     latency=, and orender_render_path how the session renders, as render=.
+#     orender_sofa_describe says what a chosen file holds and which stage
+#     takes it, reading only its shape and geometry (the helper's
+#     --describe), so Kodi can tell the listener before copying anything. A
+#     prepared room carries the identity of the bytes it was made from, so a
+#     file chosen again whose room Kodi still keeps is not prepared again.
+#   - orender_check_config checks a config strictly - unknown keys and
+#     values, numbers out of range, files that are not there - where
+#     orender_create would read it leniently. Kodi merges the listener's
+#     config.yaml over the config the codec writes and hands the result to
+#     the helper (OPEN's override=), which plays it only when the check
+#     takes it, and the codec's own config otherwise.
+#   - render.binaural.hrtf_grid_cache keeps the finished HRIR grids of a SOFA
+#     set in files the host names, one per stream rate: the codec names
+#     hrtf{khz}.grid beside the staged HRTF set, with diffuse-field
+#     equalisation, so a custom HRTF plays from the start rather than after
+#     seconds of the embedded set. Kodi has the 48 kHz one built when the set
+#     is chosen (the helper's --prepare-hrtf); another rate's is built by its
+#     first stream. Another engine build rebuilds them.
 #
 # ABI 8 supplies the upstream height-tier labels, ABI 9 the NUL-terminated
 # orender_source_label query, ABI 10 the decode thread (orender_set_option's
 # `decode_thread`, which the helper turns on for TrueHD and E-AC-3) and
 # orender_drain, ABI 11 the thread's live option and
 # orender_output_packet_pts, ABI 12 upstream's heard_us, which this tree's
-# helper does not use, and this fork's decoded-rate, decoder-drain and HRIR
-# additions are ABI 13. Every optional symbol is probed with dlsym;
-# major-version mismatch is still fatal. The build produces both orender_ffi
-# and pcm_bridge from this same pin so the C ABI and Rust bridge_api stay
-# paired.
+# helper does not use, and this fork's decoded-rate, decoder-drain, HRIR,
+# room and config-check additions are ABI 13. Every optional symbol is probed
+# with dlsym; major-version mismatch is still fatal. The build produces both
+# orender_ffi and pcm_bridge from this same pin so the C ABI and Rust
+# bridge_api stay paired.
 PKG_URL="https://github.com/v-lix/Omniphony/archive/${PKG_VERSION}.tar.gz"
 # GitHub commit tarballs extract to <repo>-<githash>/, which scripts/unpack
 # cannot auto-detect against ${PKG_NAME}-${PKG_VERSION}.
@@ -71,10 +105,11 @@ fi
 # repo (the standalone player, the studio GUIs) is not built here.
 PKG_OMNIPHONY_MANIFEST="omniphony-renderer/Cargo.toml"
 
-# CDVDAudioCodecOmniphony names five files, all under special://xbmcbin/omniphony/:
-# the helper, the engine, the two bridges - libharletty_bridge.so for the
-# bitstream formats that carry objects or heights, libpcm_bridge.so for
-# everything ffmpeg decodes - and cascade-12.yaml. On this image
+# CDVDAudioCodecOmniphony names six files, all under special://xbmcbin/omniphony/:
+# the helper, the engine, the bridges - libharletty_dolby_bridge.so and
+# libharletty_dts_bridge.so for the bitstream formats that carry objects or
+# heights, libpcm_bridge.so for everything ffmpeg decodes - and
+# cascade-12.yaml. On this image
 # special://xbmcbin resolves to the directory kodi.bin was started from, which
 # is /usr/lib/kodi, so the payload sits one level below it.
 PKG_OMNIPHONY_DIR="/usr/lib/kodi/omniphony"
@@ -103,6 +138,14 @@ makeinstall_target() {
   # than placed - a cascaded render costs one convolution per spatialized
   # speaker, so the LFE deliberately carries spatialize: false.
   cp ${PKG_DIR}/config/cascade-12.yaml ${INSTALL}${PKG_OMNIPHONY_DIR}/
+
+  # The listener's config.yaml template, which nothing reads where it is
+  # installed: it is for copying to special://profile/omniphony/config.yaml
+  # and editing. Kodi merges such a file over the config the codec writes,
+  # and every entry starts as null, so the copy alone changes nothing. Its
+  # keys follow the engine's: the helper's real-engine test has the engine
+  # check it filled in, and that it holds the template's keys.
+  cp ${PKG_DIR}/config/config.template.yaml ${INSTALL}${PKG_OMNIPHONY_DIR}/
 
   # The engine's own 5.1 and 7.1 room-model layouts, which it looks for by name
   # in a fixed list of directories, the last of them /usr/share/orender/layouts.

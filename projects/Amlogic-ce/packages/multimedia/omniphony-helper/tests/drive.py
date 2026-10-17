@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Phase 1 acceptance harness for omniphony-helper.
+"""A client of omniphony-helper's framed protocol, for its tests.
 
-Speaks the helper's framed protocol so the checks in test_phase1.py can drive
-the real helper, engine and PCM bridge with bytes they make themselves - no
-soundtrack required, and so nothing here depends on files that cannot be
-shipped.
+Speaks the protocol so test_real_engine.py can drive the real helper, engine
+and PCM bridge, and test_protocol.py the helper against a fake engine, with
+bytes they make themselves - no soundtrack required, so nothing here depends
+on files that cannot be shipped.
 
 This is a test tool, not shipped code.
 """
@@ -64,6 +64,7 @@ class Helper:
         # next command - so the position of the RESET status frame in this list
         # is the exact boundary between the old timeline and the new one.
         self.events = []     # ("audio", frames, pts) | ("status", code, text)
+        self.err = b""       # what the helper and the engine logged, after finish()
 
     def send(self, op, payload=b""):
         try:
@@ -135,6 +136,7 @@ class Helper:
         except subprocess.TimeoutExpired:
             self.p.kill()
             out, err = self.p.communicate()
+        self.err = err or b""
         if out:
             self.buf += out
             self._parse()
