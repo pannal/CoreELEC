@@ -1,0 +1,111 @@
+From: pannal <1359593+pannal@users.noreply.github.com>
+Subject: [PATCH] shutdown: Add opt-in reboot test-build diagnostics
+
+Default-off diagnostic integration for the shared meson_wdt.reboot_trace boot
+option. Record shutdown boundaries and passive legacy watchdog samples without
+feeding, disarming or changing timeout policy. Keep the token out of ordinary
+boot defaults. Capture persistence must be qualified on the actual reset path.
+
+--- a/src/shutdown/shutdown.c
++++ b/src/shutdown/shutdown.c
+@@ -5,6 +5,7 @@
+ 
+ #include <errno.h>
+ #include <getopt.h>
++#include <fcntl.h>
+ #include <linux/reboot.h>
+ #include <stdbool.h>
+ #include <stdlib.h>
+@@ -38,6 +39,7 @@
+ #include "log.h"
+ #include "parse-util.h"
+ #include "process-util.h"
++#include "proc-cmdline.h"
+ #include "reboot-util.h"
+ #include "rlimit-util.h"
+ #include "signal-util.h"
+@@ -55,6 +57,25 @@
+ static char* arg_verb;
+ static uint8_t arg_exit_code;
+ static usec_t arg_timeout = DEFAULT_TIMEOUT_USEC;
++
++/* Diagnostic patch for the verified AM6B+ legacy binding. Never opens /dev/watchdog. */
++static bool arg_reboot_trace;
++static char *reboot_trace_boot;
++
++static void reboot_trace(const char *stage) {
++        _cleanup_free_ char *sample = NULL;
++        _cleanup_close_ int fd = -EBADF;
++        int r;
++
++        if (!arg_reboot_trace)
++                return;
++        r = read_one_line_file("/sys/bus/platform/drivers/meson_wdt/ffd0f0d0.watchdog/reboot_watchdog", &sample);
++        fd = open("/dev/kmsg", O_WRONLY|O_NOCTTY|O_CLOEXEC);
++        if (fd < 0)
++                return;
++        (void) dprintf(fd, "<0>reboot-watchdog v1 boot=%s stage=%s %s error=%d\n",
++                      strna(reboot_trace_boot), stage, strna(sample), r);
++}
+ 
+ static int parse_argv(int argc, char *argv[]) {
+         enum {
+@@ -409,7 +430,11 @@
+                    LOG_TARGET_KMSG))
+                 bump_sysctl_printk_log_level(LOG_WARNING);
+ 
++        (void) proc_cmdline_get_bool("meson_wdt.reboot_trace", 0, &arg_reboot_trace);
++        if (arg_reboot_trace)
++                (void) read_one_line_file("/proc/sys/kernel/random/boot_id", &reboot_trace_boot);
+         init_watchdog();
++        reboot_trace("shutdown-watchdog-ready");
+ 
+         /* Lock us into memory */
+         (void) mlockall(MCL_CURRENT|MCL_FUTURE);
+@@ -423,8 +448,11 @@
+          * slow IO is processed here already and the final process killing spree is not impacted by processes
+          * desperately trying to sync IO to disk within their timeout. Do not remove this sync, data corruption will
+          * result. */
+-        if (!in_container)
++        if (!in_container) {
++                reboot_trace("initial-sync-entry");
+                 sync_with_progress();
++                reboot_trace("initial-sync-return");
++        }
+ 
+         disable_coredumps();
+         disable_binfmt();
+@@ -547,9 +575,11 @@
+ 
+         /* We're done with the watchdog. Note that the watchdog is explicitly not stopped here. It remains
+          * active to guard against any issues during the rest of the shutdown sequence. */
++        reboot_trace("final-cleanup-entry");
+         if (IN_SET(cmd, RB_AUTOBOOT, LINUX_REBOOT_CMD_KEXEC))
+                 watchdog_close(/* disarm= */ false);
+         watchdog_free_device();
++        reboot_trace("final-cleanup-return");
+ 
+         arguments[0] = NULL; /* Filled in by execute_directories(), when needed */
+         arguments[1] = arg_verb;
+@@ -588,8 +618,11 @@
+          * containers. Note that we sync'ed things already once above, but we did some more work since then
+          * which might have caused IO, hence let's do it once more. Do not remove this sync, data corruption
+          * will result. */
+-        if (!in_container)
++        if (!in_container) {
++                reboot_trace("final-sync-entry");
+                 sync_with_progress();
++                reboot_trace("final-sync-return");
++        }
+ 
+         if (streq(arg_verb, "exit")) {
+                 if (in_container) {
+@@ -599,6 +632,8 @@
+ 
+                 cmd = RB_POWER_OFF; /* We cannot exit() on the host, fallback on another method. */
+         }
++
++        reboot_trace("reboot-dispatch");
+ 
+         switch (cmd) {
+ 

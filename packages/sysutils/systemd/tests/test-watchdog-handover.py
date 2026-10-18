@@ -2,13 +2,13 @@
 """Host actual-body regression; never opens a watchdog or contacts a device.
 
 Usage: test-watchdog-handover.py --systemd-tree UNPACKED_255_4 --kernel-tree KERNEL
-Apply the adjacent package patch to a temporary systemd source tree automatically.
+Use the final package-prepared source, including the diagnostic patch.
+prepare-reboot-inputs.py checks the complete actual package application separately.
 MMIO, watchdog framework and OS boundaries are simulated, not device verification.
 """
 import argparse
 import pathlib
 import re
-import shutil
 import subprocess
 import tempfile
 
@@ -68,6 +68,8 @@ struct aml_wdt_dev {
 };
 struct watchdog_device { struct aml_wdt_dev *data; unsigned int timeout; };
 struct platform_device { struct watchdog_device *data; };
+/* Default-off trace boundaries; active readers/callers are exercised separately. */
+static void aml_wdt_reboot_trace(const char *stage) { (void) stage; }
 static struct aml_wdt_dev wdev;
 static struct watchdog_device wdog;
 static struct platform_device pdev;
@@ -88,6 +90,7 @@ static struct aml_wdt_dev *watchdog_get_drvdata(struct watchdog_device *p) { ret
 static struct watchdog_device *platform_get_drvdata(struct platform_device *p) { return p->data; }
 '''
 USER = r'''
+static void reboot_trace(const char *stage) { (void) stage; }
 typedef uint64_t usec_t;
 #define USEC_INFINITY UINT64_MAX
 #define IN_SET(v,a,b) ((v)==(a)||(v)==(b))
@@ -252,7 +255,6 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--systemd-tree',type=pathlib.Path,required=True)
     parser.add_argument('--kernel-tree',type=pathlib.Path,required=True)
-    parser.add_argument('--patch',type=pathlib.Path,default=pathlib.Path(__file__).resolve().parents[1]/'patches/systemd-0600-preserve-shutdown-watchdog.patch')
     parser.add_argument('--cc',default='cc')
     args=parser.parse_args()
     tree=args.systemd_tree
@@ -269,11 +271,11 @@ def main():
     old_shutdown=shutdown.replace(fixed_cleanup,'')
     with tempfile.TemporaryDirectory(prefix='watchdog-handover-') as tmp:
         temp=pathlib.Path(tmp)
-        path=temp/'src/shutdown/shutdown.c'; path.parent.mkdir(parents=True)
-        path.write_text(old_shutdown)
-        subprocess.run(['patch','--batch','--fuzz=0','-p1','-i',str(args.patch.resolve())],cwd=temp,check=True,capture_output=True)
-        new_shutdown=path.read_text()
+        # Synthetic old/one-sided fixtures remove only the production correction.
+        # The paired fixture is the exact final input, including diagnostic callers.
+        new_shutdown=shutdown
         assert new_shutdown.count(fixed_cleanup)==1
+        assert 'static void reboot_trace(' in new_shutdown, 'Use final package-prepared source'
         for label,sd,k,expected in [
             ('old',old_shutdown,old_kernel,{'reboot-cleanup','kexec-cleanup','paired-handover','stopped-reboot','repeated-cleanup'}),
             ('userspace-only',new_shutdown,old_kernel,{'stopped-reboot'}),
