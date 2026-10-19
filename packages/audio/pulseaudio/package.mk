@@ -94,6 +94,16 @@ post_makeinstall_target() {
 
   cp ${PKG_DIR}/config/system.pa ${INSTALL}/etc/pulse/
 
+  # Kodi plays video, whose audio is almost always 48 kHz, and the A2DP modules
+  # negotiate the Bluetooth link at the lowest rate the headset supports that is
+  # at least this default - so 44.1 kHz here made every film resample on the way
+  # to Bluetooth headphones. 44.1 kHz music keeps an alternate rate on ALSA.
+  sed -e 's/^; default-sample-rate = 44100$/default-sample-rate = 48000/' \
+      -e 's/^; alternate-sample-rate = 48000$/alternate-sample-rate = 44100/' \
+      -i ${INSTALL}/etc/pulse/daemon.conf
+  grep -q '^default-sample-rate = 48000$' ${INSTALL}/etc/pulse/daemon.conf ||
+    die "pulseaudio: could not set default-sample-rate in daemon.conf"
+
   sed 's/user="pulse"/user="root"/' -i ${INSTALL}/usr/share/dbus-1/system.d/pulseaudio-system.conf
 
   mkdir -p ${INSTALL}/usr/config

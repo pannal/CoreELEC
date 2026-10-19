@@ -187,6 +187,8 @@ configure_target() {
               --enable-encoder=ac3 \
               --enable-encoder=eac3 \
               --enable-encoder=aac \
+              --enable-encoder=aptx \
+              --enable-encoder=aptx_hd \
               --enable-encoder=wmav2 \
               --enable-encoder=mjpeg \
               --enable-encoder=png \

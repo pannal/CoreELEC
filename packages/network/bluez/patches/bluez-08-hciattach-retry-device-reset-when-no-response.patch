@@ -12,7 +12,6 @@ Signed-off-by: meijjaa <jjmeijer88@gmail.com>
  1 file changed, 13 insertions(+), 2 deletions(-)
 
 diff --git a/tools/hciattach_bcm43xx.c b/tools/hciattach_bcm43xx.c
-index bb24483..ad89161 100644
 --- a/tools/hciattach_bcm43xx.c
 +++ b/tools/hciattach_bcm43xx.c
 @@ -23,6 +23,7 @@
@@ -21,9 +20,9 @@ index bb24483..ad89161 100644
  #include <limits.h>
 +#include <signal.h>
 
- #include "lib/bluetooth.h"
- #include "lib/hci.h"
-@@ -81,21 +82,31 @@ fail:
+ #include "bluetooth/bluetooth.h"
+ #include "bluetooth/hci.h"
+@@ -81,21 +82,31 @@
  	return -1;
  }
 
@@ -57,5 +56,3 @@ index bb24483..ad89161 100644
  	if (resp[4] != cmd[1] || resp[5] != cmd[2] || resp[6] != CMD_SUCCESS) {
  		fprintf(stderr, "Failed to reset chip, command failure\n");
  		return -1;
---
-2.38.1
