@@ -275,7 +275,10 @@ render:
   decode_thread: null
 
   ## Object movement/gain ramp mode: off, frame, interp, or sample.
-  ## Engine: frame. Preserve the default until alternate interpolation is tested.
+  ## Engine: sample; Kodi leaves it to the engine. Recommended: null. sample
+  ## follows the stream's movement per sample; interp and frame interpolate
+  ## across each decoded block for less CPU; off jumps. Applies where objects
+  ## are panned onto loudspeakers, not the direct path.
   ramp_mode: null
 
   ## Samples between gain lookups in sample ramp mode; range: 1..32. Engine: 8.
@@ -339,8 +342,8 @@ render:
   ## plugins are installed on CoreELEC: only the engine's built-in backends
   ## and generators exist. Their parameter mappings are checked for type only.
 
-  ## Panning backend: vbap, volumetric, barycenter or hybrid. Engine: vbap.
-  ## Recommended: null, preserving the existing tuning. volumetric is vbap
+  ## Panning backend: vbap, volumetric, barycenter or hybrid. Kodi:
+  ## volumetric; engine: vbap. Recommended: null, keeping Kodi's. volumetric is vbap
   ## that also weighs how far inside the loudspeakers an object sits, moving
   ## that share towards a central spread, so an object crossing the room
   ## moves through it rather than jumping across; its parameters go under
