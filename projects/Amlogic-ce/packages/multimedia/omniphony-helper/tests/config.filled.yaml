@@ -41,7 +41,7 @@ render:
   drc_mode: "Off"
   drc_weight: 1.0
   decode_thread: true
-  ramp_mode: frame
+  ramp_mode: sample
   sample_ramp_stride: 8
   surround_placement: side
   synthetic_objects_enabled: false
