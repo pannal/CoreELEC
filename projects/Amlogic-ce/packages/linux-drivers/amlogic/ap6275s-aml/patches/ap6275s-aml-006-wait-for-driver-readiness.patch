@@ -1,0 +1,47 @@
+Subject: [PATCH] wifi: Wait for SDIO initialization before the first open
+
+Restore the bounded readiness wait removed after .8. Poll only until
+initialization finishes, preserving the three-second timeout and the
+separate firmware power-up retry budget. Use a kernel-time deadline so
+sleep rounding does not accumulate across polls. Keep readiness publication
+after the existing registration and deferred power-off sequence.
+
+--- a/bcmdhd.100.10.545.x/dhd_linux.c
++++ b/bcmdhd.100.10.545.x/dhd_linux.c
+@@ -6988,6 +6988,7 @@
+ 	int bytes_written = 0;
+ #endif
+ 	int retry = POWERUP_MAX_RETRY;
++	unsigned long init_deadline;
+ 
+ 	mutex_lock(&dhd->pub.ndev_op_sync);
+ 
+@@ -6999,10 +7000,15 @@
+ 	}
+ 
+ 	if (!dhd_download_fw_on_driverload) {
+-		if (!dhd_driver_init_done) {
+-			DHD_ERROR(("%s: WLAN driver is not initialized\n", __FUNCTION__));
+-			mutex_unlock(&dhd->pub.ndev_op_sync);
+-			return -1;
++		/* Registration and deferred power-off must finish before opening. */
++		init_deadline = jiffies + msecs_to_jiffies(3000);
++		while (!READ_ONCE(dhd_driver_init_done)) {
++			if (time_after_eq(jiffies, init_deadline)) {
++				DHD_ERROR(("%s: WLAN driver is not initialized\n", __FUNCTION__));
++				mutex_unlock(&dhd->pub.ndev_op_sync);
++				return -1;
++			}
++			OSL_SLEEP(20);
+ 		}
+ 	}
+ 
+@@ -12761,7 +12767,7 @@
+ 		DHD_ERROR(("%s: Failed to load driver max retry reached**\n", __FUNCTION__));
+ 	} else {
+ 		if (!dhd_download_fw_on_driverload) {
+-			dhd_driver_init_done = TRUE;
++			WRITE_ONCE(dhd_driver_init_done, TRUE);
+ 		}
+ 	}
+ 
