@@ -11,8 +11,14 @@ ENV{SDIO_ID}=="02D0:A804", GOTO="p3i_dhd_sdio"
 ENV{SDIO_ID}=="02D0:AAE8", GOTO="p3i_dhd_sdio"
 ENV{SDIO_ID}=="02D0:AAE7", GOTO="p3i_dhd_sdio"
 ENV{SDIO_ID}=="02D0:4362", GOTO="p3i_dhd_sdio"
-ENV{SDIO_ID}=="02D0:4354", GOTO="p3i_dhd_sdio"
-ENV{SDIO_ID}=="02D0:A9BF", GOTO="p3i_dhd_sdio"
+ENV{SDIO_ID}=="02D0:4354", GOTO="p3i_dhd_legacy"
+ENV{SDIO_ID}=="02D0:A9BF", GOTO="p3i_dhd_legacy"
+GOTO="p3i_dhd_end"
+
+# Keep these two IDs on legacy until the newer driver is device-tested.
+LABEL="p3i_dhd_legacy"
+ENV{MODALIAS}="dhd"
+RUN{builtin}+="kmod load dhd"
 GOTO="p3i_dhd_end"
 
 LABEL="p3i_dhd_sdio"

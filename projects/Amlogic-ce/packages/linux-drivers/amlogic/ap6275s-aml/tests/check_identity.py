@@ -144,6 +144,9 @@ def dispatch(source, rules):
     identifiers = {int(re.search(r'^#define\s+' + name + r'\s+(0x[0-9a-fA-F]+)',
                                 header, re.M)[1], 16) for name in names}
     assert len(identifiers) == 10
+    # Retain legacy autoload for these IDs until hardware acceptance.
+    legacy = {0x4354, 0xa9bf}
+    assert legacy <= identifiers
     cases = 0
     for identifier in sorted(identifiers | {0x4334, 0x4329, 0xffff}):
         alias = f'sdio:c00v02D0d{identifier:04X}'
@@ -152,19 +155,27 @@ def dispatch(source, rules):
                      'MODALIAS': alias, 'SDIO_ID': f'02D0:{identifier:04X}'}
             observed, requests = evaluate_rules(text, event)
             if action == 'add' and identifier in identifiers:
-                assert observed['MODALIAS'] == 'dhd_sdio', observed
-                assert requests == ['kmod load dhd_sdio'], requests
+                module = 'dhd' if identifier in legacy else 'dhd_sdio'
+                assert observed['MODALIAS'] == module, observed
+                assert requests == ['kmod load ' + module], requests
                 # Stock 80-drivers.rules also reads the final MODALIAS property.
-                assert set([observed['MODALIAS'], *[r.split()[-1] for r in requests]]) == {'dhd_sdio'}
+                assert set([observed['MODALIAS'], *[r.split()[-1] for r in requests]]) == {module}
             else:
                 assert observed == event, (observed, event)
                 assert requests == [], requests
             cases += 1
-    for event in ({'ACTION': 'add', 'SUBSYSTEM': 'usb', 'MODALIAS': 'usb:example', 'SDIO_ID': '02D0:AAE8'},
-                  {'ACTION': 'add', 'SUBSYSTEM': 'sdio', 'SDIO_ID': '02D0:AAE8'},
-                  {'ACTION': 'add', 'SUBSYSTEM': 'sdio', 'MODALIAS': 'other', 'SDIO_ID': '1234:AAE8'}):
-        assert evaluate_rules(text, event) == (event, [])
-        cases += 1
+    for identifier in (0xaae8, *sorted(legacy)):
+        for event in (
+                {'ACTION': 'add', 'SUBSYSTEM': 'usb', 'MODALIAS': 'usb:example',
+                 'SDIO_ID': f'02D0:{identifier:04X}'},
+                {'ACTION': 'add', 'SUBSYSTEM': 'sdio',
+                 'SDIO_ID': f'02D0:{identifier:04X}'},
+                {'ACTION': 'add', 'SUBSYSTEM': 'sdio', 'MODALIAS': '',
+                 'SDIO_ID': f'02D0:{identifier:04X}'},
+                {'ACTION': 'add', 'SUBSYSTEM': 'sdio', 'MODALIAS': 'other',
+                 'SDIO_ID': f'1234:{identifier:04X}'}):
+            assert evaluate_rules(text, event) == (event, [])
+            cases += 1
     print(f'udev dispatch model: {cases} cases pass')
 
 
