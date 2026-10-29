@@ -14,6 +14,12 @@ PKG_LONGDESC="Broadcom AP6275S SDIO WLAN driver 100.10.545.16 for Amlogic-ng"
 PKG_IS_KERNEL_PKG="yes"
 PKG_TOOLCHAIN="manual"
 
+post_unpack() {
+  # Keep the bus component distinct from the dhd_sdio composite module.
+  mv ${PKG_BUILD}/bcmdhd.100.10.545.x/dhd_sdio.c \
+    ${PKG_BUILD}/bcmdhd.100.10.545.x/dhd_sdio_bus.c
+}
+
 pre_make_target() {
   unset LDFLAGS
 }
@@ -30,6 +36,6 @@ make_target() {
 
 makeinstall_target() {
   mkdir -p ${INSTALL}/$(get_full_module_dir)/${PKG_NAME}
-  cp ${PKG_BUILD}/bcmdhd.100.10.545.x/dhd.ko \
-    ${INSTALL}/$(get_full_module_dir)/${PKG_NAME}/dhd_sdio.ko
+  cp ${PKG_BUILD}/bcmdhd.100.10.545.x/dhd_sdio.ko \
+    ${INSTALL}/$(get_full_module_dir)/${PKG_NAME}/
 }
