@@ -1,0 +1,72 @@
+Subject: [PATCH] wifi: Add a reboot-applied throughput profile override
+
+Keep the addon preference separate from board firmware configuration.
+Apply explicit values only on BCM43752 rev 2 and expose the effective
+profile for capability detection without assuming the loaded module name.
+
+--- a/bcmdhd.100.10.545.x/dhd_linux.c
++++ b/bcmdhd.100.10.545.x/dhd_linux.c
+@@ -568,6 +568,15 @@
+ #else
+ uint dhd_console_ms = 0;
+ #endif /* DHD_DEBUG */
++
++#ifdef DHD_TPUT_PATCH
++int p3i_tput_profile = -1;
++module_param(p3i_tput_profile, int, 0444);
++MODULE_PARM_DESC(p3i_tput_profile, "BCM43752 rev 2 throughput profile: -1=config, 0=off, 1=on");
++int p3i_tput_active = -1;
++module_param(p3i_tput_active, int, 0444);
++MODULE_PARM_DESC(p3i_tput_active, "Effective throughput profile: -1=unsupported, 0=off, 1=on");
++#endif
+ 
+ uint dhd_slpauto = TRUE;
+ module_param(dhd_slpauto, uint, 0);
+--- a/bcmdhd.100.10.545.x/dhd_config.h
++++ b/bcmdhd.100.10.545.x/dhd_config.h
+@@ -30,6 +30,10 @@
+ #define TXGLOM_RECV_OFFSET 8
+ extern uint dhd_doflow;
+ extern uint dhd_slpauto;
++#ifdef DHD_TPUT_PATCH
++extern int p3i_tput_profile;
++extern int p3i_tput_active;
++#endif
+ #endif
+ 
+ typedef struct wl_mac_range {
+--- a/bcmdhd.100.10.545.x/dhd_config.c
++++ b/bcmdhd.100.10.545.x/dhd_config.c
+@@ -1010,6 +1010,24 @@
+ }
+ #endif /* DHD_TPUT_PATCH */
+ 
++#ifdef DHD_TPUT_PATCH
++static void
++dhd_conf_set_p3i_tput_profile(dhd_pub_t *dhd)
++{
++	struct dhd_conf *conf = dhd->conf;
++
++	p3i_tput_active = -1;
++	if (conf->chip != BCM43752_CHIP_ID || conf->chiprev != 2)
++		return;
++
++	if (p3i_tput_profile >= 0) {
++		conf->tput_patch = p3i_tput_profile != 0;
++		dhd_conf_set_tput_patch(dhd);
++	}
++	p3i_tput_active = conf->tput_patch ? 1 : 0;
++}
++#endif
++
+ void
+ dhd_conf_set_path_params(dhd_pub_t *dhd, char *fw_path, char *nv_path)
+ {
+@@ -1030,6 +1048,7 @@
+ 
+ 	dhd_conf_read_config(dhd, dhd->conf_path);
+ #ifdef DHD_TPUT_PATCH
++	dhd_conf_set_p3i_tput_profile(dhd);
+ 	dhd_conf_dump_tput_patch(dhd);
+ #endif
+ 

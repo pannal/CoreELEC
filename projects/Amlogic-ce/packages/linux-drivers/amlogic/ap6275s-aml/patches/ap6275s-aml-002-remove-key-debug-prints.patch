@@ -1,0 +1,36 @@
+Subject: [PATCH] wifi: Remove key material from rekey and roaming diagnostics
+
+--- a/bcmdhd.100.10.545.x/wl_cfg80211.c
++++ b/bcmdhd.100.10.545.x/wl_cfg80211.c
+@@ -20878,7 +20878,6 @@
+ 		bzero(key, FBT_KEYLEN);
+ 		WL_ERR(("wl_cfg80211_get_fbt_key: Failed to copy KCK and KEK \n"));
+ 	}
+-	prhex("KCK, KEK", (uchar *)key, FBT_KEYLEN);
+ end:
+ 	return bytes_written;
+ }
+@@ -21806,9 +21805,6 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	prhex("kck", (const u8 *) (data->kck), RSN_KCK_LENGTH);
+-	prhex("kek", (const u8 *) (data->kek), RSN_KEK_LENGTH);
+-	prhex("replay_ctr", (const u8 *) (data->replay_ctr), RSN_REPLAY_LEN);
+ 	bcopy(data->kck, keyinfo.KCK, RSN_KCK_LENGTH);
+ 	bcopy(data->kek, keyinfo.KEK, RSN_KEK_LENGTH);
+ 	bcopy(data->replay_ctr, keyinfo.ReplayCounter, RSN_REPLAY_LEN);
+--- a/bcmdhd.100.10.545.x/wl_android_ext.c
++++ b/bcmdhd.100.10.545.x/wl_android_ext.c
+@@ -6310,11 +6310,6 @@
+ 	if (data) {
+ 		memset(&keyinfo, 0, sizeof(keyinfo));
+ 		memcpy(&keyinfo, data, RSN_KCK_LENGTH+RSN_KEK_LENGTH+RSN_REPLAY_LEN);
+-		if (android_msg_level & ANDROID_INFO_LEVEL) {
+-			prhex("kck", (uchar *)keyinfo.KCK, RSN_KCK_LENGTH);
+-			prhex("kek", (uchar *)keyinfo.KEK, RSN_KEK_LENGTH);
+-			prhex("replay_ctr", (uchar *)keyinfo.ReplayCounter, RSN_REPLAY_LEN);
+-		}
+ 
+ 		memset(&bcol_keyinfo, 0, sizeof(bcol_keyinfo));
+ 		bcol_keyinfo.enable = 1;

@@ -1,0 +1,17 @@
+Subject: [PATCH] wifi: Remove always-true country revision pointer checks
+
+--- a/bcmdhd.100.10.545.x/wl_android.c
++++ b/bcmdhd.100.10.545.x/wl_android.c
+@@ -5748,10 +5748,8 @@
+ 			revinfo = 0;
+ 		} else
+ #endif /* DHD_BLOB_EXISTENCE_CHECK */
+-		if ((rev_info_delim) &&
+-			(strnicmp(rev_info_delim, CMD_COUNTRY_DELIMITER,
+-			strlen(CMD_COUNTRY_DELIMITER)) == 0) &&
+-			(rev_info_delim + 1)) {
++		if (strnicmp(rev_info_delim, CMD_COUNTRY_DELIMITER,
++			strlen(CMD_COUNTRY_DELIMITER)) == 0) {
+ 			revinfo  = bcm_atoi(rev_info_delim + 1);
+ 		}
+ #ifdef WL_CFG80211

@@ -1,0 +1,71 @@
+Subject: [PATCH] wifi: Preserve CE device matching and selected defaults
+
+--- a/bcmdhd.100.10.545.x/bcmsdh_sdmmc_linux.c
++++ b/bcmdhd.100.10.545.x/bcmsdh_sdmmc_linux.c
+@@ -192,7 +192,7 @@
+ 
+ /* devices we support, null terminated */
+ static const struct sdio_device_id bcmsdh_sdmmc_ids[] = {
+-	{ SDIO_DEVICE(SDIO_VENDOR_ID_BROADCOM, SDIO_DEVICE_ID_BROADCOM_DEFAULT) },
++	{ SDIO_DEVICE(SDIO_VENDOR_ID_BROADCOM, BCM4354_CHIP_ID) },
+ 	{ SDIO_DEVICE(SDIO_VENDOR_ID_BROADCOM, BCM4362_CHIP_ID) },
+ 	{ SDIO_DEVICE(SDIO_VENDOR_ID_BROADCOM, BCM43751_CHIP_ID) },
+ 	{ SDIO_DEVICE(SDIO_VENDOR_ID_BROADCOM, BCM43752_CHIP_ID) },
+@@ -201,10 +201,8 @@
+ 	{ SDIO_DEVICE(SDIO_VENDOR_ID_BROADCOM, BCM43014_D11N_ID) },
+ 	{ SDIO_DEVICE(SDIO_VENDOR_ID_BROADCOM, BCM43014_D11N2G_ID) },
+ 	{ SDIO_DEVICE(SDIO_VENDOR_ID_BROADCOM, BCM43014_D11N5G_ID) },
+-	/* { SDIO_DEVICE(SDIO_VENDOR_ID_BROADCOM, SDIO_ANY_ID) }, */
+-	{ SDIO_DEVICE_CLASS(SDIO_CLASS_NONE)		},
+-	 /* end: all zeroes */
+-	{ 0, 0, 0, 0},
++	{ SDIO_DEVICE(SDIO_VENDOR_ID_BROADCOM, BCM43455_D11AC_V2_ID) },
++	{ 0, 0, 0, 0 },
+ };
+ 
+ MODULE_DEVICE_TABLE(sdio, bcmsdh_sdmmc_ids);
+--- a/bcmdhd.100.10.545.x/Makefile
++++ b/bcmdhd.100.10.545.x/Makefile
+@@ -250,6 +250,9 @@
+ 	DHDCFLAGS += -DDHD_USE_STATIC_MEMDUMP
+ endif
+ 
++# Static interfaces are unsupported by the existing CE integration.
++DHDCFLAGS := $(filter-out -DWL_STATIC_IF,$(DHDCFLAGS))
++
+ EXTRA_CFLAGS = $(DHDCFLAGS)
+ ifeq ($(CONFIG_BCMDHD),m)
+ EXTRA_LDFLAGS += --strip-debug
+--- a/bcmdhd.100.10.545.x/dhd_config.c
++++ b/bcmdhd.100.10.545.x/dhd_config.c
+@@ -4318,7 +4318,7 @@
+ 	}
+ #ifdef DHD_TPUT_PATCH
+ 	if (conf->chip == BCM43752_CHIP_ID || conf->chip == BCM4375_CHIP_ID) {
+-		conf->tput_patch = TRUE;
++		/* Keep throughput tuning opt-in on the first CE 4.9 port. */
+ 		dhd_conf_set_tput_patch(dhd);
+ 	}
+ #endif
+@@ -4348,9 +4348,8 @@
+ 	init_waitqueue_head(&conf->event_complete);
+ 
+ #if defined(BCMSDIO) && defined(CUSTOMER_HW_AMLOGIC)
+-	if (conf->chip != BCM43752_CHIP_ID) {
+-		dhd_slpauto = FALSE;
+-	}
++	/* Preserve CE's existing SDIO sleep policy before config overrides. */
++	dhd_slpauto = FALSE;
+ 	conf->txglom_mode = SDPCM_TXGLOM_CPY;
+ #endif
+ 
+--- a/bcmdhd.100.10.545.x/include/bcmdevs.h
++++ b/bcmdhd.100.10.545.x/include/bcmdevs.h
+@@ -189,6 +189,7 @@
+ #define BCM43455_D11AC_ID	0x43e3		/* 43455 802.11ac dualband device */
+ #define BCM43455_D11AC2G_ID	0x43e4		/* 43455 802.11ac 2.4G device */
+ #define BCM43455_D11AC5G_ID	0x43e5		/* 43455 802.11ac 5G device */
++#define BCM43455_D11AC_V2_ID  0xa9bf		/* AMPAK AP6255 */
+ #define BCM4335_D11AC_ID	0x43ae
+ #define BCM4335_D11AC2G_ID	0x43af
+ #define BCM4335_D11AC5G_ID	0x43b0
