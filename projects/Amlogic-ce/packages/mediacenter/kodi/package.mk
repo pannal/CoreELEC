@@ -10,6 +10,7 @@ PKG_SITE="http://www.kodi.tv"
 # Using local xbmc checkout for development
 PKG_URL="file://${ROOT}/sources/kodi/xbmc-local"
 PKG_SOURCE_NAME="xbmc-local"
+PKG_TAR_COPY_OPTS="--exclude=.git"
 # omniphony brings the spatial audio engine, the decoder bridges and the helper
 # process that runs them, installed beside kodi.bin under /usr/lib/kodi/omniphony.
 # CDVDAudioCodecOmniphony looks for them there and leaves audio to the ordinary
@@ -379,6 +380,7 @@ post_makeinstall_target() {
 
   if [ "${PROJECT}" = "Amlogic-ce" ]; then
     cp ${PKG_DIR}/scripts/aml-wait-for-dispcap.sh ${INSTALL}/usr/lib/kodi
+    cp ${PKG_DIR}/scripts/aml-display-wake.sh ${INSTALL}/usr/lib/kodi
   fi
 
     # Configure safe mode triggers - default 5 restarts within 900 seconds/15 minutes
