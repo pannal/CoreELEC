@@ -1,0 +1,692 @@
+From 1d6630bd1ba05ef08b2e5ad75aac6c32cd321e79 Mon Sep 17 00:00:00 2001
+From: primez <mpincoski@gmail.com>
+Date: Sat, 31 Oct 2026 03:44:59 -0600
+Subject: [PATCH] [TSReader] Return the frame of a seek first, and find HEVC
+ and MPEG-2 key frames
+
+The session aligns the other streams to the PTS of the sample after a
+video seek. With video and audio, the demuxer can emit audio after the
+PES of the key frame before the key frame, so the session aligned to
+the audio time. The reader now keeps the samples of other streams that
+come before the frame of the seek, and returns them after that frame.
+With video, a landing on a segment start waits for the first video
+frame. While a live seek waits for the next segment, the reader reports
+the PTS of the frame of the seek.
+
+The HEVC and MPEG-2 parsers did not mark key frames, so a seek in these
+streams went to the segment start. IRAP pictures and I pictures are now
+key frames.
+
+The HEVC parser read the last NAL unit of the stream before the end of
+the data when a PES without data followed, and then skipped the end
+completion. The end of the data now completes the frame.
+
+A PES header can start in one segment and end in the next segment. The
+PTS of the header now belongs to the segment where the PES starts.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ inputstream.adaptive/changelog.txt   |   4 +
+ lib/mpegts/mpegts/ES_MPEGVideo.cpp   |   4 +
+ lib/mpegts/mpegts/ES_MPEGVideo.h     |   1 +
+ lib/mpegts/mpegts/ES_hevc.cpp        |   9 +-
+ lib/mpegts/mpegts/ES_hevc.h          |   1 +
+ lib/mpegts/mpegts/elementaryStream.h |   1 +
+ src/demuxers/TSReader.cpp            |  29 ++-
+ src/demuxers/TSReader.h              |   7 +
+ src/samplereader/TSSampleReader.cpp  |  21 +++
+ src/samplereader/TSSampleReader.h    |  36 +++-
+ src/test/TestTSReader.cpp            | 259 ++++++++++++++++++++++++---
+ 11 files changed, 333 insertions(+), 39 deletions(-)
+
+diff --git a/inputstream.adaptive/changelog.txt b/inputstream.adaptive/changelog.txt
+index 821c3bf..57c5b43 100644
+--- a/inputstream.adaptive/changelog.txt
++++ b/inputstream.adaptive/changelog.txt
+@@ -8,6 +8,10 @@ v21.5.25-p3i.4 (2026-10-31)
+ - Fix a seek in a TS audio stream that continued at the first frame of the PES instead of at the frame of the seek time
+ - Fix a seek in a TS stream with video and audio that continued at the key frame before the key frame of the seek time
+ - Fix a seek to an earlier time inside the current segment, which continued at the start of the segment instead of at the frame of the seek time
++- Fix a seek in a TS stream with video and audio that returned an audio frame first, so the other streams aligned to the audio time instead of the video frame of the seek
++- Fix a seek in an HEVC or MPEG-2 TS stream, which continued at the segment start instead of at the key frame of the seek time
++- Fix the end of an HEVC TS stream after a PES without data, which did not play the last frame
++- Fix the timing offset of a TS segment whose first PES header starts in the segment before
+ 
+ v21.5.25-p3i.3 (2026-10-30)
+ - Fix a seek in a live HLS stream that ended the audio when the next audio segment was not available yet
+diff --git a/lib/mpegts/mpegts/ES_MPEGVideo.cpp b/lib/mpegts/mpegts/ES_MPEGVideo.cpp
+index fb4c98c..3beff59 100644
+--- a/lib/mpegts/mpegts/ES_MPEGVideo.cpp
++++ b/lib/mpegts/mpegts/ES_MPEGVideo.cpp
+@@ -115,11 +115,13 @@ void ES_MPEG2Video::Parse(STREAM_PKT *pkt)
+       pkt->pts          = m_PTS;
+       pkt->duration     = m_FrameDuration;
+       pkt->streamChange = streamChange;
++      pkt->recoveryPoint = m_recoveryPoint;
+     }
+     m_StartCode = 0xffffffff;
+     es_parsed = es_consumed;
+     es_found_frame = false;
+     es_frame_valid = true;
++    m_recoveryPoint = false;
+   }
+ }
+ 
+@@ -129,6 +131,7 @@ void ES_MPEG2Video::Reset()
+   m_StartCode = 0xffffffff;
+   m_NeedIFrame = true;
+   m_NeedSPS = true;
++  m_recoveryPoint = false;
+ }
+ 
+ int ES_MPEG2Video::Parse_MPEG2Video(uint32_t startcode, int buf_ptr, bool &complete)
+@@ -271,6 +274,7 @@ bool ES_MPEG2Video::Parse_MPEG2Video_PicStart(uint8_t *buf)
+   if (pct < PKT_I_FRAME || pct > PKT_B_FRAME)
+     return true; /* Illegal picture_coding_type */
+ 
++  m_recoveryPoint = pct == PKT_I_FRAME;
+   if (pct == PKT_I_FRAME)
+     m_NeedIFrame = false;
+ 
+diff --git a/lib/mpegts/mpegts/ES_MPEGVideo.h b/lib/mpegts/mpegts/ES_MPEGVideo.h
+index dea4524..70f0f69 100644
+--- a/lib/mpegts/mpegts/ES_MPEGVideo.h
++++ b/lib/mpegts/mpegts/ES_MPEGVideo.h
+@@ -19,6 +19,7 @@ namespace TSDemux
+     uint32_t        m_StartCode;
+     bool            m_NeedIFrame;
+     bool            m_NeedSPS;
++    bool            m_recoveryPoint;  ///< The frame is an I picture
+     int             m_FrameDuration;
+     int             m_vbvDelay;       /* -1 if CBR */
+     int             m_vbvSize;        /* Video buffer size (in bytes) */
+diff --git a/lib/mpegts/mpegts/ES_hevc.cpp b/lib/mpegts/mpegts/ES_hevc.cpp
+index 1710304..4b3e211 100644
+--- a/lib/mpegts/mpegts/ES_hevc.cpp
++++ b/lib/mpegts/mpegts/ES_hevc.cpp
+@@ -35,7 +35,9 @@ ES_hevc::~ES_hevc()
+ 
+ void ES_hevc::Parse(STREAM_PKT* pkt)
+ {
+-  if (es_parsed + 10 > es_len) // 2*startcode + header + trail bits
++  // 2*startcode + header + trail bits. At the end of the data, the last NAL
++  // unit can be read up to the end of the buffer already.
++  if (es_parsed + 10 > es_len && !es_end_of_data)
+     return;
+ 
+   size_t frame_ptr = es_consumed;
+@@ -106,12 +108,14 @@ void ES_hevc::Parse(STREAM_PKT* pkt)
+       pkt->pts      = m_PTS;
+       pkt->duration = duration;
+       pkt->streamChange = streamChange;
++      pkt->recoveryPoint = m_recoveryPoint;
+     }
+     m_StartCode = 0xffffffff;
+     m_LastStartPos = -1;
+     es_parsed = es_consumed;
+     es_found_frame = false;
+     es_frame_valid = true;
++    m_recoveryPoint = false;
+   }
+ }
+ 
+@@ -123,6 +127,7 @@ void ES_hevc::Reset()
+   m_NeedVPS = true;
+   m_NeedSPS = true;
+   m_NeedPPS = true;
++  m_recoveryPoint = false;
+   memset(&m_streamData, 0, sizeof(m_streamData));
+ }
+ 
+@@ -162,6 +167,8 @@ void ES_hevc::Parse_HEVC(int buf_ptr, unsigned int NumBytesInNalUnit, bool &comp
+ 
+     if (!es_found_frame)
+     {
++      // A BLA, IDR or CRA picture starts a decode
++      m_recoveryPoint = hdr.nal_unit_type >= NAL_BLA_W_LP;
+       if (buf_ptr - 3 >= (int)es_pts_pointer)
+       {
+         m_DTS = c_dts;
+diff --git a/lib/mpegts/mpegts/ES_hevc.h b/lib/mpegts/mpegts/ES_hevc.h
+index 30e338d..82fe1f3 100644
+--- a/lib/mpegts/mpegts/ES_hevc.h
++++ b/lib/mpegts/mpegts/ES_hevc.h
+@@ -80,6 +80,7 @@ namespace TSDemux
+     bool            m_NeedVPS;
+     bool            m_NeedSPS;
+     bool            m_NeedPPS;
++    bool            m_recoveryPoint;  ///< The frame is an IRAP picture
+     int             m_Width;
+     int             m_Height;
+     int             m_FpsScale;
+diff --git a/lib/mpegts/mpegts/elementaryStream.h b/lib/mpegts/mpegts/elementaryStream.h
+index fee0d44..c770a3d 100644
+--- a/lib/mpegts/mpegts/elementaryStream.h
++++ b/lib/mpegts/mpegts/elementaryStream.h
+@@ -113,6 +113,7 @@ namespace TSDemux
+     };
+     void StartPes(uint64_t position, uint32_t segment); ///< The next appended data starts a PES
+     const PesStart* GetPesStart(const unsigned char* data) const; ///< The PES where packet data starts
++    uint32_t GetPesSegment() const { return es_pes_start_segment; } ///< Media segment of the last PES start
+ 
+   protected:
+     void ResetStreamPacket(STREAM_PKT* pkt);
+diff --git a/src/demuxers/TSReader.cpp b/src/demuxers/TSReader.cpp
+index d612b2d..3445f7e 100644
+--- a/src/demuxers/TSReader.cpp
++++ b/src/demuxers/TSReader.cpp
+@@ -214,9 +214,17 @@ bool TSReader::GetInformation(kodi::addon::InputstreamInfo& info)
+ // We assume that m_startpos is the current I-Frame position
+ bool TSReader::SeekTime(uint64_t timeInTs, bool preceeding)
+ {
+-  const bool hasVideo{HasVideo()};
++  // With video, the read after a seek to a segment start starts with the
++  // first video frame
++  std::optional<SeekFrame> startFrame;
++  for (const auto& tsInfo : m_streamInfos)
++  {
++    if (tsInfo.m_enabled && tsInfo.m_streamType == INPUTSTREAM_TYPE_VIDEO)
++      startFrame = SeekFrame{tsInfo.m_stream->pid, 0};
++  }
++  const bool hasVideo{startFrame.has_value()};
+   uint64_t lastRecovery(static_cast<uint64_t>(m_startPos));
+-  std::optional<SeekFrame> seekFrame; // The frame at lastRecovery or later
++  std::optional<SeekFrame> seekFrame{startFrame}; // The frame at lastRecovery or later
+   // The stream cannot seek back into a segment after a read of the next
+   // segment. So the scan reads the frames left in the buffers at the end of a
+   // segment, before the next segment.
+@@ -236,7 +244,7 @@ bool TSReader::SeekTime(uint64_t timeInTs, bool preceeding)
+       // The seek time is after the frames of this segment
+       nextSegment = true;
+       lastRecovery = m_AVContext->GetPosition();
+-      seekFrame.reset();
++      seekFrame = startFrame;
+       continue;
+     }
+     nextSegment = false;
+@@ -445,13 +453,16 @@ bool TSReader::IsBeforeSeekFrame()
+ 
+ void TSReader::UpdateSegmentPts(TSDemux::ElementaryStream* stream)
+ {
+-  // The PES header is in the segment of the last read. A seek inside the
+-  // segment reads the PES headers again. The read of the stream information
+-  // reads the first segment before the streams are enabled.
+-  auto& segmentPts{m_segments.back().pts};
+-  if (std::none_of(segmentPts.begin(), segmentPts.end(),
++  // The PES belongs to the segment where the PES starts, the header can end
++  // in the next segment. A seek inside the segment reads the PES headers
++  // again. The read of the stream information reads the first segment before
++  // the streams are enabled.
++  const auto segment{std::find_if(m_segments.begin(), m_segments.end(), [stream](const Segment& s)
++                                  { return s.number == stream->GetPesSegment(); })};
++  if (segment != m_segments.end() &&
++      std::none_of(segment->pts.begin(), segment->pts.end(),
+                    [stream](const auto& pts) { return pts.first == stream->pid; }))
+-    segmentPts.emplace_back(stream->pid, stream->c_pts);
++    segment->pts.emplace_back(stream->pid, stream->c_pts);
+ }
+ 
+ bool TSReader::HandleProgramChange()
+diff --git a/src/demuxers/TSReader.h b/src/demuxers/TSReader.h
+index 72dc632..8a9f511 100644
+--- a/src/demuxers/TSReader.h
++++ b/src/demuxers/TSReader.h
+@@ -72,6 +72,13 @@ public:
+    *        other streams start at the same position.
+    */
+   bool IsBeforeSeekFrame();
++  /*!
++   * \brief The PTS of the frame that the last seek found, until the frame is read
++   */
++  std::optional<uint64_t> GetSeekFramePts() const
++  {
++    return m_seekFrame ? std::optional<uint64_t>{m_seekFrame->pts} : std::nullopt;
++  }
+ 
+   uint64_t GetDts() const { return m_pkt.dts == PTS_UNSET ? PTS_UNSET : m_pkt.dts; }
+   uint64_t GetPts() const { return m_pkt.pts == PTS_UNSET ? PTS_UNSET : m_pkt.pts; }
+diff --git a/src/samplereader/TSSampleReader.cpp b/src/samplereader/TSSampleReader.cpp
+index 3f6902c..321bf4e 100644
+--- a/src/samplereader/TSSampleReader.cpp
++++ b/src/samplereader/TSSampleReader.cpp
+@@ -67,6 +67,17 @@ AP4_Result CTSSampleReader::Start(bool& bStarted)
+ 
+ AP4_Result CTSSampleReader::ReadSample()
+ {
++  m_sample.reset();
++  if (!m_samples.empty() && !GetSeekFramePts())
++  {
++    m_sample = std::move(m_samples.front());
++    m_samples.pop_front();
++    m_dts = m_sample->dts;
++    m_pts = m_sample->pts;
++    m_ptsDiff = m_sample->ptsDiff;
++    return AP4_SUCCESS;
++  }
++
+   if (m_seekTime)
+   {
+     // The seek continues from the start of the next segment
+@@ -87,6 +98,12 @@ AP4_Result CTSSampleReader::ReadSample()
+ 
+     if (const std::optional<SegmentStart> start{GetSegmentStart()})
+       m_ptsDiff = (start->pts * 100) / 9 - start->offset;
++    if (GetSeekFramePts())
++    {
++      m_samples.push_back({GetStreamId(), m_dts, m_pts, TSReader::GetDuration(), m_ptsDiff,
++                           {GetPacketData(), GetPacketData() + GetPacketSize()}});
++      continue;
++    }
+     return AP4_SUCCESS;
+   }
+   return EndOfData();
+@@ -99,6 +116,8 @@ AP4_Result CTSSampleReader::EndOfData()
+     // The session aligns the other streams to the PTS of a video seek
+     if (m_seekTime)
+       m_pts = *m_seekTime;
++    else if (const std::optional<uint64_t> pts{GetSeekFramePts()})
++      m_pts = (*pts * 100) / 9;
+   }
+   else
+   {
+@@ -125,6 +144,8 @@ void CTSSampleReader::Reset(bool bEOS)
+   TSReader::Reset();
+   m_eos = bEOS;
+   m_seekTime.reset();
++  m_samples.clear();
++  m_sample.reset();
+ }
+ 
+ bool CTSSampleReader::TimeSeek(uint64_t pts, bool preceeding)
+diff --git a/src/samplereader/TSSampleReader.h b/src/samplereader/TSSampleReader.h
+index ece7484..752a5d9 100644
+--- a/src/samplereader/TSSampleReader.h
++++ b/src/samplereader/TSSampleReader.h
+@@ -9,7 +9,9 @@
+ #include "SampleReader.h"
+ #include "demuxers/TSReader.h"
+ 
++#include <deque>
+ #include <optional>
++#include <vector>
+ 
+ // forwards
+ class CAdaptiveByteStream;
+@@ -41,10 +43,22 @@ public:
+   void SetPTSOffset(uint64_t offset) override;
+   int64_t GetPTSDiff() const override { return m_ptsDiff; }
+   uint32_t GetTimeScale() const override { return 90000; }
+-  AP4_UI32 GetStreamId() const override { return m_typeMap[GetStreamType()]; }
+-  AP4_Size GetSampleDataSize() const override { return GetPacketSize(); }
+-  const AP4_Byte* GetSampleData() const override { return GetPacketData(); }
+-  uint64_t GetDuration() const override { return (TSReader::GetDuration() * 100) / 9; }
++  AP4_UI32 GetStreamId() const override
++  {
++    return m_sample ? m_sample->streamId : m_typeMap[GetStreamType()];
++  }
++  AP4_Size GetSampleDataSize() const override
++  {
++    return m_sample ? static_cast<AP4_Size>(m_sample->data.size()) : GetPacketSize();
++  }
++  const AP4_Byte* GetSampleData() const override
++  {
++    return m_sample ? m_sample->data.data() : GetPacketData();
++  }
++  uint64_t GetDuration() const override
++  {
++    return ((m_sample ? m_sample->duration : TSReader::GetDuration()) * 100) / 9;
++  }
+   bool IsEncrypted() const override { return false; }
+ 
+ protected:
+@@ -63,5 +77,19 @@ private:
+   bool m_started{false};
+   std::optional<uint64_t> m_seekTime; // A seek that waits for a live segment
+   bool m_seekPreceeding{false};
++  struct Sample
++  {
++    AP4_UI32 streamId;
++    uint64_t dts;
++    uint64_t pts;
++    uint64_t duration;
++    int64_t ptsDiff;
++    std::vector<AP4_Byte> data;
++  };
++  // The session aligns the other streams to the PTS of the frame of a seek,
++  // so that frame comes first. The samples of other streams read before the
++  // frame follow the frame.
++  std::deque<Sample> m_samples;
++  std::optional<Sample> m_sample; // The current sample, from m_samples
+   CAdaptiveByteStream* m_adByteStream;
+ };
+diff --git a/src/test/TestTSReader.cpp b/src/test/TestTSReader.cpp
+index 02c752c..2be2a8f 100644
+--- a/src/test/TestTSReader.cpp
++++ b/src/test/TestTSReader.cpp
+@@ -200,9 +200,10 @@ public:
+       WriteVideoFrame(frame, frame % keyInterval ? m_codec.frame : m_codec.keyFrame);
+   }
+ 
+-  void WriteVideoFrame(int frame, const std::vector<uint8_t>& accessUnit)
++  // firstPacket is the PES size in the first TS packet
++  void WriteVideoFrame(int frame, const std::vector<uint8_t>& accessUnit, size_t firstPacket = 184)
+   {
+-    WritePes(VIDEO_PID, 0xE0, VideoPts(frame), accessUnit, false);
++    WritePes(VIDEO_PID, 0xE0, VideoPts(frame), accessUnit, false, firstPacket);
+   }
+ 
+   // A frame can span two PES packets, the second without a PTS
+@@ -254,7 +255,8 @@ private:
+                 uint8_t streamId,
+                 std::optional<uint64_t> pts,
+                 const std::vector<uint8_t>& payload,
+-                bool pesLength)
++                bool pesLength,
++                size_t firstPacket = 184)
+   {
+     const size_t length{pesLength ? (pts ? 8 : 3) + payload.size() : 0};
+     std::vector<uint8_t> pes{0x00,
+@@ -273,8 +275,8 @@ private:
+                              static_cast<uint8_t>(*pts >> 7),
+                              static_cast<uint8_t>(((*pts << 1) & 0xFE) | 1)});
+     pes.insert(pes.end(), payload.begin(), payload.end());
+-    for (size_t pos = 0; pos < pes.size(); pos += 184)
+-      WritePacket(pid, pos == 0, pes.data() + pos, std::min<size_t>(184, pes.size() - pos));
++    for (size_t pos = 0, size = firstPacket; pos < pes.size(); pos += size, size = 184)
++      WritePacket(pid, pos == 0, pes.data() + pos, std::min<size_t>(size, pes.size() - pos));
+   }
+ 
+   const VideoCodec& m_codec;
+@@ -523,9 +525,11 @@ TEST_F(TSSampleReaderTest, SeekWaitsForTheNextLiveSegment)
+ // between the start times of two frames.
+ TEST_F(TSSampleReaderTest, VideoSeekLandsOnTheKeyFrame)
+ {
++  for (const VideoCodec* codec : {&H264, &HEVC, &MPEG2})
+   for (const int keyInterval : {5, 7})
+   {
+-    TSWriter writer;
++    SCOPED_TRACE(codec->name);
++    TSWriter writer{*codec};
+     std::vector<uint8_t> segments[2];
+     for (int s = 0; s < 2; ++s)
+     {
+@@ -596,38 +600,187 @@ TEST_F(TSSampleReaderTest, VideoSeekKeepsTheFramesAfterTheKeyFrameInDecodeOrder)
+   }
+ }
+ 
+-// A seek with video lands on the PES of the key frame. The audio after that
+-// PES keeps all frames, also a frame with an earlier PTS. A reset after the
+-// seek reads all video frames again.
+-TEST_F(TSSampleReaderTest, SeekKeepsTheOtherStreamsAndAResetEndsTheSeek)
++// A seek with video lands on the PES of the key frame. The session aligns
++// the other streams to the PTS of the seek, so the key frame comes first. The
++// audio after the PES of the key frame follows with all frames, also frames
++// with an earlier PTS. A reset after the seek reads all frames again.
++TEST_F(TSSampleReaderTest, SeekReturnsTheVideoFrameFirstAndKeepsTheAudio)
+ {
+   constexpr int KEY{5};
++  for (const uint64_t lead : {AUDIO_LEAD, uint64_t{90000}})
++  {
++    SCOPED_TRACE(testing::Message() << "audio lead " << lead);
++    TSWriter writer;
++    writer.WriteTables(true);
++    for (int v = 0; v < SEGMENT_VIDEO_FRAMES; ++v)
++    {
++      writer.WriteVideo(v, 1);
++      writer.WriteAudio(AudioPts(2 * v) - lead, 2 * v, 2, 2, false);
++    }
++    Open(writer.Take(), Time(VideoPts(0)) - DIFF, INPUTSTREAM_TYPE_VIDEO);
++    m_reader->AddStreamType(INPUTSTREAM_TYPE_AUDIO, AUDIO_ID);
++    bool started{false};
++    ASSERT_EQ(m_reader->Start(started), AP4_SUCCESS);
++    m_segments->m_absolutePosition -= m_segments->m_segmentReadPos;
++    m_segments->m_segmentReadPos = 0;
++    m_reader->Reset(false);
++    ASSERT_TRUE(m_reader->TimeSeek(Time(VideoPts(KEY)), true));
++    ASSERT_EQ(m_reader->GetStreamId(), VIDEO_ID);
++    EXPECT_EQ(m_reader->PTS(), Time(VideoPts(KEY)));
++    EXPECT_EQ(m_reader->GetPTSDiff(), DIFF);
++    int video{KEY + 1};
++    int audio{2 * KEY};
++    while (audio < 2 * KEY + 4)
++    {
++      ASSERT_EQ(m_reader->ReadSample(), AP4_SUCCESS);
++      if (m_reader->GetStreamId() == VIDEO_ID)
++      {
++        EXPECT_EQ(m_reader->PTS(), Time(VideoPts(video++)));
++        continue;
++      }
++      EXPECT_EQ(FrameIndex(), audio);
++      EXPECT_EQ(m_reader->PTS(), Time(AudioPts(audio++) - lead));
++      EXPECT_EQ(m_reader->GetPTSDiff(), DIFF);
++    }
++
++    // A reset after a seek drops the audio that waits for the frame of the seek
++    m_segments->m_absolutePosition -= m_segments->m_segmentReadPos;
++    m_segments->m_segmentReadPos = 0;
++    m_reader->Reset(false);
++    ASSERT_TRUE(m_reader->TimeSeek(Time(VideoPts(KEY)), true));
++    m_segments->m_absolutePosition -= m_segments->m_segmentReadPos;
++    m_segments->m_segmentReadPos = 0;
++    m_reader->Reset(false);
++    video = 0;
++    audio = 0;
++    while (video < 2 || audio < 2)
++    {
++      ASSERT_EQ(m_reader->ReadSample(), AP4_SUCCESS);
++      if (m_reader->GetStreamId() == VIDEO_ID)
++        EXPECT_EQ(m_reader->PTS(), Time(VideoPts(video++)));
++      else
++        EXPECT_EQ(FrameIndex(), audio++);
++    }
++  }
++}
++
++// A seek before the first key frame of a segment lands on the segment start.
++// A seek after the frames of a segment scans the next segment. With video,
++// the video frame of the landing comes first, and the audio after the landing
++// follows.
++TEST_F(TSSampleReaderTest, SeekToTheSegmentStartReturnsTheVideoFrameFirst)
++{
+   TSWriter writer;
+-  writer.WriteTables(true);
+-  for (int v = 0; v < SEGMENT_VIDEO_FRAMES; ++v)
++  std::vector<uint8_t> segments[2];
++  for (int s = 0; s < 2; ++s)
++  {
++    writer.WriteTables(true);
++    for (int v = s * SEGMENT_VIDEO_FRAMES; v < (s + 1) * SEGMENT_VIDEO_FRAMES; ++v)
++    {
++      writer.WriteAudio(AudioPts(2 * v) - AUDIO_LEAD, 2 * v, 2, 1, false);
++      writer.WriteVideo(v, 1, 6);
++    }
++    segments[s] = writer.Take();
++  }
++  struct Seek
++  {
++    uint64_t time;
++    bool preceeding;
++    int frame;
++    int audio; // The first audio frame after the landing
++  };
++  // Key frames 0, 6 and 12, then 18 in the next segment. The audio of a frame
++  // comes before the PES of the frame. After a landing on the segment start,
++  // the video starts with the first key frame.
++  for (const Seek seek : {Seek{VideoPts(0) - AUDIO_LEAD, true, 0, 0},
++                          Seek{VideoPts(13), false, 18, 2 * 18 + 2},
++                          Seek{VideoPts(16), true, 18, SEGMENT_FRAMES}})
++  {
++    SCOPED_TRACE(seek.frame);
++    Open(segments[0], Time(VideoPts(0)) - SegmentDiff(0), INPUTSTREAM_TYPE_VIDEO);
++    AppendSegment(segments[1], Time(VideoPts(SEGMENT_VIDEO_FRAMES)) - SegmentDiff(1));
++    m_reader->AddStreamType(INPUTSTREAM_TYPE_AUDIO, AUDIO_ID);
++    bool started{false};
++    ASSERT_EQ(m_reader->Start(started), AP4_SUCCESS);
++    m_segments->m_absolutePosition -= m_segments->m_segmentReadPos;
++    m_segments->m_segmentReadPos = 0;
++    m_reader->Reset(false);
++    ASSERT_TRUE(m_reader->TimeSeek(Time(seek.time), seek.preceeding));
++    ASSERT_EQ(m_reader->GetStreamId(), VIDEO_ID);
++    EXPECT_EQ(m_reader->PTS(), Time(VideoPts(seek.frame)));
++    ASSERT_EQ(m_reader->ReadSample(), AP4_SUCCESS);
++    ASSERT_EQ(m_reader->GetStreamId(), AUDIO_ID);
++    EXPECT_EQ(FrameIndex(), seek.audio);
++  }
++}
++
++// In a live stream, the last frame of a segment comes after the next segment
++// starts. A seek to that frame waits with the PTS of the frame, and the frame
++// comes before the audio read before it. Each frame takes the diff of its
++// segment. A reset while the seek waits reads all frames again.
++TEST_F(TSSampleReaderTest, LiveSeekToTheLastFrameOfASegmentReturnsTheFrameFirst)
++{
++  constexpr int KEY{SEGMENT_VIDEO_FRAMES - 1};
++  TSWriter writer;
++  std::vector<uint8_t> segments[2];
++  for (int s = 0; s < 2; ++s)
+   {
+-    writer.WriteVideo(v, 1);
+-    writer.WriteAudio(AudioPts(2 * v) - AUDIO_LEAD, 2 * v, 2, 2, false);
++    writer.WriteTables(true);
++    for (int v = s * SEGMENT_VIDEO_FRAMES; v < (s + 1) * SEGMENT_VIDEO_FRAMES; ++v)
++    {
++      writer.WriteVideo(v, 1, KEY);
++      writer.WriteAudio(AudioPts(2 * v) - AUDIO_LEAD, 2 * v, 2, 1, false);
++    }
++    segments[s] = writer.Take();
+   }
+-  Open(writer.Take(), Time(VideoPts(0)) - DIFF, INPUTSTREAM_TYPE_VIDEO);
++  auto restartSegment = [this]
++  {
++    m_segments->m_absolutePosition -= m_segments->m_segmentReadPos;
++    m_segments->m_segmentReadPos = 0;
++    m_reader->Reset(false);
++  };
++  Open(segments[0], Time(VideoPts(0)) - SegmentDiff(0), INPUTSTREAM_TYPE_VIDEO);
+   m_reader->AddStreamType(INPUTSTREAM_TYPE_AUDIO, AUDIO_ID);
++  m_segments->m_waitingForSegment = true;
+   bool started{false};
+   ASSERT_EQ(m_reader->Start(started), AP4_SUCCESS);
+-  m_segments->m_absolutePosition -= m_segments->m_segmentReadPos;
+-  m_segments->m_segmentReadPos = 0;
+-  m_reader->Reset(false);
+-  ASSERT_TRUE(m_reader->TimeSeek(Time(VideoPts(KEY)), true));
+-  // The demuxer emits the audio frames of the key frame first
+-  ASSERT_EQ(m_reader->GetStreamId(), AUDIO_ID);
+-  EXPECT_EQ(FrameIndex(), 2 * KEY);
+ 
+-  m_segments->m_absolutePosition -= m_segments->m_segmentReadPos;
+-  m_segments->m_segmentReadPos = 0;
+-  m_reader->Reset(false);
++  restartSegment();
++  ASSERT_TRUE(m_reader->TimeSeek(Time(VideoPts(KEY)), true));
++  restartSegment();
+   do
+     ASSERT_EQ(m_reader->ReadSample(), AP4_SUCCESS);
+   while (m_reader->GetStreamId() != VIDEO_ID);
+   EXPECT_EQ(m_reader->PTS(), Time(VideoPts(0)));
++
++  restartSegment();
++  ASSERT_TRUE(m_reader->TimeSeek(Time(VideoPts(KEY)), true));
++  EXPECT_FALSE(m_reader->EOS());
++  EXPECT_EQ(m_reader->PTS(), Time(VideoPts(KEY)));
++  EXPECT_EQ(m_reader->ReadSample(), AP4_ERROR_EOS);
++
++  AppendSegment(segments[1], Time(VideoPts(SEGMENT_VIDEO_FRAMES)) - SegmentDiff(1));
++  m_segments->m_waitingForSegment = false;
++  ASSERT_EQ(m_reader->ReadSample(), AP4_SUCCESS);
++  ASSERT_EQ(m_reader->GetStreamId(), VIDEO_ID);
++  EXPECT_EQ(m_reader->PTS(), Time(VideoPts(KEY)));
++  EXPECT_EQ(m_reader->GetPTSDiff(), SegmentDiff(0));
++  int video{KEY + 1};
++  int audio{2 * KEY};
++  while (audio < SEGMENT_FRAMES + 6)
++  {
++    ASSERT_EQ(m_reader->ReadSample(), AP4_SUCCESS);
++    if (m_reader->GetStreamId() == VIDEO_ID)
++    {
++      SCOPED_TRACE(testing::Message() << "video frame " << video);
++      EXPECT_EQ(m_reader->PTS(), Time(VideoPts(video)));
++      EXPECT_EQ(m_reader->GetPTSDiff(), SegmentDiff(video++ / SEGMENT_VIDEO_FRAMES));
++      continue;
++    }
++    SCOPED_TRACE(testing::Message() << "audio frame " << audio);
++    EXPECT_EQ(FrameIndex(), audio);
++    EXPECT_EQ(m_reader->GetPTSDiff(), SegmentDiff(audio++ / SEGMENT_FRAMES));
++  }
+ }
+ 
+ // A video seek past the last frame of a live stream continues on the key
+@@ -686,6 +839,30 @@ TEST_F(TSSampleReaderTest, TheLastFramesAreReadAtTheEndOfTheStream)
+   }
+ }
+ 
++// A PES without data at the end of the stream makes the parser read the last
++// frame before the end of the data. The end still completes the last frame.
++TEST_F(TSSampleReaderTest, TheLastFrameBeforeAnEmptyPesIsReadAtTheEndOfTheStream)
++{
++  for (const VideoCodec* codec : {&H264, &HEVC, &MPEG2})
++  {
++    SCOPED_TRACE(codec->name);
++    TSWriter writer{*codec};
++    writer.WriteTables(true);
++    writer.WriteVideo(0, SEGMENT_VIDEO_FRAMES, 5);
++    writer.WriteVideoFrame(SEGMENT_VIDEO_FRAMES, {});
++    Open(writer.Take(), Time(VideoPts(0)) - DIFF, INPUTSTREAM_TYPE_VIDEO);
++    std::vector<uint64_t> expected;
++    for (int i = 0; i < SEGMENT_VIDEO_FRAMES; ++i)
++      expected.push_back(Time(VideoPts(i)));
++    std::vector<uint64_t> read;
++    bool started{false};
++    for (AP4_Result result{m_reader->Start(started)}; AP4_SUCCEEDED(result);
++         result = m_reader->ReadSample())
++      read.push_back(m_reader->PTS());
++    EXPECT_EQ(read, expected);
++  }
++}
++
+ // The H.264 parser waits for 32 bytes after a slice start and for 64 bytes
+ // after an SPS or PPS start. At the end of the stream, no more data follows,
+ // and a short last frame, as a frame of a fade to black, is read too.
+@@ -923,6 +1100,38 @@ TEST_F(TSSampleReaderTest, PtsDiffOfAudioBeforeTheVideoOfASegment)
+   EXPECT_EQ(audio, SEGMENTS * SEGMENT_FRAMES);
+ }
+ 
++// The header of a PES can start in one segment and end in the next segment.
++// The PES and its PTS belong to the segment where the PES starts.
++TEST_F(TSSampleReaderTest, PtsDiffOfAPesHeaderAcrossTwoSegments)
++{
++  TSWriter writer;
++  writer.WriteTables(true);
++  writer.WriteVideo(0, SEGMENT_VIDEO_FRAMES - 1);
++  std::vector<uint8_t> first{writer.Take()};
++  // The first TS packet holds 9 of the 14 bytes of the PES header
++  writer.WriteVideoFrame(SEGMENT_VIDEO_FRAMES - 1, H264.keyFrame, 9);
++  const std::vector<uint8_t> split{writer.Take()};
++  first.insert(first.end(), split.begin(), split.begin() + 188);
++  writer.WriteTables(true);
++  std::vector<uint8_t> second{writer.Take()};
++  second.insert(second.end(), split.begin() + 188, split.end());
++  writer.WriteVideo(SEGMENT_VIDEO_FRAMES, SEGMENT_VIDEO_FRAMES);
++  const std::vector<uint8_t> rest{writer.Take()};
++  second.insert(second.end(), rest.begin(), rest.end());
++  Open(first, Time(VideoPts(0)) - SegmentDiff(0), INPUTSTREAM_TYPE_VIDEO);
++  AppendSegment(second, Time(VideoPts(SEGMENT_VIDEO_FRAMES)) - SegmentDiff(1));
++  int frame{0};
++  bool started{false};
++  for (AP4_Result result{m_reader->Start(started)}; AP4_SUCCEEDED(result);
++       result = m_reader->ReadSample(), ++frame)
++  {
++    SCOPED_TRACE(frame);
++    EXPECT_EQ(m_reader->PTS(), Time(VideoPts(frame)));
++    EXPECT_EQ(m_reader->GetPTSDiff(), SegmentDiff(frame / SEGMENT_VIDEO_FRAMES));
++  }
++  EXPECT_EQ(frame, 2 * SEGMENT_VIDEO_FRAMES);
++}
++
+ // A PES of audio holds several frames. A seek lands on the frame of the seek
+ // time, not on the first frame of its PES.
+ TEST_F(TSSampleReaderTest, AudioSeekLandsOnTheFrameInsideThePes)
+-- 
+2.47.3
+
