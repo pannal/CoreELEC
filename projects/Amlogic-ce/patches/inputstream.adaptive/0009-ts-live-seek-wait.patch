@@ -1,8 +1,8 @@
 From 6b7f7cb290459b6002277c5ada77660bb10f0fb7 Mon Sep 17 00:00:00 2001
 From: primez <mpincoski@gmail.com>
 Date: Sat, 31 Oct 2026 01:54:40 -0600
-Subject: [PATCH 9/9] [TSSampleReader] Continue a seek after a wait for a live
- segment
+Subject: [PATCH 09/12] [TSSampleReader] Continue a seek after a wait for a
+ live segment
 
 TimeSeek() returned AP4_ERROR_EOS when TSReader::SeekTime() failed,
 which converts to true. After a seek past the end of a stream, the

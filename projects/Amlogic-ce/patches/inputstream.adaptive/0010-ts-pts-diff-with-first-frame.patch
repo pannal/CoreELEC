@@ -1,0 +1,530 @@
+From c782767a55df3db7bd8a7ed7b4f551935ad651b4 Mon Sep 17 00:00:00 2001
+From: primez <mpincoski@gmail.com>
+Date: Sat, 31 Oct 2026 02:10:36 -0600
+Subject: [PATCH 10/12] [TSReader] Change the PTS diff with the first frame of
+ the new segment
+
+The reader took the diff of a new segment when the demuxer parsed the
+first PES header of that segment. The video parser emits a frame only
+after the start of the next frame, so the last two video frames of the
+previous segment came after that header and took the diff of the new
+segment.
+
+The demuxer now marks the first PES of each stream after the segment
+change in the elementary stream buffer. A packet that starts at the
+mark or later is from the new segment, the same rule the parsers use to
+assign a PTS to a frame. The reader takes the new diff with the first
+packet of the new segment after the video has no frames of the previous
+segment left. A muxed reader has one diff for both streams, and the
+session applies the diff of the timing stream to all samples, so the
+diff follows the video. A cleared buffer keeps the mark at the buffer
+start, so after a seek or at the stream start the diff applies at once.
+
+The TS, WebM and ADTS tests give each segment a different diff, so the
+tests check where the diff changes, also for video only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ lib/mpegts/mpegts/elementaryStream.cpp |  30 ++++++
+ lib/mpegts/mpegts/elementaryStream.h   |   8 ++
+ src/demuxers/TSReader.cpp              |  33 ++++--
+ src/demuxers/TSReader.h                |  10 +-
+ src/samplereader/TSSampleReader.cpp    |   5 +-
+ src/test/TestADTSReader.cpp            |  16 +--
+ src/test/TestTSReader.cpp              | 136 +++++++++++++++----------
+ src/test/TestWebmReader.cpp            |  12 ++-
+ 8 files changed, 172 insertions(+), 78 deletions(-)
+
+diff --git a/lib/mpegts/mpegts/elementaryStream.cpp b/lib/mpegts/mpegts/elementaryStream.cpp
+index 40c0426..443e9a5 100644
+--- a/lib/mpegts/mpegts/elementaryStream.cpp
++++ b/lib/mpegts/mpegts/elementaryStream.cpp
+@@ -32,6 +32,8 @@ ElementaryStream::ElementaryStream(uint16_t pes_pid)
+   , es_consumed(0)
+   , es_pts_pointer(0)
+   , es_parsed(0)
++  , es_marked(false)
++  , es_mark_pointer(0)
+   , es_found_frame(false)
+   , es_frame_valid(false)
+   , es_extraDataChanged(false)
+@@ -59,6 +61,30 @@ void ElementaryStream::Reset(void)
+ void ElementaryStream::ClearBuffer()
+ {
+   es_len = es_consumed = es_pts_pointer = es_parsed = 0;
++  // The data of the marked PES and of the PES before is gone, later data is newer
++  es_mark_pointer = 0;
++}
++
++void ElementaryStream::MarkPes()
++{
++  es_marked = true;
++  es_mark_pointer = es_pts_pointer;
++}
++
++void ElementaryStream::ClearMark()
++{
++  es_marked = false;
++}
++
++bool ElementaryStream::IsMarked(const unsigned char* data) const
++{
++  // The parsers also assign a frame to a PES by the position of the frame start
++  return es_marked && es_buf && data >= es_buf + es_mark_pointer;
++}
++
++bool ElementaryStream::HasOnlyMarkedData() const
++{
++  return es_marked && es_consumed >= es_mark_pointer;
+ }
+ 
+ int ElementaryStream::Append(const unsigned char* buf, size_t len, bool new_pts)
+@@ -78,6 +104,10 @@ int ElementaryStream::Append(const unsigned char* buf, size_t len, bool new_pts)
+         es_pts_pointer -= es_consumed;
+       else
+         es_pts_pointer = 0;
++      if (es_mark_pointer > es_consumed)
++        es_mark_pointer -= es_consumed;
++      else
++        es_mark_pointer = 0;
+ 
+       es_consumed = 0;
+     }
+diff --git a/lib/mpegts/mpegts/elementaryStream.h b/lib/mpegts/mpegts/elementaryStream.h
+index 17a9151..3c929b7 100644
+--- a/lib/mpegts/mpegts/elementaryStream.h
++++ b/lib/mpegts/mpegts/elementaryStream.h
+@@ -103,6 +103,12 @@ namespace TSDemux
+     bool GetStreamPacket(STREAM_PKT* pkt);
+     virtual void Parse(STREAM_PKT* pkt);
+ 
++    void MarkPes();               ///< Mark the start of the current PES in the buffer
++    void ClearMark();
++    bool HasMark() const { return es_marked; }
++    bool IsMarked(const unsigned char* data) const; ///< True if packet data starts in the marked PES or later
++    bool HasOnlyMarkedData() const; ///< True if the next packet starts in the marked PES or later
++
+   protected:
+     void ResetStreamPacket(STREAM_PKT* pkt);
+     uint64_t Rescale(uint64_t a, uint64_t b, uint64_t c);
+@@ -116,6 +122,8 @@ namespace TSDemux
+     size_t es_consumed;           ///< Consumed payload. Will be erased on next append
+     size_t es_pts_pointer;        ///< Position in buffer where current PTS becomes applicable
+     size_t es_parsed;             ///< Parser: Last processed position in buffer
++    bool   es_marked;             ///< MarkPes() set es_mark_pointer
++    size_t es_mark_pointer;       ///< Position in buffer where the marked PES starts
+     bool   es_found_frame;        ///< Parser: Found frame
+     bool   es_frame_valid;
+     bool   es_extraDataChanged;
+diff --git a/src/demuxers/TSReader.cpp b/src/demuxers/TSReader.cpp
+index 58832e8..a064892 100644
+--- a/src/demuxers/TSReader.cpp
++++ b/src/demuxers/TSReader.cpp
+@@ -276,7 +276,7 @@ bool TSReader::ReadPacket(bool scanStreamInfo)
+ 
+     if (m_AVContext->HasPIDPayload())
+     {
+-      const TSDemux::ElementaryStream* stream{m_AVContext->GetPIDStream()};
++      TSDemux::ElementaryStream* stream{m_AVContext->GetPIDStream()};
+       const uint32_t pesPtsCount{stream ? stream->pes_pts_count : 0};
+       status = m_AVContext->ProcessTSPayload();
+       // Take the PTS before the parser of the stream advances the PTS frame by frame
+@@ -330,25 +330,42 @@ bool TSReader::HasVideo() const
+ 
+ void TSReader::MarkSegmentStart()
+ {
+-  m_segmentPtsPending = true;
++  m_segmentStart = true;
+   m_segmentPts = PTS_UNSET;
++  for (auto& tsInfo : m_streamInfos)
++    tsInfo.m_stream->ClearMark();
++}
++
++bool TSReader::IsSegmentPacket() const
++{
++  // The demuxer still holds frames of the previous segment when the segment
++  // changes, and emits them before the frames of the new segment
++  const TSDemux::ElementaryStream* stream{m_AVContext->GetStream(m_pkt.pid)};
++  const TSDemux::ElementaryStream* segmentStream{m_AVContext->GetStream(m_segmentPid)};
++  return stream && stream->IsMarked(m_pkt.data) && segmentStream &&
++         segmentStream->HasOnlyMarkedData();
+ }
+ 
+-void TSReader::UpdateSegmentPts(const TSDemux::ElementaryStream* stream)
++void TSReader::UpdateSegmentPts(TSDemux::ElementaryStream* stream)
+ {
+-  if (!m_segmentPtsPending)
++  if (!m_segmentStart)
+     return;
+ 
+   for (const auto& tsInfo : m_streamInfos)
+   {
++    if (tsInfo.m_stream != stream || !tsInfo.m_enabled)
++      continue;
++
++    // The first PES of each stream in the new segment
++    if (!stream->HasMark())
++      stream->MarkPes();
+     // With video, the audio PES can start before the video PES in some segments
+-    if (tsInfo.m_stream == stream && tsInfo.m_enabled &&
+-        (tsInfo.m_streamType == INPUTSTREAM_TYPE_VIDEO || !HasVideo()))
++    if (m_segmentPts == PTS_UNSET && (tsInfo.m_streamType == INPUTSTREAM_TYPE_VIDEO || !HasVideo()))
+     {
+       m_segmentPts = stream->c_pts;
+-      m_segmentPtsPending = false;
+-      return;
++      m_segmentPid = stream->pid;
+     }
++    return;
+   }
+ }
+ 
+diff --git a/src/demuxers/TSReader.h b/src/demuxers/TSReader.h
+index b64fe05..1d4ec17 100644
+--- a/src/demuxers/TSReader.h
++++ b/src/demuxers/TSReader.h
+@@ -45,6 +45,11 @@ public:
+    * \return The PTS, or PTS_UNSET while the PES is not read yet
+    */
+   uint64_t GetSegmentPts() const { return m_segmentPts; }
++  /*!
++   * \brief True if the packet is from the new segment, and the stream of
++   *        GetSegmentPts() has no packets of the previous segment left.
++   */
++  bool IsSegmentPacket() const;
+ 
+   uint64_t GetDts() const { return m_pkt.dts == PTS_UNSET ? PTS_UNSET : m_pkt.dts; }
+   uint64_t GetPts() const { return m_pkt.pts == PTS_UNSET ? PTS_UNSET : m_pkt.pts; }
+@@ -56,7 +61,7 @@ public:
+ private:
+   bool GetPacket();
+   bool HasVideo() const;
+-  void UpdateSegmentPts(const TSDemux::ElementaryStream* stream);
++  void UpdateSegmentPts(TSDemux::ElementaryStream* stream);
+   bool HandleProgramChange();
+   bool HandleStreamChange(uint16_t pid);
+ 
+@@ -68,8 +73,9 @@ private:
+   AP4_Position m_startPos;
+   uint32_t m_requiredMask;
+   uint32_t m_typeMask;
+-  bool m_segmentPtsPending{false};
++  bool m_segmentStart{false};
+   uint64_t m_segmentPts{PTS_UNSET};
++  uint16_t m_segmentPid{0};
+ 
+   struct TSINFO
+   {
+diff --git a/src/samplereader/TSSampleReader.cpp b/src/samplereader/TSSampleReader.cpp
+index 79dba74..7c9a198 100644
+--- a/src/samplereader/TSSampleReader.cpp
++++ b/src/samplereader/TSSampleReader.cpp
+@@ -92,7 +92,7 @@ AP4_Result CTSSampleReader::ReadSample()
+     m_dts = (GetDts() == PTS_UNSET) ? STREAM_NOPTS_VALUE : (GetDts() * 100) / 9;
+     m_pts = (GetPts() == PTS_UNSET) ? STREAM_NOPTS_VALUE : (GetPts() * 100) / 9;
+ 
+-    if (~m_ptsOffs && GetSegmentPts() != PTS_UNSET)
++    if (~m_ptsOffs && GetSegmentPts() != PTS_UNSET && IsSegmentPacket())
+     {
+       m_ptsDiff = (GetSegmentPts() * 100) / 9 - m_ptsOffs;
+       m_ptsOffs = ~0ULL;
+@@ -122,7 +122,8 @@ void CTSSampleReader::SetPTSOffset(uint64_t offset)
+   m_ptsOffs = offset;
+   // The demuxer emits a PES only when the next PES starts. So after a segment
+   // change, the next samples are still from the previous segment, and the
+-  // offset applies to the first PES of the new segment.
++  // offset applies from the first PES of the new segment. With muxed streams,
++  // the frames of the video set the time of the change.
+   MarkSegmentStart();
+ }
+ 
+diff --git a/src/test/TestADTSReader.cpp b/src/test/TestADTSReader.cpp
+index d040fbb..e63864c 100644
+--- a/src/test/TestADTSReader.cpp
++++ b/src/test/TestADTSReader.cpp
+@@ -399,12 +399,14 @@ TEST_F(ADTSSampleReaderTest, Eac3ReadsThePaddedEndOfASegment)
+ 
+ // The session sets the PTS offset of the next segment when the stream switches
+ // to that segment. The PTS diff compares the offset with the first sample of
+-// that segment, so the diff stays the same across the segment change. Before,
+-// the last sample of a segment took the offset of the next segment, and the
+-// diff was one frame wrong until the next seek.
+-TEST_F(ADTSSampleReaderTest, PtsDiffStaysTheSameAcrossSegments)
++// that segment, and the new diff applies from that sample. Before, the last
++// sample of a segment took the offset of the next segment, and the diff was
++// one frame wrong until the next seek.
++TEST_F(ADTSSampleReaderTest, PtsDiffChangesWithTheFirstFrameOfASegment)
+ {
++  // Each segment has a different diff, so the test sees where the diff changes
+   constexpr int64_t DIFF{5000};
++  constexpr int64_t NEXT_DIFF{6000};
+   const struct
+   {
+     const char* name;
+@@ -439,7 +441,7 @@ TEST_F(ADTSSampleReaderTest, PtsDiffStaysTheSameAcrossSegments)
+       }
+       OpenSegment(segments[0], starts[0] * 100 / 9 - DIFF);
+       if (!late)
+-        AppendSegment(segments[1], starts[1] * 100 / 9 - DIFF);
++        AppendSegment(segments[1], starts[1] * 100 / 9 - NEXT_DIFF);
+       m_segments->m_waitingForSegment = late;
+ 
+       ASSERT_TRUE(
+@@ -452,14 +454,14 @@ TEST_F(ADTSSampleReaderTest, PtsDiffStaysTheSameAcrossSegments)
+           // The live stream waits for the next segment
+           ASSERT_EQ(m_reader->ReadSample(), AP4_ERROR_EOS);
+           ASSERT_FALSE(m_reader->EOS());
+-          AppendSegment(segments[1], starts[1] * 100 / 9 - DIFF);
++          AppendSegment(segments[1], starts[1] * 100 / 9 - NEXT_DIFF);
+           m_segments->m_waitingForSegment = false;
+         }
+         if (i > FRAMES - 3)
+           ASSERT_EQ(m_reader->ReadSample(), AP4_SUCCESS);
+         EXPECT_EQ(FrameIndex(), i);
+         EXPECT_EQ(m_reader->PTS(), FrameTime(BASE_PTS, i, codec.samples, codec.rate));
+-        EXPECT_EQ(m_reader->GetPTSDiff(), DIFF);
++        EXPECT_EQ(m_reader->GetPTSDiff(), i < FRAMES ? DIFF : NEXT_DIFF);
+       }
+     }
+   }
+diff --git a/src/test/TestTSReader.cpp b/src/test/TestTSReader.cpp
+index a8ae272..1e836d8 100644
+--- a/src/test/TestTSReader.cpp
++++ b/src/test/TestTSReader.cpp
+@@ -33,8 +33,14 @@ constexpr int SEGMENT_FRAMES = 30; // Audio frames
+ constexpr int SEGMENT_VIDEO_FRAMES = 15;
+ // The audio of the muxed segments starts before the video
+ constexpr uint64_t AUDIO_LEAD = 1000;
++// Each segment has a different diff, so the tests see where the diff changes
+ constexpr int64_t DIFF = 5000;
+ 
++int64_t SegmentDiff(int segment)
++{
++  return DIFF + segment * 1000;
++}
++
+ uint64_t AudioPts(int frame)
+ {
+   return BASE_PTS + frame * AUDIO_TICKS;
+@@ -245,9 +251,9 @@ protected:
+ 
+ // The demuxer emits a PES only when the next PES starts, so after a segment
+ // change the reader still emits the frames of the previous segment. The offset
+-// of the new segment must apply to the PTS of the first PES of that segment,
+-// not to the next emitted frame.
+-TEST_F(TSSampleReaderTest, PtsDiffStaysTheSameAcrossSegments)
++// of the new segment must apply from the first frame of that segment, with
++// the PTS of the first PES of that segment.
++TEST_F(TSSampleReaderTest, PtsDiffChangesWithTheFirstFrameOfASegment)
+ {
+   for (const bool pesLength : {true, false})
+   for (const int framesPerPes : {1, 3})
+@@ -265,7 +271,7 @@ TEST_F(TSSampleReaderTest, PtsDiffStaysTheSameAcrossSegments)
+       writer.WriteAudio(AudioPts(s * SEGMENT_FRAMES), s * SEGMENT_FRAMES, SEGMENT_FRAMES,
+                         framesPerPes, pesLength);
+       segments[s] = writer.Take();
+-      starts[s] = Time(AudioPts(s * SEGMENT_FRAMES)) - DIFF;
++      starts[s] = Time(AudioPts(s * SEGMENT_FRAMES)) - SegmentDiff(s);
+     }
+     Open(segments[0], starts[0], INPUTSTREAM_TYPE_AUDIO);
+     int appended{1};
+@@ -297,69 +303,87 @@ TEST_F(TSSampleReaderTest, PtsDiffStaysTheSameAcrossSegments)
+       }
+       EXPECT_EQ(FrameIndex(), i);
+       EXPECT_EQ(m_reader->PTS(), Time(AudioPts(i)));
+-      EXPECT_EQ(m_reader->GetPTSDiff(), DIFF);
++      EXPECT_EQ(m_reader->GetPTSDiff(), SegmentDiff(i / SEGMENT_FRAMES));
+     }
+   }
+ }
+ 
+-// The segments of the video set the offset. The audio of a segment can start
+-// before the video, and the diff must not change to the audio start.
+-TEST_F(TSSampleReaderTest, PtsDiffFollowsTheVideoOfMuxedSegments)
++// The segments of the video set the offset. The video parser emits a frame
++// only after the start of the next frame, so the last video frames of a
++// segment come after the PES header of the next segment. The audio of a
++// segment can start before the video, and the diff must not take the audio
++// start.
++TEST_F(TSSampleReaderTest, PtsDiffChangesWithTheVideoOfASegment)
+ {
+-  TSWriter writer;
+-  std::vector<uint8_t> segments[SEGMENTS];
+-  uint64_t starts[SEGMENTS];
+-  for (int s = 0; s < SEGMENTS; ++s)
++  for (const bool withAudio : {false, true})
++  for (const int framesPerPes : {1, 3})
+   {
+-    writer.WriteTables(true);
+-    // A muxer interleaves the PES packets by PTS
+-    int audio{s * SEGMENT_FRAMES};
+-    int video{s * SEGMENT_VIDEO_FRAMES};
+-    while (audio < (s + 1) * SEGMENT_FRAMES || video < (s + 1) * SEGMENT_VIDEO_FRAMES)
++    SCOPED_TRACE(testing::Message() << (withAudio ? "video and audio, " : "video, ")
++                                    << framesPerPes << " audio frames per PES");
++    TSWriter writer;
++    std::vector<uint8_t> segments[SEGMENTS];
++    uint64_t starts[SEGMENTS];
++    for (int s = 0; s < SEGMENTS; ++s)
+     {
+-      if (video == (s + 1) * SEGMENT_VIDEO_FRAMES ||
+-          (audio < (s + 1) * SEGMENT_FRAMES && AudioPts(audio) - AUDIO_LEAD <= VideoPts(video)))
++      writer.WriteTables(true);
++      // A muxer interleaves the PES packets by PTS
++      int audio{s * SEGMENT_FRAMES};
++      int video{s * SEGMENT_VIDEO_FRAMES};
++      while (audio < (s + 1) * SEGMENT_FRAMES || video < (s + 1) * SEGMENT_VIDEO_FRAMES)
+       {
+-        writer.WriteAudio(AudioPts(audio) - AUDIO_LEAD, audio, 3, 3, false);
+-        audio += 3;
++        if (video == (s + 1) * SEGMENT_VIDEO_FRAMES ||
++            (audio < (s + 1) * SEGMENT_FRAMES && AudioPts(audio) - AUDIO_LEAD <= VideoPts(video)))
++        {
++          writer.WriteAudio(AudioPts(audio) - AUDIO_LEAD, audio, framesPerPes, framesPerPes,
++                            false);
++          audio += framesPerPes;
++        }
++        else
++          writer.WriteVideo(video++, 1);
+       }
+-      else
+-        writer.WriteVideo(video++, 1);
++      segments[s] = writer.Take();
++      starts[s] = Time(VideoPts(s * SEGMENT_VIDEO_FRAMES)) - SegmentDiff(s);
+     }
+-    segments[s] = writer.Take();
+-    starts[s] = Time(VideoPts(s * SEGMENT_VIDEO_FRAMES)) - DIFF;
+-  }
+-  Open(segments[0], starts[0], INPUTSTREAM_TYPE_VIDEO);
+-  for (int s = 1; s < SEGMENTS; ++s)
+-    AppendSegment(segments[s], starts[s]);
+-  m_reader->AddStreamType(INPUTSTREAM_TYPE_AUDIO, AUDIO_ID);
++    Open(segments[0], starts[0], INPUTSTREAM_TYPE_VIDEO);
++    for (int s = 1; s < SEGMENTS; ++s)
++      AppendSegment(segments[s], starts[s]);
++    if (withAudio)
++      m_reader->AddStreamType(INPUTSTREAM_TYPE_AUDIO, AUDIO_ID);
+ 
+-  bool started{false};
+-  ASSERT_EQ(m_reader->Start(started), AP4_SUCCESS);
+-  int video{0};
+-  int audio{0};
+-  do
+-  {
+-    if (m_reader->GetStreamId() == VIDEO_ID)
+-    {
+-      SCOPED_TRACE(testing::Message() << "video frame " << video);
+-      EXPECT_EQ(m_reader->PTS(), Time(VideoPts(video)));
+-      ++video;
+-    }
+-    else
++    bool started{false};
++    ASSERT_EQ(m_reader->Start(started), AP4_SUCCESS);
++    int video{0};
++    int audio{0};
++    // One diff serves both streams. The diff of a segment applies from the
++    // first frame of that segment after the last video frame of the previous
++    // segment.
++    int segment{0};
++    do
+     {
+-      SCOPED_TRACE(testing::Message() << "audio frame " << audio);
+-      EXPECT_EQ(FrameIndex(), audio);
+-      EXPECT_EQ(m_reader->PTS(), Time(AudioPts(audio) - AUDIO_LEAD));
+-      ++audio;
+-    }
+-    EXPECT_EQ(m_reader->GetPTSDiff(), DIFF);
+-  } while (AP4_SUCCEEDED(m_reader->ReadSample()));
++      SCOPED_TRACE(testing::Message() << "video frame " << video << ", audio frame " << audio);
++      const bool isVideo{m_reader->GetStreamId() == VIDEO_ID};
++      const int frameSegment{isVideo ? video / SEGMENT_VIDEO_FRAMES : audio / SEGMENT_FRAMES};
++      if (frameSegment > segment && video >= frameSegment * SEGMENT_VIDEO_FRAMES)
++        segment = frameSegment;
++      if (isVideo)
++      {
++        EXPECT_EQ(m_reader->PTS(), Time(VideoPts(video)));
++        ++video;
++      }
++      else
++      {
++        EXPECT_EQ(FrameIndex(), audio);
++        EXPECT_EQ(m_reader->PTS(), Time(AudioPts(audio) - AUDIO_LEAD));
++        ++audio;
++      }
++      EXPECT_EQ(m_reader->GetPTSDiff(), SegmentDiff(segment));
++    } while (AP4_SUCCEEDED(m_reader->ReadSample()));
+ 
+-  // The last PES of each stream has no next PES. The video parser also waits
+-  // for the start of the next frame.
+-  EXPECT_EQ(video, SEGMENTS * SEGMENT_VIDEO_FRAMES - 2);
+-  EXPECT_EQ(audio, SEGMENTS * SEGMENT_FRAMES - 3);
++    // The last PES of each stream has no next PES. The video parser also waits
++    // for the start of the next frame.
++    EXPECT_EQ(video, SEGMENTS * SEGMENT_VIDEO_FRAMES - 2);
++    EXPECT_EQ(audio, withAudio ? SEGMENTS * SEGMENT_FRAMES - framesPerPes : 0);
++  }
+ }
+ 
+ // A seek to the last frame of the stream lands on that frame. A seek past the
+@@ -407,7 +431,7 @@ TEST_F(TSSampleReaderTest, SeekWaitsForTheNextLiveSegment)
+   EXPECT_FALSE(m_reader->EOS());
+   EXPECT_EQ(m_reader->PTS(), target);
+ 
+-  AppendSegment(segments[1], Time(AudioPts(SEGMENT_FRAMES)) - DIFF);
++  AppendSegment(segments[1], Time(AudioPts(SEGMENT_FRAMES)) - SegmentDiff(1));
+   m_segments->m_waitingForSegment = false;
+   for (int i = SEGMENT_FRAMES; i < SEGMENT_FRAMES + 3; ++i)
+   {
+@@ -415,6 +439,6 @@ TEST_F(TSSampleReaderTest, SeekWaitsForTheNextLiveSegment)
+     ASSERT_EQ(m_reader->ReadSample(), AP4_SUCCESS);
+     EXPECT_EQ(FrameIndex(), i);
+     EXPECT_EQ(m_reader->PTS(), Time(AudioPts(i)));
+-    EXPECT_EQ(m_reader->GetPTSDiff(), DIFF);
++    EXPECT_EQ(m_reader->GetPTSDiff(), SegmentDiff(1));
+   }
+ }
+diff --git a/src/test/TestWebmReader.cpp b/src/test/TestWebmReader.cpp
+index e65d717..cb4fd15 100644
+--- a/src/test/TestWebmReader.cpp
++++ b/src/test/TestWebmReader.cpp
+@@ -23,8 +23,14 @@ constexpr uint64_t BASE_MS = 100000; // 100 s
+ constexpr uint64_t FRAME_MS = 20;
+ constexpr int CLUSTERS = 3;
+ constexpr int CLUSTER_FRAMES = 10;
++// Each segment has a different diff, so the tests see where the diff changes
+ constexpr int64_t DIFF = 5000;
+ 
++int64_t SegmentDiff(int segment)
++{
++  return DIFF + segment * 1000;
++}
++
+ // PTS of a frame in the microseconds of the sample reader
+ uint64_t FrameTime(int frame)
+ {
+@@ -131,11 +137,11 @@ protected:
+ // After the last frame of a cluster, that read switches to the next segment,
+ // and the session sets the offset of the next segment. The offset must apply
+ // to the first frame of the next segment, not to the last frame of the cluster.
+-TEST_F(WebmSampleReaderTest, PtsDiffStaysTheSameAcrossSegments)
++TEST_F(WebmSampleReaderTest, PtsDiffChangesWithTheFirstFrameOfASegment)
+ {
+   Open();
+   for (int c = 0; c < CLUSTERS; ++c)
+-    AppendSegment(Cluster(c), FrameTime(c * CLUSTER_FRAMES) - DIFF);
++    AppendSegment(Cluster(c), FrameTime(c * CLUSTER_FRAMES) - SegmentDiff(c));
+ 
+   bool started{false};
+   ASSERT_EQ(m_reader->Start(started), AP4_SUCCESS);
+@@ -146,7 +152,7 @@ TEST_F(WebmSampleReaderTest, PtsDiffStaysTheSameAcrossSegments)
+       ASSERT_EQ(m_reader->ReadSample(), AP4_SUCCESS);
+     EXPECT_EQ(FrameIndex(), i);
+     EXPECT_EQ(m_reader->PTS(), FrameTime(i));
+-    EXPECT_EQ(m_reader->GetPTSDiff(), DIFF);
++    EXPECT_EQ(m_reader->GetPTSDiff(), SegmentDiff(i / CLUSTER_FRAMES));
+   }
+   EXPECT_EQ(m_reader->ReadSample(), AP4_ERROR_EOS);
+ }
+-- 
+2.47.3
+

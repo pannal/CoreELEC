@@ -1,7 +1,7 @@
 From 2d19f75f364b782d540c3049efea332f7bfe6106 Mon Sep 17 00:00:00 2001
 From: primez <mpincoski@gmail.com>
 Date: Sat, 31 Oct 2026 01:35:42 -0600
-Subject: [PATCH 6/9] [ADTSReader] Read nothing past a frame before the frame
+Subject: [PATCH 06/12] [ADTSReader] Read nothing past a frame before the frame
  takes the PTS
 
 AdjustStreamForPadding() called Tell() after each frame. At the segment

@@ -1,8 +1,8 @@
 From a98f5bb6d4c1fe4889ab084587ba2e255d60c8f1 Mon Sep 17 00:00:00 2001
 From: primez <mpincoski@gmail.com>
 Date: Sat, 31 Oct 2026 01:54:34 -0600
-Subject: [PATCH 8/9] [WebmReader] Take the PTS offset from the first frame of
- a segment
+Subject: [PATCH 08/12] [WebmReader] Take the PTS offset from the first frame
+ of a segment
 
 The parser reads the header of the next block to find the duration of
 a frame. After the last frame of a cluster, that read switches to the

@@ -1,7 +1,7 @@
 From 21ce83066ecb320e251c0473f76fac10b32a033b Mon Sep 17 00:00:00 2001
 From: primez <mpincoski@gmail.com>
 Date: Sat, 31 Oct 2026 01:49:23 -0600
-Subject: [PATCH 7/9] [TSReader] Take the PTS offset from the first PES of a
+Subject: [PATCH 07/12] [TSReader] Take the PTS offset from the first PES of a
  segment
 
 The TS demuxer emits a PES only when the next PES of the stream starts,
