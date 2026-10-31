@@ -1,0 +1,83 @@
+From 00ad4c3b4619734782933006a487aacb7a6630fc Mon Sep 17 00:00:00 2001
+From: primez <mpincoski@gmail.com>
+Date: Sat, 31 Oct 2026 10:07:28 -0600
+Subject: [PATCH] [main] Pass the seek time without a float error
+
+PosTime and the retry of a failed seek converted milliseconds with the
+float constant 0.001f, so 24000 ms became 24.0000011 s. The session
+truncated that time to 24000001 us, and the TS reader rounds the seek
+time up to the next 90 kHz tick. So a seek to the time of a key frame
+skipped that key frame and continued at the next one (a seek to 24.0 s
+continued at 25.0 s). The error grows with the time: at one hour it is
+about 170 us.
+
+The callers now divide by 1000.0, and the session rounds the seek time to
+the nearest microsecond.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ inputstream.adaptive/changelog.txt | 1 +
+ src/Session.cpp                    | 5 ++++-
+ src/main.cpp                       | 4 ++--
+ 3 files changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/inputstream.adaptive/changelog.txt b/inputstream.adaptive/changelog.txt
+index ca70d69..8323ac3 100644
+--- a/inputstream.adaptive/changelog.txt
++++ b/inputstream.adaptive/changelog.txt
+@@ -7,6 +7,7 @@ v21.5.25-p3i.4 (2026-10-31)
+ - Fix the timing offset of TS audio that follows the video of the next segment, of the first TS audio frames before the first video frame, and of TS and WebM segments with only one frame
+ - Fix a seek in a TS audio stream that continued at the first frame of the PES instead of at the frame of the seek time
+ - Fix a seek in a TS stream with video and audio that continued at the key frame before the key frame of the seek time
++- Fix a seek to the time of a key frame, which continued at the next key frame: the seek time in milliseconds came with a float error
+ - Fix a seek to an earlier time inside the current segment, which continued at the start of the segment instead of at the frame of the seek time
+ - Fix a seek in a TS stream with video and audio that returned an audio frame first, so the other streams aligned to the audio time instead of the video frame of the seek
+ - Fix a seek in an HEVC or MPEG-2 TS stream, which continued at the segment start instead of at the key frame of the seek time
+diff --git a/src/Session.cpp b/src/Session.cpp
+index f2b0f1e..efe57f5 100644
+--- a/src/Session.cpp
++++ b/src/Session.cpp
+@@ -26,6 +26,7 @@
+ #include "utils/log.h"
+ 
+ #include <array>
++#include <cmath>
+ 
+ #include <kodi/addon-instance/Inputstream.h>
+ 
+@@ -1229,7 +1230,9 @@ bool CSession::SeekTime(double seekTime, unsigned int streamId, bool preceeding)
+   }
+ 
+   // correct for starting segment pts value of chapter and chapter offset within program
+-  uint64_t seekTimeCorrected{static_cast<uint64_t>(seekTime * STREAM_TIME_BASE)};
++  // Round to the nearest microsecond. A time above the exact value skips a key
++  // frame at the seek time.
++  uint64_t seekTimeCorrected{static_cast<uint64_t>(std::llround(seekTime * STREAM_TIME_BASE))};
+   int64_t ptsDiff{0};
+   if (m_timingStream)
+   {
+diff --git a/src/main.cpp b/src/main.cpp
+index 0469ae0..df6e6c8 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -340,7 +340,7 @@ DEMUX_PACKET* CInputStreamAdaptive::DemuxRead(void)
+   if (~m_failedSeekTime)
+   {
+     LOG::Log(LOGDEBUG, "Seeking to last failed seek position (%d)", m_failedSeekTime);
+-    m_session->SeekTime(static_cast<double>(m_failedSeekTime) * 0.001f, 0, false);
++    m_session->SeekTime(m_failedSeekTime / 1000.0, 0, false);
+     m_failedSeekTime = ~0;
+   }
+ 
+@@ -464,7 +464,7 @@ bool CInputStreamAdaptive::PosTime(int ms)
+ 
+   LOG::Log(LOGINFO, "PosTime (%d)", ms);
+ 
+-  bool ret = m_session->SeekTime(static_cast<double>(ms) * 0.001f, 0, false);
++  bool ret = m_session->SeekTime(ms / 1000.0, 0, false);
+   m_failedSeekTime = ret ? ~0 : ms;
+ 
+   return ret;
+-- 
+2.47.3
+

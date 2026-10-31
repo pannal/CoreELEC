@@ -1,0 +1,308 @@
+From 8cf8c1d9fdd0b71118e8de5a9ad34178c5cafde8 Mon Sep 17 00:00:00 2001
+From: primez <mpincoski@gmail.com>
+Date: Sat, 31 Oct 2026 11:34:35 -0600
+Subject: [PATCH] [AdaptiveStream] Keep the last frames of the old quality at a
+ quality change
+
+At a change of the representation, ensureSegment returned false at the end
+of the old data and notified the session. The TS reader then returned one of
+the frames that it keeps, but DemuxRead returned the stream change in place
+of that frame, and the reopen deleted the reader with the other kept frames.
+A TS stream lost two video frames at each quality change, and the audio
+frames that waited for a PTS. A read before the reopen also read the data of
+the new representation into the reader of the old representation.
+
+- After the notification, the old representation has no more data and waits
+  for no segment, until the reopen (start_stream) or a seek. A seek clears
+  the state, so that the reopen continues in the segment of the seek.
+- The session signals the change only after the reader of the old
+  representation returned all frames (EOS). DemuxRead checks the change
+  also when no stream has a next sample, because the old reader can be the
+  only stream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ inputstream.adaptive/changelog.txt |  1 +
+ src/Session.cpp                    | 14 +++++
+ src/Session.h                      | 12 ++---
+ src/common/AdaptiveStream.cpp      | 12 ++++-
+ src/common/AdaptiveStream.h        |  7 +++
+ src/main.cpp                       | 25 +++++----
+ src/test/TestDASHTree.cpp          | 87 ++++++++++++++++++++++++++++++
+ 7 files changed, 138 insertions(+), 20 deletions(-)
+
+diff --git a/inputstream.adaptive/changelog.txt b/inputstream.adaptive/changelog.txt
+index 446f0b8..32e9d4b 100644
+--- a/inputstream.adaptive/changelog.txt
++++ b/inputstream.adaptive/changelog.txt
+@@ -9,6 +9,7 @@ v21.5.25-p3i.4 (2026-10-31)
+ - Fix a seek in a TS stream with video and audio that continued at the key frame before the key frame of the seek time
+ - Fix a seek to the time of a key frame, which continued at the next key frame: the seek time in milliseconds came with a float error
+ - Fix a seek to the start time of some segments, which chose the segment before: a TS seek downloaded and scanned one more segment, and a seek to the frame at or before the seek time continued in the segment before
++- Fix a change of the stream quality in a TS stream, which lost the last frames of the old quality: two video frames, and the audio frames that waited for a PTS
+ - Fix a seek to an earlier time inside the current segment, which continued at the start of the segment instead of at the frame of the seek time
+ - Fix a seek in a TS stream with video and audio that returned an audio frame first, so the other streams aligned to the audio time instead of the video frame of the seek
+ - Fix a seek in an HEVC or MPEG-2 TS stream, which continued at the segment start instead of at the key frame of the seek time
+diff --git a/src/Session.cpp b/src/Session.cpp
+index efe57f5..ac2b2c0 100644
+--- a/src/Session.cpp
++++ b/src/Session.cpp
+@@ -1342,6 +1342,20 @@ void CSession::OnSegmentChanged(adaptive::AdaptiveStream* adStream)
+   }
+ }
+ 
++bool CSession::CheckChange()
++{
++  for (const auto& stream : m_streams)
++  {
++    ISampleReader* reader{stream->GetReader()};
++    if (stream->m_isEnabled && stream->m_adStream.IsOldRepresentationEnded() && reader &&
++        (reader->IsReadSampleAsyncWorking() || !reader->EOS()))
++      return false;
++  }
++  const bool changed{m_changed};
++  m_changed = false;
++  return changed;
++}
++
+ void CSession::OnStreamChange(adaptive::AdaptiveStream* adStream)
+ {
+   for (auto& stream : m_streams)
+diff --git a/src/Session.h b/src/Session.h
+index c4bd77a..d5ea376 100644
+--- a/src/Session.h
++++ b/src/Session.h
+@@ -190,16 +190,12 @@ public:
+   void StartReader(
+       CStream* stream, uint64_t seekTime, int64_t ptsDiff, bool preceeding, bool timing);
+ 
+-  /*! \brief Check if the stream has changed, reset changed status
+-   *  \param bSet True to keep m_changed value true
++  /*! \brief Check if the stream has changed, reset changed status. At a change
++   *         of the representation, the change waits until the reader of the old
++   *         representation returned all frames.
+    *  \return True if stream has changed
+    */
+-  bool CheckChange(bool bSet = false)
+-  {
+-    bool ret = m_changed;
+-    m_changed = bSet;
+-    return ret;
+-  };
++  bool CheckChange();
+ 
+   /*! \brief To inform of Kodi's current screen resolution
+    *  \param width The width in pixels
+diff --git a/src/common/AdaptiveStream.cpp b/src/common/AdaptiveStream.cpp
+index ac5a473..472564e 100644
+--- a/src/common/AdaptiveStream.cpp
++++ b/src/common/AdaptiveStream.cpp
+@@ -758,6 +758,7 @@ bool AdaptiveStream::start_stream(const uint64_t startPts)
+ 
+   // Reset the event for the next one
+   m_startEvent = EVENT_TYPE::NONE;
++  m_oldRepresentationEnded = false;
+ 
+   const CSegment* next_segment = current_rep_->GetNextSegment();
+ 
+@@ -831,7 +832,7 @@ bool AdaptiveStream::start_stream(const uint64_t startPts)
+ bool AdaptiveStream::ensureSegment()
+ {
+   // NOTE: Some demuxers may call ensureSegment more times to try make more attempts when it return false.
+-  if (state_ != RUNNING)
++  if (state_ != RUNNING || m_oldRepresentationEnded)
+     return false;
+ 
+   // Switch to the next segment, if the current (so segment_buffers_[0]) segment has been read fully by the demuxer.
+@@ -1024,6 +1025,9 @@ bool AdaptiveStream::ensureSegment()
+ 
+       if (m_startEvent == EVENT_TYPE::REP_CHANGE)
+       {
++        // The data of the old representation ended. The reader returns the
++        // frames that it keeps before the session reopens the stream.
++        m_oldRepresentationEnded = true;
+         if (observer_)
+           observer_->OnStreamChange(this);
+         return false;
+@@ -1227,6 +1231,9 @@ bool AdaptiveStream::seek_time(double seek_seconds, bool preceeding, bool& needR
+   if (!current_rep_)
+     return false;
+ 
++  // A seek discards the frames of the old representation
++  m_oldRepresentationEnded = false;
++
+   if (current_rep_->IsSubtitleFileStream())
+     return true;
+ 
+@@ -1353,6 +1360,9 @@ bool AdaptiveStream::CanAddLiveSegment() const
+ 
+ bool AdaptiveStream::waitingForSegment() const
+ {
++  // The data of the old representation ended, the reader waits for no segment
++  if (m_oldRepresentationEnded)
++    return false;
+   if ((m_tree->HasManifestUpdates() || m_tree->HasManifestUpdatesSegs()) && state_ == RUNNING)
+   {
+     std::lock_guard<adaptive::AdaptiveTree::TreeUpdateThread> lckUpdTree(m_tree->GetTreeUpdMutex());
+diff --git a/src/common/AdaptiveStream.h b/src/common/AdaptiveStream.h
+index b5cfa9b..689701e 100644
+--- a/src/common/AdaptiveStream.h
++++ b/src/common/AdaptiveStream.h
+@@ -136,6 +136,11 @@ enum class EVENT_TYPE
+     void FixateInitialization(bool on);
+     void SetSegmentFileOffset(uint64_t offset) { m_segmentFileOffset = offset; };
+     bool StreamChanged() { return m_startEvent == EVENT_TYPE::REP_CHANGE; }
++    /*!
++     * \brief True from the end of the data of the old representation at a
++     *        change of the representation, until the reopen or a seek
++     */
++    bool IsOldRepresentationEnded() const { return m_oldRepresentationEnded; }
+ 
+     void OnTFRFatom(uint64_t ts, uint64_t duration, uint32_t mediaTimescale) override;
+ 
+@@ -307,6 +312,8 @@ enum class EVENT_TYPE
+ 
+     // Defines the event to start the stream, the status will be resetted by start stream method.
+     EVENT_TYPE m_startEvent{EVENT_TYPE::STREAM_START};
++    // The reader of the old representation reads no data of the new one
++    bool m_oldRepresentationEnded{false};
+ 
+     // Class ID for debug log purpose, allow the LOG prints of each AdaptiveStream to be distinguished
+     uint32_t clsId;
+diff --git a/src/main.cpp b/src/main.cpp
+index df6e6c8..75b4f7d 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -345,20 +345,23 @@ DEMUX_PACKET* CInputStreamAdaptive::DemuxRead(void)
+   }
+ 
+   ISampleReader* sr{nullptr};
++  // At a change of the representation, the reader of the old representation can
++  // end before the change: the change also comes without a next sample
++  const bool hasSample{m_session->GetNextSample(sr)};
+ 
+-  if (m_session->GetNextSample(sr))
++  if (m_session->CheckChange())
+   {
+-    DEMUX_PACKET* p{nullptr};
++    // Adaptive stream has switched stream (representation) quality
++    m_lastPts = PLAYLIST::NO_PTS_VALUE;
++    DEMUX_PACKET* p{AllocateDemuxPacket(0)};
++    p->iStreamId = DEMUX_SPECIALID_STREAMCHANGE;
++    LOG::Log(LOGDEBUG, "DEMUX_SPECIALID_STREAMCHANGE (stream quality changed)");
++    return p;
++  }
+ 
+-    if (m_session->CheckChange())
+-    {
+-      // Adaptive stream has switched stream (representation) quality
+-      m_lastPts = PLAYLIST::NO_PTS_VALUE;
+-      p = AllocateDemuxPacket(0);
+-      p->iStreamId = DEMUX_SPECIALID_STREAMCHANGE;
+-      LOG::Log(LOGDEBUG, "DEMUX_SPECIALID_STREAMCHANGE (stream quality changed)");
+-      return p;
+-    }
++  if (hasSample)
++  {
++    DEMUX_PACKET* p{nullptr};
+ 
+     if (sr)
+     {
+diff --git a/src/test/TestDASHTree.cpp b/src/test/TestDASHTree.cpp
+index b66c5b8..eda9c04 100644
+--- a/src/test/TestDASHTree.cpp
++++ b/src/test/TestDASHTree.cpp
+@@ -903,3 +903,90 @@ TEST_F(DASHTreeTest, LastSegmentOfEachPeriod)
+     }
+   }
+ }
++
++// A change of the representation ends the data of the old representation: the
++// reader of the old representation returns the frames that it keeps, and the
++// stream continues with the new representation after the reopen (start_stream).
++// A read before the reopen read the data of the new representation into the
++// reader of the old representation.
++TEST_F(DASHTreeAdaptiveStreamTest, RepresentationChangeEndsTheOldData)
++{
++  class CAlternatingChooser : public CTestRepresentationChooserDefault
++  {
++  public:
++    PLAYLIST::CRepresentation* GetNextRepresentation(PLAYLIST::CAdaptationSet* adp,
++                                                     PLAYLIST::CRepresentation* currentRep) override
++    {
++      const auto& reps{adp->GetRepresentations()};
++      if (!currentRep)
++        return reps[0].get();
++      return reps[0].get() == currentRep ? reps[1].get() : reps[0].get();
++    }
++  };
++  class CObserver : public adaptive::AdaptiveStreamObserver
++  {
++  public:
++    void OnSegmentChanged(adaptive::AdaptiveStream* stream) override {}
++    void OnStreamChange(adaptive::AdaptiveStream* stream) override { ++m_changes; }
++    int m_changes{0};
++  };
++
++  for (const bool seek : {false, true})
++  {
++    SCOPED_TRACE(seek ? "seek before the reopen" : "reopen");
++    delete m_reprChooser;
++    m_reprChooser = new CAlternatingChooser();
++    tree->Uninitialize();
++    delete tree;
++    tree = new DASHTestTree();
++    OpenTestFile("mpd/segtpl_multiple.mpd", "https://foo.bar/dash/multiple.mpd");
++    PLAYLIST::CAdaptationSet* adp{tree->m_periods[0]->GetAdaptationSets()[0].get()};
++    SetTestStream(NewStream(adp));
++    CObserver observer;
++    testStream->set_observer(&observer);
++    ASSERT_TRUE(testStream->start_stream());
++    const PLAYLIST::CRepresentation* first{testStream->getRepresentation()};
++
++    // The segments of the first representation, up to the change. A read
++    // fails also while the download of the next segment has not started.
++    for (int reads = 0; observer.m_changes == 0; ++reads)
++    {
++      ASSERT_LT(reads, 50);
++      testStream->read(buf, 16);
++      std::this_thread::sleep_for(std::chrono::milliseconds(10));
++    }
++    ASSERT_EQ(observer.m_changes, 1);
++    ASSERT_TRUE(testStream->StreamChanged());
++    ASSERT_NE(testStream->getRepresentation(), first);
++
++    // No data of the new representation before the reopen
++    for (int read = 0; read < 3; ++read)
++      EXPECT_EQ(testStream->read(buf, 16), 0U);
++    EXPECT_EQ(observer.m_changes, 1);
++
++    if (seek)
++    {
++      // The change is still pending after the seek, and the reopen continues
++      // in the segment of the seek time
++      bool needReset{false};
++      ASSERT_TRUE(testStream->seek_time(10.0, true, needReset));
++      EXPECT_EQ(testStream->read(buf, 16), 0U);
++      EXPECT_TRUE(testStream->StreamChanged());
++    }
++    ASSERT_TRUE(testStream->start_stream());
++    EXPECT_FALSE(testStream->StreamChanged());
++    EXPECT_EQ(testStream->read(buf, 16), 16U);
++    if (seek)
++    {
++      const PLAYLIST::CRepresentation* rep{testStream->getRepresentation()};
++      const PLAYLIST::CSegment* segment{rep->current_segment_};
++      ASSERT_NE(segment, nullptr);
++      const double start{static_cast<double>(segment->startPTS_) / rep->GetTimescale()};
++      const double end{static_cast<double>(segment->m_endPts) /
++                       rep->GetTimescale()};
++      EXPECT_LE(start, 10.0);
++      EXPECT_GT(end, 10.0);
++    }
++    testStream->Stop();
++  }
++}
+-- 
+2.47.3
+

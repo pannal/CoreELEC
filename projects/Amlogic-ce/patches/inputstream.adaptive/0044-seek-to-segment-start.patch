@@ -1,0 +1,117 @@
+From 71105e0e83848ea9e1f86e72fd1a3aabec87432f Mon Sep 17 00:00:00 2001
+From: primez <mpincoski@gmail.com>
+Date: Sat, 31 Oct 2026 10:09:03 -0600
+Subject: [PATCH] [AdaptiveStream] Choose the segment of a seek to a segment
+ start
+
+seek_time truncated seek_seconds * timescale. For some segment starts the
+double product is a bit less than the start, for example
+1000.9999999999999 for 1.001 s at timescale 1000, or 89.99999999999999
+for 1 ms at 90 kHz (about 7% of whole milliseconds at 90 kHz). The seek
+then chose the segment before: a TS seek downloaded and scanned one more
+segment, and a preceeding seek continued in the segment before.
+
+The session passes microseconds, so seek_time rounds the seek time to
+microseconds and converts with integers.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ inputstream.adaptive/changelog.txt |  1 +
+ src/common/AdaptiveStream.cpp      |  7 +++-
+ src/test/TestHLSTree.cpp           | 53 ++++++++++++++++++++++++++++++
+ 3 files changed, 60 insertions(+), 1 deletion(-)
+
+diff --git a/inputstream.adaptive/changelog.txt b/inputstream.adaptive/changelog.txt
+index 8323ac3..446f0b8 100644
+--- a/inputstream.adaptive/changelog.txt
++++ b/inputstream.adaptive/changelog.txt
+@@ -8,6 +8,7 @@ v21.5.25-p3i.4 (2026-10-31)
+ - Fix a seek in a TS audio stream that continued at the first frame of the PES instead of at the frame of the seek time
+ - Fix a seek in a TS stream with video and audio that continued at the key frame before the key frame of the seek time
+ - Fix a seek to the time of a key frame, which continued at the next key frame: the seek time in milliseconds came with a float error
++- Fix a seek to the start time of some segments, which chose the segment before: a TS seek downloaded and scanned one more segment, and a seek to the frame at or before the seek time continued in the segment before
+ - Fix a seek to an earlier time inside the current segment, which continued at the start of the segment instead of at the frame of the seek time
+ - Fix a seek in a TS stream with video and audio that returned an audio frame first, so the other streams aligned to the audio time instead of the video frame of the seek
+ - Fix a seek in an HEVC or MPEG-2 TS stream, which continued at the segment start instead of at the key frame of the seek time
+diff --git a/src/common/AdaptiveStream.cpp b/src/common/AdaptiveStream.cpp
+index 96d3d0a..ac5a473 100644
+--- a/src/common/AdaptiveStream.cpp
++++ b/src/common/AdaptiveStream.cpp
+@@ -1232,7 +1232,12 @@ bool AdaptiveStream::seek_time(double seek_seconds, bool preceeding, bool& needR
+ 
+   std::lock_guard<adaptive::AdaptiveTree::TreeUpdateThread> lckUpdTree(m_tree->GetTreeUpdMutex());
+ 
+-  uint64_t sec_in_ts = static_cast<uint64_t>(seek_seconds * current_rep_->GetTimescale());
++  // The seek time has microseconds. Seconds times the timescale can be a bit
++  // less than a segment start, and the seek then chose the segment before.
++  const uint64_t seekUs{static_cast<uint64_t>(std::llround(seek_seconds * STREAM_TIME_BASE))};
++  const uint64_t timescale{current_rep_->GetTimescale()};
++  const uint64_t sec_in_ts{seekUs / STREAM_TIME_BASE * timescale +
++                           seekUs % STREAM_TIME_BASE * timescale / STREAM_TIME_BASE};
+ 
+   //Skip initialization
+   size_t choosen_seg{0};
+diff --git a/src/test/TestHLSTree.cpp b/src/test/TestHLSTree.cpp
+index 67d8ae8..58c4ef8 100644
+--- a/src/test/TestHLSTree.cpp
++++ b/src/test/TestHLSTree.cpp
+@@ -563,3 +563,56 @@ TEST_F(HLSTreeTest, SeekSegmentOfAForwardVideoSeek)
+     hls.Uninitialize();
+   }
+ }
++
++TEST_F(HLSTreeTest, SeekSegmentAtASegmentStart)
++{
++  // Segments of 1.001 s. For some segment starts, the seek time in seconds
++  // times the timescale is a bit less than the start, for example
++  // 1000.9999999999999 for 1.001 s. A seek to a segment start chooses that
++  // segment.
++  for (const bool ts : {true, false})
++  {
++    SCOPED_TRACE(testing::Message() << "TS=" << ts);
++    CSrvBroker::GetInstance()->Init(m_kodiProps);
++    ChildManifestTree hls;
++    hls.Configure(m_reprChooser, {}, "");
++    ASSERT_TRUE(hls.Open("http://foo.bar/master.m3u8", {},
++                         "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,CODECS=\"avc1.4d401f\"\n"
++                         "video.m3u8\n"));
++    auto period = hls.m_periods[0].get();
++    PLAYLIST::CAdaptationSet* adp{nullptr};
++    for (const auto& adpSet : period->GetAdaptationSets())
++    {
++      if (adpSet->GetStreamType() == PLAYLIST::StreamType::VIDEO)
++        adp = adpSet.get();
++    }
++    ASSERT_TRUE(adp);
++    auto rep = adp->GetRepresentations()[0].get();
++    std::string media{"#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n"
++                      "#EXT-X-PLAYLIST-TYPE:VOD\n"};
++    if (!ts)
++      media += "#EXT-X-MAP:URI=\"init.mp4\"\n";
++    for (int segment = 0; segment < 30; ++segment)
++      media += "#EXTINF:1.001,\nseg" + std::to_string(segment) + (ts ? ".ts\n" : ".m4s\n");
++    media += "#EXT-X-ENDLIST\n";
++    ASSERT_EQ(hls.ParseChildManifest(media, "http://foo.bar/video.m3u8", period, adp, rep),
++              adaptive::CHLSTree::ParseStatus::SUCCESS);
++    TestAdaptiveStream stream{&hls, adp, rep};
++    ASSERT_TRUE(stream.start_stream());
++    for (int segment = 1; segment < 30; ++segment)
++    {
++      ASSERT_EQ(rep->Timeline().Get(segment)->startPTS_, segment * uint64_t{1001});
++      for (const bool preceeding : {true, false})
++      {
++        // The session passes microseconds in seconds
++        const double seconds{static_cast<double>(segment * 1001000) / 1000000};
++        SCOPED_TRACE(testing::Message() << "seek=" << seconds << " preceeding=" << preceeding);
++        bool reset{false};
++        ASSERT_TRUE(stream.seek_time(seconds, preceeding, reset));
++        EXPECT_EQ(rep->GetNextSegment(), rep->Timeline().Get(segment));
++      }
++    }
++    stream.Stop();
++    hls.Uninitialize();
++  }
++}
+-- 
+2.47.3
+
