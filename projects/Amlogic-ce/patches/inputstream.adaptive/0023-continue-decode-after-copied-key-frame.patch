@@ -1,0 +1,176 @@
+From 10bffc339009713ac4bd48372cc644e59fcc6c63 Mon Sep 17 00:00:00 2001
+From: primez <mpincoski@gmail.com>
+Date: Sat, 31 Oct 2026 05:27:35 -0600
+Subject: [PATCH] [TSReader] Continue the decode after a copied key frame
+
+A seek to a key frame whose PES starts in the segment before returns a
+copy of that key frame. The read then starts at a later PES, and the lazy
+parser reset at the next unit start made the H.264, HEVC and MPEG-2
+parsers wait for the next key frame. So the frames after the copied key
+frame were dropped up to the next key frame.
+
+ElementaryStream::ContinueDecode() tells the parser that the next reset
+continues a decode. The video parsers then do not wait for a key frame.
+Each reset takes the flag, so a later seek or reset waits again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ inputstream.adaptive/changelog.txt     |  1 +
+ lib/mpegts/mpegts/ES_MPEGVideo.cpp     |  3 +--
+ lib/mpegts/mpegts/ES_h264.cpp          |  2 +-
+ lib/mpegts/mpegts/ES_hevc.cpp          |  2 +-
+ lib/mpegts/mpegts/elementaryStream.cpp |  1 +
+ lib/mpegts/mpegts/elementaryStream.h   |  4 ++++
+ src/demuxers/TSReader.cpp              |  7 +++++++
+ src/test/TestTSReader.cpp              | 10 ++++++----
+ 8 files changed, 22 insertions(+), 8 deletions(-)
+
+diff --git a/inputstream.adaptive/changelog.txt b/inputstream.adaptive/changelog.txt
+index f311bbb..2c7da6a 100644
+--- a/inputstream.adaptive/changelog.txt
++++ b/inputstream.adaptive/changelog.txt
+@@ -19,6 +19,7 @@ v21.5.25-p3i.4 (2026-10-31)
+ - Fix reads past the data, crashes and wrong decoder setups from H.264 and HEVC TS streams with corrupt parameter sets, an H.264 SPS longer than 256 bytes, an HEVC parameter set after a 3 byte start code, or an HEVC VPS in another TS packet than the PPS
+ - Fix a seek in a TS stream to a key frame whose PES starts at the end of the segment before with no frame data or only the first bytes of the frame, which continued at the next key frame
+ - Fix a live seek to a key frame whose PES starts in the segment before, which lost the first audio frame of an audio PES across the two segments while the seek waited for the next segment
++- Fix a seek in a TS stream to a key frame whose PES starts in the segment before, which dropped the frames after that key frame up to the next key frame
+ 
+ v21.5.25-p3i.3 (2026-10-30)
+ - Fix a seek in a live HLS stream that ended the audio when the next audio segment was not available yet
+diff --git a/lib/mpegts/mpegts/ES_MPEGVideo.cpp b/lib/mpegts/mpegts/ES_MPEGVideo.cpp
+index 8497b49..10b1d85 100644
+--- a/lib/mpegts/mpegts/ES_MPEGVideo.cpp
++++ b/lib/mpegts/mpegts/ES_MPEGVideo.cpp
+@@ -130,8 +130,7 @@ void ES_MPEG2Video::Reset()
+ {
+   ElementaryStream::Reset();
+   m_StartCode = 0xffffffff;
+-  m_NeedIFrame = true;
+-  m_NeedSPS = true;
++  m_NeedIFrame = m_NeedSPS = !TakeContinueDecode();
+   m_recoveryPoint = false;
+   m_sequenceHeader = false;
+ }
+diff --git a/lib/mpegts/mpegts/ES_h264.cpp b/lib/mpegts/mpegts/ES_h264.cpp
+index 728a368..e2df8fd 100644
+--- a/lib/mpegts/mpegts/ES_h264.cpp
++++ b/lib/mpegts/mpegts/ES_h264.cpp
+@@ -201,7 +201,7 @@ void ES_h264::Reset()
+   // can use the parameter sets of an earlier picture.
+   m_SPSRawId = -1;
+   m_PPSRawId = -1;
+-  m_NeedIFrame = true;
++  m_NeedIFrame = !TakeContinueDecode();
+   m_recoveryPoint = false;
+   memset(&m_streamData.vcl_nal, 0, sizeof(m_streamData.vcl_nal));
+ }
+diff --git a/lib/mpegts/mpegts/ES_hevc.cpp b/lib/mpegts/mpegts/ES_hevc.cpp
+index 89a1339..f54ef88 100644
+--- a/lib/mpegts/mpegts/ES_hevc.cpp
++++ b/lib/mpegts/mpegts/ES_hevc.cpp
+@@ -128,7 +128,7 @@ void ES_hevc::Reset()
+   // The VPS, SPS and PPS stay valid for the next frames of the stream, as for
+   // the decoder, which has them in the extra data. So after a seek, an IRAP
+   // picture can use the parameter sets of an earlier picture.
+-  m_NeedIRAP = true;
++  m_NeedIRAP = !TakeContinueDecode();
+   m_recoveryPoint = false;
+   memset(&m_streamData.vcl_nal, 0, sizeof(m_streamData.vcl_nal));
+ }
+diff --git a/lib/mpegts/mpegts/elementaryStream.cpp b/lib/mpegts/mpegts/elementaryStream.cpp
+index b8bb4fe..72ecba7 100644
+--- a/lib/mpegts/mpegts/elementaryStream.cpp
++++ b/lib/mpegts/mpegts/elementaryStream.cpp
+@@ -34,6 +34,7 @@ ElementaryStream::ElementaryStream(uint16_t pes_pid)
+   , es_parsed(0)
+   , es_end_of_data(false)
+   , es_skip_to_pts(false)
++  , es_continue_decode(false)
+   , es_pes_start_pending(false)
+   , es_pes_start_position(0)
+   , es_pes_start_segment(0)
+diff --git a/lib/mpegts/mpegts/elementaryStream.h b/lib/mpegts/mpegts/elementaryStream.h
+index b703150..ef92000 100644
+--- a/lib/mpegts/mpegts/elementaryStream.h
++++ b/lib/mpegts/mpegts/elementaryStream.h
+@@ -11,6 +11,7 @@
+ 
+ #include <inttypes.h>
+ #include <cstddef>    // for size_t
++#include <utility>
+ #include <vector>
+ 
+ #define ES_INIT_BUFFER_SIZE     64000
+@@ -103,6 +104,7 @@ namespace TSDemux
+ 
+     bool GetStreamPacket(STREAM_PKT* pkt);
+     bool GetEndPacket(STREAM_PKT* pkt); ///< Like GetStreamPacket(), but the buffer ends with the end of the last frame
++    void ContinueDecode(bool continueDecode) { es_continue_decode = continueDecode; } ///< After the next reset, the frames continue the decode of a key frame that the reader returned
+     virtual void Parse(STREAM_PKT* pkt);
+ 
+     struct PesStart
+@@ -130,6 +132,8 @@ namespace TSDemux
+     size_t es_parsed;             ///< Parser: Last processed position in buffer
+     bool   es_end_of_data;        ///< Parser: In GetEndPacket(), the last frame ends at the end of the buffer
+     bool   es_skip_to_pts;        ///< Parser: The end of the data completed the last frame. The rest of that frame follows up to the next PES with a PTS.
++    bool   es_continue_decode;    ///< Parser: After the next reset, the frames continue a decode
++    bool TakeContinueDecode() { return std::exchange(es_continue_decode, false); } ///< Parser: In Reset(), the frames continue a decode
+     std::vector<PesStart> es_pes_starts; ///< The PES starts in buffer order, the first PES can start before the buffer
+     bool   es_pes_start_pending;
+     uint64_t es_pes_start_position;
+diff --git a/src/demuxers/TSReader.cpp b/src/demuxers/TSReader.cpp
+index 1683352..bc54d66 100644
+--- a/src/demuxers/TSReader.cpp
++++ b/src/demuxers/TSReader.cpp
+@@ -367,6 +367,13 @@ bool TSReader::SeekTime(uint64_t timeInTs, bool preceeding)
+     }
+   }
+   m_AVContext->GoPosition(lastRecovery, true);
++  // The parser does not see a copied key frame, so the frames after the copy
++  // continue the decode of that key frame
++  if (seekFrameIsCopy)
++  {
++    if (TSDemux::ElementaryStream* stream{m_AVContext->GetStream(seekFrame->pid)})
++      stream->ContinueDecode(true);
++  }
+   m_seekFrame = seekFrame;
+ 
+   return true;
+diff --git a/src/test/TestTSReader.cpp b/src/test/TestTSReader.cpp
+index f5e9986..7083aa8 100644
+--- a/src/test/TestTSReader.cpp
++++ b/src/test/TestTSReader.cpp
+@@ -1448,8 +1448,9 @@ TEST_F(TSSampleReaderTest, PtsDiffOfAPesHeaderAcrossTwoSegments)
+ // The last key frame of a segment can continue in the next segment, with a
+ // part of the PES header or with a part of the frame data. The stream cannot
+ // read the previous segment again, but a seek still lands on that key frame,
+-// also when the seek waits for the next live segment. The stream information
+-// stays the same, also when the segment ends in a parameter set.
++// also when the seek waits for the next live segment. The P-frames after that
++// key frame follow. The stream information stays the same, also when the
++// segment ends in a parameter set.
+ TEST_F(TSSampleReaderTest, SeekLandsOnAKeyFrameAcrossTwoSegments)
+ {
+   constexpr int SPLIT_FRAME{SEGMENT_VIDEO_FRAMES - 1};
+@@ -1469,7 +1470,8 @@ TEST_F(TSSampleReaderTest, SeekLandsOnAKeyFrameAcrossTwoSegments)
+     writer.WriteTables(true);
+     std::vector<uint8_t> second{writer.Take()};
+     second.insert(second.end(), split.begin() + 188, split.end());
+-    writer.WriteVideo(SEGMENT_VIDEO_FRAMES, SEGMENT_VIDEO_FRAMES, 5);
++    // P-frames follow the key frame, up to the key frame 20
++    writer.WriteVideo(SEGMENT_VIDEO_FRAMES, SEGMENT_VIDEO_FRAMES, 10);
+     const std::vector<uint8_t> rest{writer.Take()};
+     second.insert(second.end(), rest.begin(), rest.end());
+ 
+@@ -1483,7 +1485,7 @@ TEST_F(TSSampleReaderTest, SeekLandsOnAKeyFrameAcrossTwoSegments)
+                                       << (preceeding ? "" : ", not preceeding")
+                                       << (live ? ", live" : ""));
+       const int landing{preceeding && target < VideoPts(SPLIT_FRAME) ? 10
+-                        : !preceeding && target > VideoPts(SPLIT_FRAME) ? SEGMENT_VIDEO_FRAMES
++                        : !preceeding && target > VideoPts(SPLIT_FRAME) ? 20
+                                                                          : SPLIT_FRAME};
+       // The live seeks read the next segment for the landing frame
+       if (live && landing < SPLIT_FRAME)
+-- 
+2.47.3
+
