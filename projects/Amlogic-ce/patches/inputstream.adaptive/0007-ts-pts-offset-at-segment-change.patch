@@ -1,0 +1,957 @@
+From 21ce83066ecb320e251c0473f76fac10b32a033b Mon Sep 17 00:00:00 2001
+From: primez <mpincoski@gmail.com>
+Date: Sat, 31 Oct 2026 01:49:23 -0600
+Subject: [PATCH 07/12] [TSReader] Take the PTS offset from the first PES of a
+ segment
+
+The TS demuxer emits a PES only when the next PES of the stream starts,
+and the video parser also waits for the start of the next frame. When
+the session sets the PTS offset of a new segment, the reader still
+emits the last frames of the previous segment, and the next emitted
+sample took the offset. The PTS diff was then one PES wrong for audio
+and two frames wrong for video (67 ms at 30 fps) until the next seek.
+The session uses that diff for the elapsed time and to select the
+segment of a seek.
+
+The demuxer now counts the PES headers with a PTS. TSReader records the
+PTS of the first PES header of the segment, of the video if the video
+is enabled, because the audio of a muxed segment can start first. The
+sample reader takes the diff from that PTS.
+
+The demuxer tests share the AdaptiveStream copy and build as one
+executable. Generated TS segments test audio with 1 or 3 frames per
+PES, with and without a PES length, with the next segment present or
+after a wait, and muxed video and audio.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                         |   2 +-
+ inputstream.adaptive/addon.xml.in      |   2 +-
+ inputstream.adaptive/changelog.txt     |   4 +-
+ lib/mpegts/mpegts/elementaryStream.cpp |   1 +
+ lib/mpegts/mpegts/elementaryStream.h   |   1 +
+ lib/mpegts/mpegts/tsDemuxer.cpp        |   2 +
+ src/demuxers/TSReader.cpp              |  49 +++-
+ src/demuxers/TSReader.h                |  15 +
+ src/samplereader/TSSampleReader.cpp    |  13 +-
+ src/samplereader/TSSampleReader.h      |   2 +-
+ src/test/CMakeLists.txt                |  14 +-
+ src/test/TestADTSReader.cpp            | 103 +------
+ src/test/TestAdaptiveStream.cpp        |  49 ++++
+ src/test/TestAdaptiveStream.h          |  78 ++++++
+ src/test/TestTSReader.cpp              | 363 +++++++++++++++++++++++++
+ 15 files changed, 576 insertions(+), 122 deletions(-)
+ create mode 100644 src/test/TestAdaptiveStream.cpp
+ create mode 100644 src/test/TestAdaptiveStream.h
+ create mode 100644 src/test/TestTSReader.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 443d3e7..bc4e6f7 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -83,7 +83,7 @@ if(NOT CMAKE_CROSSCOMPILING AND BUILD_TESTING)
+   add_subdirectory(src/test)
+   if(ENABLE_INTERNAL_BENTO4)
+     add_dependencies(${CMAKE_PROJECT_NAME}_test bento4)
+-    add_dependencies(${CMAKE_PROJECT_NAME}_adts_test bento4)
++    add_dependencies(${CMAKE_PROJECT_NAME}_demuxer_test bento4)
+   endif()
+ endif()
+ 
+diff --git a/inputstream.adaptive/addon.xml.in b/inputstream.adaptive/addon.xml.in
+index 49b4387..c83289e 100644
+--- a/inputstream.adaptive/addon.xml.in
++++ b/inputstream.adaptive/addon.xml.in
+@@ -1,7 +1,7 @@
+ <?xml version="1.0" encoding="UTF-8"?>
+ <addon
+   id="inputstream.adaptive"
+-  version="21.5.25-p3i.3"
++  version="21.5.25-p3i.4"
+   name="InputStream Adaptive"
+   provider-name="peak3d, Team Kodi">
+   <requires>@ADDON_DEPENDS@</requires>
+diff --git a/inputstream.adaptive/changelog.txt b/inputstream.adaptive/changelog.txt
+index 9dec826..540f492 100644
+--- a/inputstream.adaptive/changelog.txt
++++ b/inputstream.adaptive/changelog.txt
+@@ -1,7 +1,9 @@
++v21.5.25-p3i.4 (2026-10-31)
++- Fix the timing offset of HLS audio and TS video after each segment change, which was one or more frames wrong until the next seek
++
+ v21.5.25-p3i.3 (2026-10-30)
+ - Fix a seek in a live HLS stream that ended the audio when the next audio segment was not available yet
+ - Fix the timestamps of 7.1 channel E-AC-3 HLS audio, and send both substreams of a frame as one sample
+-- Fix the timing offset of HLS audio after each segment change, which was one frame wrong until the next seek
+ 
+ v21.5.25-p3i.2 (2026-10-30)
+ - Fix HLS audio starting before video after a seek, which froze the picture on Amlogic
+diff --git a/lib/mpegts/mpegts/elementaryStream.cpp b/lib/mpegts/mpegts/elementaryStream.cpp
+index 5f3b5c3..40c0426 100644
+--- a/lib/mpegts/mpegts/elementaryStream.cpp
++++ b/lib/mpegts/mpegts/elementaryStream.cpp
+@@ -23,6 +23,7 @@ ElementaryStream::ElementaryStream(uint16_t pes_pid)
+   , c_pts(PTS_UNSET)
+   , p_dts(PTS_UNSET)
+   , p_pts(PTS_UNSET)
++  , pes_pts_count(0)
+   , has_stream_info(false)
+   , es_alloc_init(ES_INIT_BUFFER_SIZE)
+   , es_buf(NULL)
+diff --git a/lib/mpegts/mpegts/elementaryStream.h b/lib/mpegts/mpegts/elementaryStream.h
+index 263b262..17a9151 100644
+--- a/lib/mpegts/mpegts/elementaryStream.h
++++ b/lib/mpegts/mpegts/elementaryStream.h
+@@ -94,6 +94,7 @@ namespace TSDemux
+     int64_t c_pts;               ///< current MPEG stream PTS (presentation time for audio and video)
+     int64_t p_dts;               ///< previous MPEG stream DTS (decode time for video)
+     int64_t p_pts;               ///< previous MPEG stream PTS (presentation time for audio and video)
++    uint32_t pes_pts_count;      ///< number of PES headers with a PTS
+ 
+     bool has_stream_info;         ///< true if stream info is completed else it requires parsing of iframe
+ 
+diff --git a/lib/mpegts/mpegts/tsDemuxer.cpp b/lib/mpegts/mpegts/tsDemuxer.cpp
+index 501ec25..d2d36fc 100644
+--- a/lib/mpegts/mpegts/tsDemuxer.cpp
++++ b/lib/mpegts/mpegts/tsDemuxer.cpp
+@@ -1144,6 +1144,7 @@ int AVContext::parse_ts_pes()
+           this->packet->stream->p_dts = this->packet->stream->c_dts;
+           this->packet->stream->p_pts = this->packet->stream->c_pts;
+           this->packet->stream->c_dts = this->packet->stream->c_pts = pts;
++          this->packet->stream->pes_pts_count++;
+         }
+         else
+         {
+@@ -1176,6 +1177,7 @@ int AVContext::parse_ts_pes()
+             this->packet->stream->p_pts = this->packet->stream->c_pts;
+             this->packet->stream->c_dts = dts;
+             this->packet->stream->c_pts = pts;
++            this->packet->stream->pes_pts_count++;
+           }
+         }
+         else
+diff --git a/src/demuxers/TSReader.cpp b/src/demuxers/TSReader.cpp
+index 5584c7a..58832e8 100644
+--- a/src/demuxers/TSReader.cpp
++++ b/src/demuxers/TSReader.cpp
+@@ -208,15 +208,7 @@ bool TSReader::GetInformation(kodi::addon::InputstreamInfo& info)
+ // We assume that m_startpos is the current I-Frame position
+ bool TSReader::SeekTime(uint64_t timeInTs, bool preceeding)
+ {
+-  bool hasVideo(false);
+-  //look if we have video
+-  for (auto &tsInfo : m_streamInfos)
+-    if (tsInfo.m_enabled && tsInfo.m_streamType == INPUTSTREAM_TYPE_VIDEO)
+-    {
+-      hasVideo = true;
+-      break;
+-    }
+-
++  const bool hasVideo{HasVideo()};
+   uint64_t lastRecovery(static_cast<uint64_t>(m_startPos));
+   while (m_pkt.pts == PTS_UNSET || !preceeding || static_cast<uint64_t>(m_pkt.pts) < timeInTs)
+   {
+@@ -284,7 +276,12 @@ bool TSReader::ReadPacket(bool scanStreamInfo)
+ 
+     if (m_AVContext->HasPIDPayload())
+     {
++      const TSDemux::ElementaryStream* stream{m_AVContext->GetPIDStream()};
++      const uint32_t pesPtsCount{stream ? stream->pes_pts_count : 0};
+       status = m_AVContext->ProcessTSPayload();
++      // Take the PTS before the parser of the stream advances the PTS frame by frame
++      if (stream && stream->pes_pts_count != pesPtsCount)
++        UpdateSegmentPts(stream);
+       if (status == TSDemux::AVCONTEXT_PROGRAM_CHANGE)
+       {
+         if (HandleProgramChange())
+@@ -321,6 +318,40 @@ bool TSReader::GetPacket()
+   return false;
+ }
+ 
++bool TSReader::HasVideo() const
++{
++  for (const auto& tsInfo : m_streamInfos)
++  {
++    if (tsInfo.m_enabled && tsInfo.m_streamType == INPUTSTREAM_TYPE_VIDEO)
++      return true;
++  }
++  return false;
++}
++
++void TSReader::MarkSegmentStart()
++{
++  m_segmentPtsPending = true;
++  m_segmentPts = PTS_UNSET;
++}
++
++void TSReader::UpdateSegmentPts(const TSDemux::ElementaryStream* stream)
++{
++  if (!m_segmentPtsPending)
++    return;
++
++  for (const auto& tsInfo : m_streamInfos)
++  {
++    // With video, the audio PES can start before the video PES in some segments
++    if (tsInfo.m_stream == stream && tsInfo.m_enabled &&
++        (tsInfo.m_streamType == INPUTSTREAM_TYPE_VIDEO || !HasVideo()))
++    {
++      m_segmentPts = stream->c_pts;
++      m_segmentPtsPending = false;
++      return;
++    }
++  }
++}
++
+ bool TSReader::HandleProgramChange()
+ {
+   bool ret = true;
+diff --git a/src/demuxers/TSReader.h b/src/demuxers/TSReader.h
+index e919df6..b64fe05 100644
+--- a/src/demuxers/TSReader.h
++++ b/src/demuxers/TSReader.h
+@@ -35,6 +35,17 @@ public:
+   bool GetInformation(kodi::addon::InputstreamInfo& info);
+   bool ReadPacket(bool streamInfo = false);
+ 
++  /*!
++   * \brief Wait for the PTS of the first PES of a new segment.
++   */
++  void MarkSegmentStart();
++  /*!
++   * \brief The PTS of the first PES after MarkSegmentStart(), of the video if
++   *        the video is enabled.
++   * \return The PTS, or PTS_UNSET while the PES is not read yet
++   */
++  uint64_t GetSegmentPts() const { return m_segmentPts; }
++
+   uint64_t GetDts() const { return m_pkt.dts == PTS_UNSET ? PTS_UNSET : m_pkt.dts; }
+   uint64_t GetPts() const { return m_pkt.pts == PTS_UNSET ? PTS_UNSET : m_pkt.pts; }
+   uint64_t GetDuration() const { return m_pkt.duration; }
+@@ -44,6 +55,8 @@ public:
+ 
+ private:
+   bool GetPacket();
++  bool HasVideo() const;
++  void UpdateSegmentPts(const TSDemux::ElementaryStream* stream);
+   bool HandleProgramChange();
+   bool HandleStreamChange(uint16_t pid);
+ 
+@@ -55,6 +68,8 @@ private:
+   AP4_Position m_startPos;
+   uint32_t m_requiredMask;
+   uint32_t m_typeMask;
++  bool m_segmentPtsPending{false};
++  uint64_t m_segmentPts{PTS_UNSET};
+ 
+   struct TSINFO
+   {
+diff --git a/src/samplereader/TSSampleReader.cpp b/src/samplereader/TSSampleReader.cpp
+index e9d4a6e..b26226f 100644
+--- a/src/samplereader/TSSampleReader.cpp
++++ b/src/samplereader/TSSampleReader.cpp
+@@ -84,9 +84,9 @@ AP4_Result CTSSampleReader::ReadSample()
+     m_dts = (GetDts() == PTS_UNSET) ? STREAM_NOPTS_VALUE : (GetDts() * 100) / 9;
+     m_pts = (GetPts() == PTS_UNSET) ? STREAM_NOPTS_VALUE : (GetPts() * 100) / 9;
+ 
+-    if (~m_ptsOffs)
++    if (~m_ptsOffs && GetSegmentPts() != PTS_UNSET)
+     {
+-      m_ptsDiff = m_pts - m_ptsOffs;
++      m_ptsDiff = (GetSegmentPts() * 100) / 9 - m_ptsOffs;
+       m_ptsOffs = ~0ULL;
+     }
+     return AP4_SUCCESS;
+@@ -96,6 +96,15 @@ AP4_Result CTSSampleReader::ReadSample()
+   return AP4_ERROR_EOS;
+ }
+ 
++void CTSSampleReader::SetPTSOffset(uint64_t offset)
++{
++  m_ptsOffs = offset;
++  // The demuxer emits a PES only when the next PES starts. So after a segment
++  // change, the next samples are still from the previous segment, and the
++  // offset applies to the first PES of the new segment.
++  MarkSegmentStart();
++}
++
+ void CTSSampleReader::Reset(bool bEOS)
+ {
+   TSReader::Reset();
+diff --git a/src/samplereader/TSSampleReader.h b/src/samplereader/TSSampleReader.h
+index 8678619..8f1a374 100644
+--- a/src/samplereader/TSSampleReader.h
++++ b/src/samplereader/TSSampleReader.h
+@@ -36,7 +36,7 @@ public:
+     return TSReader::GetInformation(info);
+   }
+   bool TimeSeek(uint64_t pts, bool preceeding) override;
+-  void SetPTSOffset(uint64_t offset) override { m_ptsOffs = offset; }
++  void SetPTSOffset(uint64_t offset) override;
+   int64_t GetPTSDiff() const override { return m_ptsDiff; }
+   uint32_t GetTimeScale() const override { return 90000; }
+   AP4_UI32 GetStreamId() const override { return m_typeMap[GetStreamType()]; }
+diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
+index 7039d58..f14ee6b 100644
+--- a/src/test/CMakeLists.txt
++++ b/src/test/CMakeLists.txt
+@@ -55,18 +55,22 @@ target_link_libraries(${BINARY} PRIVATE ${BENTO4_LIBRARIES} ${PUGIXML_LIBRARIES}
+ set(TEST_DATA_DIR "${CMAKE_SOURCE_DIR}/src/test/manifests")
+ add_test(NAME manifest_tests COMMAND ${BINARY} "${TEST_DATA_DIR}")
+ 
+-# The ADTS reader uses the Kodi headers instead of the test stubs, so the ADTS
++# The demuxers use the Kodi headers instead of the test stubs, so the demuxer
+ # tests build without INPUTSTREAM_TEST_BUILD in a separate executable
+-set(ADTS_BINARY ${CMAKE_PROJECT_NAME}_adts_test)
++set(DEMUXER_BINARY ${CMAKE_PROJECT_NAME}_demuxer_test)
+ 
+-add_executable(${ADTS_BINARY}
++add_executable(${DEMUXER_BINARY}
+     TestMain.cpp
++    TestAdaptiveStream.cpp
+     TestADTSReader.cpp
++    TestTSReader.cpp
+     ../demuxers/ADTSReader.cpp
++    ../demuxers/TSReader.cpp
+     ../parser/CodecParser.cpp
+     ../samplereader/ADTSSampleReader.cpp
++    ../samplereader/TSSampleReader.cpp
+     )
+ 
+-target_link_libraries(${ADTS_BINARY} PRIVATE ${BENTO4_LIBRARIES} ${GTEST_LIBRARIES} Threads::Threads)
++target_link_libraries(${DEMUXER_BINARY} PRIVATE ${BENTO4_LIBRARIES} mpegts ${GTEST_LIBRARIES} Threads::Threads)
+ 
+-add_test(NAME adts_tests COMMAND ${ADTS_BINARY} "${TEST_DATA_DIR}")
++add_test(NAME demuxer_tests COMMAND ${DEMUXER_BINARY} "${TEST_DATA_DIR}")
+diff --git a/src/test/TestADTSReader.cpp b/src/test/TestADTSReader.cpp
+index 63d58a0..d040fbb 100644
+--- a/src/test/TestADTSReader.cpp
++++ b/src/test/TestADTSReader.cpp
+@@ -7,116 +7,15 @@
+  */
+ 
+ #include "AdaptiveByteStream.h"
++#include "TestAdaptiveStream.h"
+ #include "samplereader/ADTSSampleReader.h"
+ 
+-#include <algorithm>
+ #include <cstdint>
+-#include <cstring>
+-#include <deque>
+-#include <functional>
+ #include <memory>
+ #include <vector>
+ 
+ #include <gtest/gtest.h>
+ 
+-// The ADTS tests build without common/AdaptiveStream.cpp. This stream copies
+-// the read, seek and tell rules of AdaptiveStream for downloaded segments: a
+-// read never spans two segments, a seek stays in the current segment, a failed
+-// seek moves only the segment read position, and tell can switch segments.
+-// A switch calls the observer with the segment start time, as
+-// CSession::OnSegmentChanged sets the PTS offset of the sample reader.
+-namespace adaptive
+-{
+-class AdaptiveStream
+-{
+-public:
+-  bool ensureSegment()
+-  {
+-    if (m_segments.size() > 1 && m_segmentReadPos >= m_segments.front().size())
+-    {
+-      m_segments.pop_front();
+-      m_starts.pop_front();
+-      m_segmentReadPos = 0;
+-      m_onSegmentChanged(m_starts.front());
+-    }
+-    return !m_segments.empty() && m_segmentReadPos < m_segments.front().size();
+-  }
+-
+-  uint32_t read(void* buffer, uint32_t bytesToRead)
+-  {
+-    while (ensureSegment() && bytesToRead > 0)
+-    {
+-      const size_t avail{std::min<size_t>(bytesToRead,
+-                                          m_segments.front().size() - m_segmentReadPos)};
+-      m_segmentReadPos += avail;
+-      m_absolutePosition += avail;
+-      if (avail < bytesToRead)
+-        break; // AdaptiveStream drops the bytes of a short read
+-      std::memcpy(buffer, m_segments.front().data() + m_segmentReadPos - avail, avail);
+-      return bytesToRead;
+-    }
+-    return 0;
+-  }
+-
+-  bool seek(uint64_t pos)
+-  {
+-    if (m_segments.empty() || pos < m_absolutePosition - m_segmentReadPos)
+-      return false;
+-    m_segmentReadPos = static_cast<size_t>(pos - (m_absolutePosition - m_segmentReadPos));
+-    if (m_segmentReadPos > m_segments.front().size())
+-    {
+-      m_segmentReadPos = m_segments.front().size();
+-      return false;
+-    }
+-    m_absolutePosition = pos;
+-    return true;
+-  }
+-
+-  std::deque<std::vector<uint8_t>> m_segments; // The current segment first
+-  std::deque<uint64_t> m_starts; // The start time of each segment
+-  std::function<void(uint64_t)> m_onSegmentChanged;
+-  size_t m_segmentReadPos{0};
+-  uint64_t m_absolutePosition{0};
+-  bool m_waitingForSegment{false};
+-};
+-} // namespace adaptive
+-
+-AP4_Result CAdaptiveByteStream::ReadPartial(void* buffer, AP4_Size bytesToRead, AP4_Size& bytesRead)
+-{
+-  bytesRead = m_adStream->read(buffer, bytesToRead);
+-  return bytesRead > 0 ? AP4_SUCCESS : AP4_ERROR_READ_FAILED;
+-}
+-
+-AP4_Result CAdaptiveByteStream::WritePartial(const void* buffer,
+-                                            AP4_Size bytesToWrite,
+-                                            AP4_Size& bytesWritten)
+-{
+-  return AP4_ERROR_NOT_SUPPORTED;
+-}
+-
+-AP4_Result CAdaptiveByteStream::Seek(AP4_Position position)
+-{
+-  return m_adStream->seek(position) ? AP4_SUCCESS : AP4_ERROR_NOT_SUPPORTED;
+-}
+-
+-AP4_Result CAdaptiveByteStream::Tell(AP4_Position& position)
+-{
+-  // AdaptiveStream::tell calls read(0, 0), which can switch to the next segment
+-  m_adStream->ensureSegment();
+-  position = m_adStream->m_absolutePosition;
+-  return AP4_SUCCESS;
+-}
+-
+-AP4_Result CAdaptiveByteStream::GetSize(AP4_LargeSize& size)
+-{
+-  return AP4_ERROR_NOT_SUPPORTED;
+-}
+-
+-bool CAdaptiveByteStream::waitingForSegment() const
+-{
+-  return m_adStream->m_waitingForSegment;
+-}
+-
+ namespace
+ {
+ constexpr uint64_t BASE_PTS = 9000000; // 100 s in 90 kHz ticks
+diff --git a/src/test/TestAdaptiveStream.cpp b/src/test/TestAdaptiveStream.cpp
+new file mode 100644
+index 0000000..31869b7
+--- /dev/null
++++ b/src/test/TestAdaptiveStream.cpp
+@@ -0,0 +1,49 @@
++/*
++ *  Copyright (C) 2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "AdaptiveByteStream.h"
++#include "TestAdaptiveStream.h"
++
++// The add-on entry point defines the Kodi interface, the demuxer tests do not use it
++AddonGlobalInterface* kodi::addon::CPrivateBase::m_interface{nullptr};
++
++AP4_Result CAdaptiveByteStream::ReadPartial(void* buffer, AP4_Size bytesToRead, AP4_Size& bytesRead)
++{
++  bytesRead = m_adStream->read(buffer, bytesToRead);
++  return bytesRead > 0 ? AP4_SUCCESS : AP4_ERROR_READ_FAILED;
++}
++
++AP4_Result CAdaptiveByteStream::WritePartial(const void* buffer,
++                                            AP4_Size bytesToWrite,
++                                            AP4_Size& bytesWritten)
++{
++  return AP4_ERROR_NOT_SUPPORTED;
++}
++
++AP4_Result CAdaptiveByteStream::Seek(AP4_Position position)
++{
++  return m_adStream->seek(position) ? AP4_SUCCESS : AP4_ERROR_NOT_SUPPORTED;
++}
++
++AP4_Result CAdaptiveByteStream::Tell(AP4_Position& position)
++{
++  // AdaptiveStream::tell calls read(0, 0), which can switch to the next segment
++  m_adStream->ensureSegment();
++  position = m_adStream->m_absolutePosition;
++  return AP4_SUCCESS;
++}
++
++AP4_Result CAdaptiveByteStream::GetSize(AP4_LargeSize& size)
++{
++  return AP4_ERROR_NOT_SUPPORTED;
++}
++
++bool CAdaptiveByteStream::waitingForSegment() const
++{
++  return m_adStream->m_waitingForSegment;
++}
+diff --git a/src/test/TestAdaptiveStream.h b/src/test/TestAdaptiveStream.h
+new file mode 100644
+index 0000000..3b4f69e
+--- /dev/null
++++ b/src/test/TestAdaptiveStream.h
+@@ -0,0 +1,78 @@
++/*
++ *  Copyright (C) 2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <algorithm>
++#include <cstdint>
++#include <cstring>
++#include <deque>
++#include <functional>
++#include <vector>
++
++// The demuxer tests build without common/AdaptiveStream.cpp. This stream copies
++// the read, seek and tell rules of AdaptiveStream for downloaded segments: a
++// read never spans two segments, a seek stays in the current segment, a failed
++// seek moves only the segment read position, and tell can switch segments.
++// A switch calls the observer with the segment start time, as
++// CSession::OnSegmentChanged sets the PTS offset of the sample reader.
++namespace adaptive
++{
++class AdaptiveStream
++{
++public:
++  bool ensureSegment()
++  {
++    if (m_segments.size() > 1 && m_segmentReadPos >= m_segments.front().size())
++    {
++      m_segments.pop_front();
++      m_starts.pop_front();
++      m_segmentReadPos = 0;
++      m_onSegmentChanged(m_starts.front());
++    }
++    return !m_segments.empty() && m_segmentReadPos < m_segments.front().size();
++  }
++
++  uint32_t read(void* buffer, uint32_t bytesToRead)
++  {
++    while (ensureSegment() && bytesToRead > 0)
++    {
++      const size_t avail{std::min<size_t>(bytesToRead,
++                                          m_segments.front().size() - m_segmentReadPos)};
++      m_segmentReadPos += avail;
++      m_absolutePosition += avail;
++      if (avail < bytesToRead)
++        break; // AdaptiveStream drops the bytes of a short read
++      std::memcpy(buffer, m_segments.front().data() + m_segmentReadPos - avail, avail);
++      return bytesToRead;
++    }
++    return 0;
++  }
++
++  bool seek(uint64_t pos)
++  {
++    if (m_segments.empty() || pos < m_absolutePosition - m_segmentReadPos)
++      return false;
++    m_segmentReadPos = static_cast<size_t>(pos - (m_absolutePosition - m_segmentReadPos));
++    if (m_segmentReadPos > m_segments.front().size())
++    {
++      m_segmentReadPos = m_segments.front().size();
++      return false;
++    }
++    m_absolutePosition = pos;
++    return true;
++  }
++
++  std::deque<std::vector<uint8_t>> m_segments; // The current segment first
++  std::deque<uint64_t> m_starts; // The start time of each segment
++  std::function<void(uint64_t)> m_onSegmentChanged;
++  size_t m_segmentReadPos{0};
++  uint64_t m_absolutePosition{0};
++  bool m_waitingForSegment{false};
++};
++} // namespace adaptive
+diff --git a/src/test/TestTSReader.cpp b/src/test/TestTSReader.cpp
+new file mode 100644
+index 0000000..b9fee35
+--- /dev/null
++++ b/src/test/TestTSReader.cpp
+@@ -0,0 +1,363 @@
++/*
++ *  Copyright (C) 2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "AdaptiveByteStream.h"
++#include "TestAdaptiveStream.h"
++#include "samplereader/TSSampleReader.h"
++
++#include <algorithm>
++#include <cstdint>
++#include <map>
++#include <memory>
++#include <vector>
++
++#include <gtest/gtest.h>
++
++namespace
++{
++constexpr uint16_t PMT_PID = 0x1000;
++constexpr uint16_t VIDEO_PID = 0x100;
++constexpr uint16_t AUDIO_PID = 0x101;
++constexpr uint32_t VIDEO_ID = 1;
++constexpr uint32_t AUDIO_ID = 2;
++constexpr uint64_t BASE_PTS = 9000000; // 100 s in 90 kHz ticks
++constexpr uint64_t AUDIO_TICKS = 1920; // 1024 samples at 48 kHz
++constexpr uint64_t VIDEO_TICKS = 3840;
++constexpr int SEGMENTS = 3;
++constexpr int SEGMENT_FRAMES = 30; // Audio frames
++constexpr int SEGMENT_VIDEO_FRAMES = 15;
++// The audio of the muxed segments starts before the video
++constexpr uint64_t AUDIO_LEAD = 1000;
++constexpr int64_t DIFF = 5000;
++
++uint64_t AudioPts(int frame)
++{
++  return BASE_PTS + frame * AUDIO_TICKS;
++}
++
++uint64_t VideoPts(int frame)
++{
++  return BASE_PTS + frame * VIDEO_TICKS;
++}
++
++// PTS in the microseconds of the sample reader
++uint64_t Time(uint64_t pts)
++{
++  return pts * 100 / 9;
++}
++
++uint32_t Crc32(const std::vector<uint8_t>& data)
++{
++  uint32_t crc{0xFFFFFFFF};
++  for (const uint8_t byte : data)
++  {
++    crc ^= static_cast<uint32_t>(byte) << 24;
++    for (int bit = 0; bit < 8; ++bit)
++      crc = (crc & 0x80000000) ? (crc << 1) ^ 0x04C11DB7 : crc << 1;
++  }
++  return crc;
++}
++
++// ADTS header: MPEG-4, no CRC, AAC LC, 48 kHz, 2 channels. The last two bytes
++// of each frame hold the frame index.
++std::vector<uint8_t> AacFrame(int index)
++{
++  constexpr unsigned int length{7 + 120};
++  std::vector<uint8_t> frame{0xFF, 0xF1, 0x4C, static_cast<uint8_t>(0x80 | (length >> 11)),
++                             static_cast<uint8_t>(length >> 3),
++                             static_cast<uint8_t>(((length & 7) << 5) | 0x1F), 0xFC};
++  frame.resize(length, 0);
++  frame[length - 2] = static_cast<uint8_t>(index >> 8);
++  frame[length - 1] = static_cast<uint8_t>(index);
++  return frame;
++}
++
++// A 16x16 H.264 IDR access unit: AUD, SPS, PPS and slice
++const std::vector<uint8_t> H264_FRAME{
++    0x00, 0x00, 0x00, 0x01, 0x09, 0x10, 0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xc0,
++    0x0a, 0xdd, 0xec, 0x04, 0x40, 0x00, 0x00, 0x03, 0x00, 0x40, 0x00, 0x00, 0x0f,
++    0x03, 0xc4, 0x89, 0xe0, 0x00, 0x00, 0x00, 0x01, 0x68, 0xce, 0x0f, 0xc8, 0x00,
++    0x00, 0x01, 0x65, 0x88, 0x84, 0x3a, 0x26, 0x28, 0x00, 0x09, 0x02, 0xe0};
++
++// Writes TS packets with continuity counters that continue across segments
++class TSWriter
++{
++public:
++  // The PAT and PMT at the start of each HLS segment
++  void WriteTables(bool video)
++  {
++    WriteSection(0, {0x00, 0xB0, 0x0D, 0x00, 0x01, 0xC1, 0x00, 0x00, 0x00, 0x01,
++                     static_cast<uint8_t>(0xE0 | (PMT_PID >> 8)), static_cast<uint8_t>(PMT_PID)});
++    const uint16_t pcrPid{video ? VIDEO_PID : AUDIO_PID};
++    std::vector<uint8_t> pmt{0x02,
++                             0xB0,
++                             static_cast<uint8_t>(video ? 0x17 : 0x12),
++                             0x00,
++                             0x01,
++                             0xC1,
++                             0x00,
++                             0x00,
++                             static_cast<uint8_t>(0xE0 | (pcrPid >> 8)),
++                             static_cast<uint8_t>(pcrPid),
++                             0xF0,
++                             0x00};
++    if (video)
++      pmt.insert(pmt.end(), {0x1B, static_cast<uint8_t>(0xE0 | (VIDEO_PID >> 8)),
++                             static_cast<uint8_t>(VIDEO_PID), 0xF0, 0x00});
++    pmt.insert(pmt.end(), {0x0F, static_cast<uint8_t>(0xE0 | (AUDIO_PID >> 8)),
++                           static_cast<uint8_t>(AUDIO_PID), 0xF0, 0x00});
++    WriteSection(PMT_PID, pmt);
++  }
++
++  // PES packets of framesPerPes AAC frames. A PES without a length ends only
++  // at the start of the next PES.
++  void WriteAudio(uint64_t firstPts, int firstFrame, int count, int framesPerPes, bool pesLength)
++  {
++    for (int frame = firstFrame; frame < firstFrame + count; frame += framesPerPes)
++    {
++      std::vector<uint8_t> payload;
++      for (int i = frame; i < frame + framesPerPes; ++i)
++      {
++        const std::vector<uint8_t> aac{AacFrame(i)};
++        payload.insert(payload.end(), aac.begin(), aac.end());
++      }
++      WritePes(AUDIO_PID, 0xC0, firstPts + (frame - firstFrame) * AUDIO_TICKS, payload,
++               pesLength);
++    }
++  }
++
++  // One video frame per PES without a length, as HLS segments carry video
++  void WriteVideo(int firstFrame, int count)
++  {
++    for (int frame = firstFrame; frame < firstFrame + count; ++frame)
++      WritePes(VIDEO_PID, 0xE0, VideoPts(frame), H264_FRAME, false);
++  }
++
++  std::vector<uint8_t> Take() { return std::move(m_data); }
++
++private:
++  void WritePacket(uint16_t pid, bool unitStart, const uint8_t* payload, size_t size)
++  {
++    uint8_t packet[188];
++    packet[0] = 0x47;
++    packet[1] = static_cast<uint8_t>((unitStart ? 0x40 : 0) | (pid >> 8));
++    packet[2] = static_cast<uint8_t>(pid);
++    uint8_t& cc{m_continuity[pid]};
++    if (size < 184)
++    {
++      // An adaptation field stuffs the rest of the packet
++      packet[3] = static_cast<uint8_t>(0x30 | cc);
++      packet[4] = static_cast<uint8_t>(183 - size);
++      if (size < 183)
++      {
++        packet[5] = 0;
++        std::fill(packet + 6, packet + 188 - size, 0xFF);
++      }
++    }
++    else
++      packet[3] = static_cast<uint8_t>(0x10 | cc);
++    cc = (cc + 1) & 0x0F;
++    std::copy(payload, payload + size, packet + 188 - size);
++    m_data.insert(m_data.end(), packet, packet + 188);
++  }
++
++  void WriteSection(uint16_t pid, std::vector<uint8_t> section)
++  {
++    const uint32_t crc{Crc32(section)};
++    for (int shift = 24; shift >= 0; shift -= 8)
++      section.push_back(static_cast<uint8_t>(crc >> shift));
++    section.insert(section.begin(), 0); // pointer field
++    WritePacket(pid, true, section.data(), section.size());
++  }
++
++  void WritePes(uint16_t pid,
++                uint8_t streamId,
++                uint64_t pts,
++                const std::vector<uint8_t>& payload,
++                bool pesLength)
++  {
++    const size_t length{pesLength ? 8 + payload.size() : 0};
++    std::vector<uint8_t> pes{0x00,
++                             0x00,
++                             0x01,
++                             streamId,
++                             static_cast<uint8_t>(length >> 8),
++                             static_cast<uint8_t>(length),
++                             0x80,
++                             0x80,
++                             0x05,
++                             static_cast<uint8_t>(0x21 | ((pts >> 29) & 0x0E)),
++                             static_cast<uint8_t>(pts >> 22),
++                             static_cast<uint8_t>(((pts >> 14) & 0xFE) | 1),
++                             static_cast<uint8_t>(pts >> 7),
++                             static_cast<uint8_t>(((pts << 1) & 0xFE) | 1)};
++    pes.insert(pes.end(), payload.begin(), payload.end());
++    for (size_t pos = 0; pos < pes.size(); pos += 184)
++      WritePacket(pid, pos == 0, pes.data() + pos, std::min<size_t>(184, pes.size() - pos));
++  }
++
++  std::vector<uint8_t> m_data;
++  std::map<uint16_t, uint8_t> m_continuity;
++};
++
++class TSSampleReaderTest : public ::testing::Test
++{
++protected:
++  // The session opens the reader, then sets the offset of the first segment
++  void Open(const std::vector<uint8_t>& data, uint64_t segmentStart, INPUTSTREAM_TYPE type)
++  {
++    m_reader.reset();
++    m_segments = std::make_unique<adaptive::AdaptiveStream>();
++    m_segments->m_segments = {data};
++    m_segments->m_starts = {segmentStart};
++    m_segments->m_onSegmentChanged = [this](uint64_t start) { m_reader->SetPTSOffset(start); };
++    m_stream = std::make_unique<CAdaptiveByteStream>(m_segments.get());
++    m_reader = std::make_unique<CTSSampleReader>(
++        m_stream.get(), type, type == INPUTSTREAM_TYPE_VIDEO ? VIDEO_ID : AUDIO_ID, 1U << type);
++    ASSERT_TRUE(m_reader->Initialize(nullptr));
++    m_reader->SetPTSOffset(segmentStart);
++  }
++
++  // The next segment is downloaded
++  void AppendSegment(const std::vector<uint8_t>& data, uint64_t segmentStart)
++  {
++    m_segments->m_segments.push_back(data);
++    m_segments->m_starts.push_back(segmentStart);
++  }
++
++  int FrameIndex() const
++  {
++    const AP4_Byte* data{m_reader->GetSampleData()};
++    const AP4_Size size{m_reader->GetSampleDataSize()};
++    return size < 2 ? -1 : (data[size - 2] << 8) | data[size - 1];
++  }
++
++  std::unique_ptr<adaptive::AdaptiveStream> m_segments;
++  std::unique_ptr<CAdaptiveByteStream> m_stream;
++  std::unique_ptr<CTSSampleReader> m_reader;
++};
++} // namespace
++
++// The demuxer emits a PES only when the next PES starts, so after a segment
++// change the reader still emits the frames of the previous segment. The offset
++// of the new segment must apply to the PTS of the first PES of that segment,
++// not to the next emitted frame.
++TEST_F(TSSampleReaderTest, PtsDiffStaysTheSameAcrossSegments)
++{
++  for (const bool pesLength : {true, false})
++  for (const int framesPerPes : {1, 3})
++  for (const bool late : {false, true})
++  {
++    SCOPED_TRACE(testing::Message() << framesPerPes << " frames per PES"
++                                    << (pesLength ? "" : ", PES without length")
++                                    << (late ? ", next segment after a wait" : ""));
++    TSWriter writer;
++    std::vector<uint8_t> segments[SEGMENTS];
++    uint64_t starts[SEGMENTS];
++    for (int s = 0; s < SEGMENTS; ++s)
++    {
++      writer.WriteTables(false);
++      writer.WriteAudio(AudioPts(s * SEGMENT_FRAMES), s * SEGMENT_FRAMES, SEGMENT_FRAMES,
++                        framesPerPes, pesLength);
++      segments[s] = writer.Take();
++      starts[s] = Time(AudioPts(s * SEGMENT_FRAMES)) - DIFF;
++    }
++    Open(segments[0], starts[0], INPUTSTREAM_TYPE_AUDIO);
++    int appended{1};
++    if (!late)
++    {
++      for (; appended < SEGMENTS; ++appended)
++        AppendSegment(segments[appended], starts[appended]);
++    }
++    m_segments->m_waitingForSegment = late;
++
++    bool started{false};
++    ASSERT_EQ(m_reader->Start(started), AP4_SUCCESS);
++    // The last PES of the stream has no next PES
++    for (int i = 0; i < SEGMENTS * SEGMENT_FRAMES - framesPerPes; ++i)
++    {
++      SCOPED_TRACE(i);
++      if (i > 0)
++      {
++        AP4_Result result{m_reader->ReadSample()};
++        if (late && result == AP4_ERROR_EOS && appended < SEGMENTS)
++        {
++          // The live stream waits for the next segment
++          ASSERT_FALSE(m_reader->EOS());
++          AppendSegment(segments[appended], starts[appended]);
++          m_segments->m_waitingForSegment = ++appended < SEGMENTS;
++          result = m_reader->ReadSample();
++        }
++        ASSERT_EQ(result, AP4_SUCCESS);
++      }
++      EXPECT_EQ(FrameIndex(), i);
++      EXPECT_EQ(m_reader->PTS(), Time(AudioPts(i)));
++      EXPECT_EQ(m_reader->GetPTSDiff(), DIFF);
++    }
++  }
++}
++
++// The segments of the video set the offset. The audio of a segment can start
++// before the video, and the diff must not change to the audio start.
++TEST_F(TSSampleReaderTest, PtsDiffFollowsTheVideoOfMuxedSegments)
++{
++  TSWriter writer;
++  std::vector<uint8_t> segments[SEGMENTS];
++  uint64_t starts[SEGMENTS];
++  for (int s = 0; s < SEGMENTS; ++s)
++  {
++    writer.WriteTables(true);
++    // A muxer interleaves the PES packets by PTS
++    int audio{s * SEGMENT_FRAMES};
++    int video{s * SEGMENT_VIDEO_FRAMES};
++    while (audio < (s + 1) * SEGMENT_FRAMES || video < (s + 1) * SEGMENT_VIDEO_FRAMES)
++    {
++      if (video == (s + 1) * SEGMENT_VIDEO_FRAMES ||
++          (audio < (s + 1) * SEGMENT_FRAMES && AudioPts(audio) - AUDIO_LEAD <= VideoPts(video)))
++      {
++        writer.WriteAudio(AudioPts(audio) - AUDIO_LEAD, audio, 3, 3, false);
++        audio += 3;
++      }
++      else
++        writer.WriteVideo(video++, 1);
++    }
++    segments[s] = writer.Take();
++    starts[s] = Time(VideoPts(s * SEGMENT_VIDEO_FRAMES)) - DIFF;
++  }
++  Open(segments[0], starts[0], INPUTSTREAM_TYPE_VIDEO);
++  for (int s = 1; s < SEGMENTS; ++s)
++    AppendSegment(segments[s], starts[s]);
++  m_reader->AddStreamType(INPUTSTREAM_TYPE_AUDIO, AUDIO_ID);
++
++  bool started{false};
++  ASSERT_EQ(m_reader->Start(started), AP4_SUCCESS);
++  int video{0};
++  int audio{0};
++  do
++  {
++    if (m_reader->GetStreamId() == VIDEO_ID)
++    {
++      SCOPED_TRACE(testing::Message() << "video frame " << video);
++      EXPECT_EQ(m_reader->PTS(), Time(VideoPts(video)));
++      ++video;
++    }
++    else
++    {
++      SCOPED_TRACE(testing::Message() << "audio frame " << audio);
++      EXPECT_EQ(FrameIndex(), audio);
++      EXPECT_EQ(m_reader->PTS(), Time(AudioPts(audio) - AUDIO_LEAD));
++      ++audio;
++    }
++    EXPECT_EQ(m_reader->GetPTSDiff(), DIFF);
++  } while (AP4_SUCCEEDED(m_reader->ReadSample()));
++
++  // The last PES of each stream has no next PES. The video parser also waits
++  // for the start of the next frame.
++  EXPECT_EQ(video, SEGMENTS * SEGMENT_VIDEO_FRAMES - 2);
++  EXPECT_EQ(audio, SEGMENTS * SEGMENT_FRAMES - 3);
++}
+-- 
+2.47.3
+

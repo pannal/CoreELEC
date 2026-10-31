@@ -1,0 +1,104 @@
+From e63e00966e4ba03b33785a6e7bf1c3506b372816 Mon Sep 17 00:00:00 2001
+From: primez <mpincoski@gmail.com>
+Date: Sat, 31 Oct 2026 06:38:00 -0600
+Subject: [PATCH] [mpegts] Skip an ADTS header with a frame length shorter than
+ the header
+
+A corrupt ADTS header with a frame length of 0 gave a frame without data
+that did not consume the buffer, so the parser returned the same empty
+frame forever. A length shorter than the header gave a corrupt frame.
+
+The parser now skips such a header and searches for the next one, as the
+AC-3 and MPEG audio parsers do for their invalid headers.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ inputstream.adaptive/changelog.txt |  1 +
+ lib/mpegts/mpegts/ES_AAC.cpp       |  3 +++
+ src/test/TestTSReader.cpp          | 37 ++++++++++++++++++++++++++++++
+ 3 files changed, 41 insertions(+)
+
+diff --git a/inputstream.adaptive/changelog.txt b/inputstream.adaptive/changelog.txt
+index 967e1bc..49ea585 100644
+--- a/inputstream.adaptive/changelog.txt
++++ b/inputstream.adaptive/changelog.txt
+@@ -24,6 +24,7 @@ v21.5.25-p3i.4 (2026-10-31)
+ - Fix the last frame of a TS segment or stream whose parameter sets came in a PES of their own, which was read as two frames
+ - Fix a seek in a TS stream to a key frame whose picture PES starts in the next segment, which returned that key frame twice
+ - Fix a live seek in a TS stream that waited more than once for the next segment, which lost audio frames of an audio PES across the two segments
++- Fix a TS AAC stream with a corrupt ADTS header whose frame length is shorter than the header, which stopped the playback in an endless loop or sent a corrupt frame
+ - Fix the segment times of HLS streams with EXTINF durations finer than 1 ms, which drifted from the media time (0.24 s after one hour of a YouTube stream), so a seek near a segment start could continue at the next segment
+ 
+ v21.5.25-p3i.3 (2026-10-30)
+diff --git a/lib/mpegts/mpegts/ES_AAC.cpp b/lib/mpegts/mpegts/ES_AAC.cpp
+index 3f98100..17717e0 100644
+--- a/lib/mpegts/mpegts/ES_AAC.cpp
++++ b/lib/mpegts/mpegts/ES_AAC.cpp
+@@ -147,6 +147,9 @@ int ES_AAC::FindHeaders(uint8_t *buf, int buf_size)
+       bs.skipBits(4);
+ 
+       m_FrameSize = bs.readBits(13);
++      // The frame length includes the header, a shorter length is corrupt
++      if (m_FrameSize < (noCrc ? 7 : 9))
++        return 0;
+       m_SampleRate    = aac_sample_rates[SampleRateIndex & 0x0F];
+ 
+       es_found_frame = true;
+diff --git a/src/test/TestTSReader.cpp b/src/test/TestTSReader.cpp
+index 5717d52..ca11b19 100644
+--- a/src/test/TestTSReader.cpp
++++ b/src/test/TestTSReader.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include "AdaptiveByteStream.h"
+ #include "TestAdaptiveStream.h"
++#include "mpegts/ES_AAC.h"
+ #include "mpegts/ES_MPEGVideo.h"
+ #include "mpegts/ES_h264.h"
+ #include "mpegts/ES_hevc.h"
+@@ -874,6 +875,42 @@ TEST(TSParserTest, TheRestOfACopiedLastFrameIsDropped)
+   }
+ }
+ 
++// A corrupt ADTS header can give a frame length shorter than the header. The
++// parser skips that header and finds the next frames.
++TEST(TSParserTest, AnAdtsFrameShorterThanItsHeaderIsSkipped)
++{
++  // The length of a header without a CRC, and of a header with a CRC
++  for (const auto& [protectionAbsent, length] :
++       {std::pair{true, 0U}, std::pair{true, 6U}, std::pair{false, 8U}})
++  {
++    SCOPED_TRACE(testing::Message() << "length " << length << (protectionAbsent ? "" : ", CRC"));
++    std::vector<uint8_t> data{AacFrame(0)};
++    std::vector<uint8_t> corrupt{AacFrame(1)};
++    corrupt[1] = protectionAbsent ? 0xF1 : 0xF0;
++    corrupt[3] = static_cast<uint8_t>(0x80 | (length >> 11));
++    corrupt[4] = static_cast<uint8_t>(length >> 3);
++    corrupt[5] = static_cast<uint8_t>(((length & 7) << 5) | 0x1F);
++    corrupt.resize(9);
++    data.insert(data.end(), corrupt.begin(), corrupt.end());
++    for (int i = 2; i < 4; ++i)
++    {
++      const std::vector<uint8_t> frame{AacFrame(i)};
++      data.insert(data.end(), frame.begin(), frame.end());
++    }
++    TSDemux::ES_AAC stream{AUDIO_PID};
++    stream.stream_type = TSDemux::STREAM_TYPE_AUDIO_AAC;
++    stream.c_pts = stream.c_dts = 90000;
++    stream.StartPes(0, 0);
++    stream.Append(data.data(), data.size(), true);
++    std::vector<int> read;
++    TSDemux::STREAM_PKT pkt;
++    // A frame without data would come again and again
++    for (int packets = 0; packets < 10 && stream.GetStreamPacket(&pkt); ++packets)
++      read.push_back(pkt.size ? (pkt.data[pkt.size - 2] << 8) | pkt.data[pkt.size - 1] : -1);
++    EXPECT_EQ(read, (std::vector<int>{0, 2, 3}));
++  }
++}
++
+ TEST(TSParserTest, TheExtraDataHasTheParameterSetsAfter3ByteStartCodes)
+ {
+   const auto shortStartCodes = [](const std::vector<uint8_t>& au) {
+-- 
+2.47.3
+

@@ -1,0 +1,602 @@
+From fe530549a3205ce6f3505bb5e9f025508f8f06c7 Mon Sep 17 00:00:00 2001
+From: primez <mpincoski@gmail.com>
+Date: Sat, 31 Oct 2026 06:02:48 -0600
+Subject: [PATCH] [mpegts] Take the timestamps of a frame from the PES where
+ the frame starts
+
+The parsers took the PTS of a frame from the last two PES headers at the
+time of the parse. The parse of a frame can wait for the next PES: HEVC
+parses a NAL unit at the next start code, the parsers do not scan the
+last 3 bytes of the data, and an audio frame header can span two PES.
+When a short PES, as an access unit delimiter or the parameter sets in a
+PES of their own (GStreamer), came before, the frame took the PTS of the
+next frame.
+
+Each PES start now keeps the PTS and DTS of its data. A video frame takes
+the timestamps of the PES where its first picture starts, and the
+duration from the DTS of the PES of the next frame (else the last
+duration). An audio frame takes the PTS of its PES if the frame is the
+first frame that starts in that PES, else the PTS of the frame before
+plus the frame duration.
+
+At the end of the data, the last frame ends at the first PES with a PTS
+after its first picture, so a PES with the parameter sets before the
+picture belongs to the frame. es_pts_pointer is no longer used.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ inputstream.adaptive/changelog.txt     |   2 +
+ lib/mpegts/mpegts/ES_AAC.cpp           |   8 +-
+ lib/mpegts/mpegts/ES_AC3.cpp           |   4 +-
+ lib/mpegts/mpegts/ES_MPEGAudio.cpp     |   4 +-
+ lib/mpegts/mpegts/ES_MPEGVideo.cpp     |  17 ++--
+ lib/mpegts/mpegts/ES_h264.cpp          |  23 ++---
+ lib/mpegts/mpegts/ES_hevc.cpp          |  24 ++----
+ lib/mpegts/mpegts/elementaryStream.cpp |  76 ++++++++++++-----
+ lib/mpegts/mpegts/elementaryStream.h   |  13 ++-
+ src/test/TestTSReader.cpp              | 111 ++++++++++++++++++++++++-
+ 10 files changed, 203 insertions(+), 79 deletions(-)
+
+diff --git a/inputstream.adaptive/changelog.txt b/inputstream.adaptive/changelog.txt
+index 2c7da6a..8f655f2 100644
+--- a/inputstream.adaptive/changelog.txt
++++ b/inputstream.adaptive/changelog.txt
+@@ -20,6 +20,8 @@ v21.5.25-p3i.4 (2026-10-31)
+ - Fix a seek in a TS stream to a key frame whose PES starts at the end of the segment before with no frame data or only the first bytes of the frame, which continued at the next key frame
+ - Fix a live seek to a key frame whose PES starts in the segment before, which lost the first audio frame of an audio PES across the two segments while the seek waited for the next segment
+ - Fix a seek in a TS stream to a key frame whose PES starts in the segment before, which dropped the frames after that key frame up to the next key frame
++- Fix the timestamps of TS video and audio frames that the parser read only after the next PES started, which took the PTS of the next frame, as with HEVC access unit delimiters or parameter sets in a PES of their own, or with an audio frame header across two PES
++- Fix the last frame of a TS segment or stream whose parameter sets came in a PES of their own, which was read as two frames
+ 
+ v21.5.25-p3i.3 (2026-10-30)
+ - Fix a seek in a live HLS stream that ended the audio when the next audio segment was not available yet
+diff --git a/lib/mpegts/mpegts/ES_AAC.cpp b/lib/mpegts/mpegts/ES_AAC.cpp
+index 995da12..3f98100 100644
+--- a/lib/mpegts/mpegts/ES_AAC.cpp
++++ b/lib/mpegts/mpegts/ES_AAC.cpp
+@@ -100,9 +100,7 @@ int ES_AAC::FindHeaders(uint8_t *buf, int buf_size)
+         return 0;
+ 
+       es_found_frame = true;
+-      m_DTS = c_pts;
+-      m_PTS = c_pts;
+-      c_pts += 90000 * 1024 / (!m_SampleRate ? aac_sample_rates[4] : m_SampleRate);
++      m_DTS = m_PTS = AudioFramePts(buf_ptr - es_buf, 90000 * 1024 / (!m_SampleRate ? aac_sample_rates[4] : m_SampleRate));
+       return -1;
+     }
+   }
+@@ -152,9 +150,7 @@ int ES_AAC::FindHeaders(uint8_t *buf, int buf_size)
+       m_SampleRate    = aac_sample_rates[SampleRateIndex & 0x0F];
+ 
+       es_found_frame = true;
+-      m_DTS = c_pts;
+-      m_PTS = c_pts;
+-      c_pts += 90000 * 1024 / (!m_SampleRate ? aac_sample_rates[4] : m_SampleRate);
++      m_DTS = m_PTS = AudioFramePts(buf_ptr - es_buf, 90000 * 1024 / (!m_SampleRate ? aac_sample_rates[4] : m_SampleRate));
+       return -1;
+     }
+   }
+diff --git a/lib/mpegts/mpegts/ES_AC3.cpp b/lib/mpegts/mpegts/ES_AC3.cpp
+index 9dea2e7..297b7d3 100644
+--- a/lib/mpegts/mpegts/ES_AC3.cpp
++++ b/lib/mpegts/mpegts/ES_AC3.cpp
+@@ -224,9 +224,7 @@ int ES_AC3::FindHeaders(uint8_t *buf, int buf_size)
+       m_Channels = AC3ChannelsTable[channelMode] + lfeon;
+     }
+     es_found_frame = true;
+-    m_DTS = c_pts;
+-    m_PTS = c_pts;
+-    c_pts += 90000 * 1536 / m_SampleRate;
++    m_DTS = m_PTS = AudioFramePts(buf - es_buf, 90000 * 1536 / m_SampleRate);
+     return -1;
+   }
+   return 0;
+diff --git a/lib/mpegts/mpegts/ES_MPEGAudio.cpp b/lib/mpegts/mpegts/ES_MPEGAudio.cpp
+index 97556a2..c20f260 100644
+--- a/lib/mpegts/mpegts/ES_MPEGAudio.cpp
++++ b/lib/mpegts/mpegts/ES_MPEGAudio.cpp
+@@ -123,9 +123,7 @@ int ES_MPEG2Audio::FindHeaders(uint8_t *buf, int buf_size)
+       m_FrameSize = 144 * m_BitRate / m_SampleRate + padding;
+ 
+     es_found_frame = true;
+-    m_DTS = c_pts;
+-    m_PTS = c_pts;
+-    c_pts += 90000 * 1152 / m_SampleRate;
++    m_DTS = m_PTS = AudioFramePts(buf - es_buf, 90000 * 1152 / m_SampleRate);
+     return -1;
+   }
+   return 0;
+diff --git a/lib/mpegts/mpegts/ES_MPEGVideo.cpp b/lib/mpegts/mpegts/ES_MPEGVideo.cpp
+index 10b1d85..7a68485 100644
+--- a/lib/mpegts/mpegts/ES_MPEGVideo.cpp
++++ b/lib/mpegts/mpegts/ES_MPEGVideo.cpp
+@@ -88,7 +88,7 @@ void ES_MPEG2Video::Parse(STREAM_PKT *pkt)
+   if (!frameComplete && es_end_of_data && es_found_frame)
+   {
+     frameComplete = true;
+-    EndLastFrame(frame_ptr);
++    EndLastFrame();
+   }
+ 
+   if (frameComplete)
+@@ -146,6 +146,8 @@ int ES_MPEG2Video::Parse_MPEG2Video(uint32_t startcode, int buf_ptr, bool &compl
+   {
+     if (m_NeedSPS)
+     {
++      if (!es_found_frame)
++        StartPicture(buf_ptr - 4);
+       es_found_frame = true;
+       return 0;
+     }
+@@ -163,16 +165,9 @@ int ES_MPEG2Video::Parse_MPEG2Video(uint32_t startcode, int buf_ptr, bool &compl
+     if (!es_found_frame)
+     {
+       m_AuPrevDTS = m_AuDTS;
+-      if (buf_ptr - 4 >= (int)es_pts_pointer)
+-      {
+-        m_AuDTS = c_dts != PTS_UNSET ? c_dts : c_pts;
+-        m_AuPTS = c_pts;
+-      }
+-      else
+-      {
+-        m_AuDTS = p_dts != PTS_UNSET ? p_dts : p_pts;
+-        m_AuPTS = p_pts;
+-      }
++      const PesStart* pes = StartPicture(buf_ptr - 4);
++      m_AuPTS = pes ? pes->pts : PTS_UNSET;
++      m_AuDTS = pes && pes->dts != PTS_UNSET ? pes->dts : m_AuPTS;
+     }
+     if (m_AuPrevDTS == m_AuDTS)
+     {
+diff --git a/lib/mpegts/mpegts/ES_h264.cpp b/lib/mpegts/mpegts/ES_h264.cpp
+index e2df8fd..a3366be 100644
+--- a/lib/mpegts/mpegts/ES_h264.cpp
++++ b/lib/mpegts/mpegts/ES_h264.cpp
+@@ -141,7 +141,7 @@ void ES_h264::Parse(STREAM_PKT* pkt)
+   if (!frameComplete && es_end_of_data && es_found_frame)
+   {
+     frameComplete = true;
+-    EndLastFrame(frame_ptr);
++    EndLastFrame();
+   }
+ 
+   if (frameComplete)
+@@ -153,11 +153,7 @@ void ES_h264::Parse(STREAM_PKT* pkt)
+       DBG(DEMUX_DBG_PARSE, "H.264 SPS: PAR %i:%i\n", m_PixelAspect.num, m_PixelAspect.den);
+       DBG(DEMUX_DBG_PARSE, "H.264 SPS: DAR %.2f\n", DAR);
+ 
+-      uint64_t duration;
+-      if (c_dts != PTS_UNSET && p_dts != PTS_UNSET && c_dts > p_dts)
+-        duration = c_dts - p_dts;
+-      else
+-        duration = stream_info.fps_scale;
++      const uint64_t duration = FrameDuration(m_DTS, stream_info.fps_scale);
+ 
+       pkt->pid            = pid;
+       pkt->size           = es_consumed - frame_ptr;
+@@ -221,6 +217,8 @@ int ES_h264::Parse_H264(uint32_t startcode, int buf_ptr, bool &complete)
+   {
+     if (m_NeedSPS || m_NeedPPS)
+     {
++      if (!es_found_frame)
++        StartPicture(buf_ptr - 4);
+       es_found_frame = true;
+       return 0;
+     }
+@@ -244,16 +242,9 @@ int ES_h264::Parse_H264(uint32_t startcode, int buf_ptr, bool &complete)
+ 
+     if (!es_found_frame)
+     {
+-      if (buf_ptr - 4 >= (int)es_pts_pointer)
+-      {
+-        m_DTS = c_dts;
+-        m_PTS = c_pts;
+-      }
+-      else
+-      {
+-        m_DTS = p_dts;
+-        m_PTS = p_pts;
+-      }
++      const PesStart* pes = StartPicture(buf_ptr - 4);
++      m_DTS = pes ? pes->dts : PTS_UNSET;
++      m_PTS = pes ? pes->pts : PTS_UNSET;
+     }
+ 
+     m_streamData.vcl_nal = vcl;
+diff --git a/lib/mpegts/mpegts/ES_hevc.cpp b/lib/mpegts/mpegts/ES_hevc.cpp
+index f54ef88..9ddb9ba 100644
+--- a/lib/mpegts/mpegts/ES_hevc.cpp
++++ b/lib/mpegts/mpegts/ES_hevc.cpp
+@@ -75,7 +75,7 @@ void ES_hevc::Parse(STREAM_PKT* pkt)
+     if (!frameComplete && es_found_frame)
+     {
+       frameComplete = true;
+-      EndLastFrame(frame_ptr);
++      EndLastFrame();
+     }
+   }
+ 
+@@ -88,11 +88,8 @@ void ES_hevc::Parse(STREAM_PKT* pkt)
+       DBG(DEMUX_DBG_DEBUG, "HEVC SPS: PAR %i:%i\n", m_PixelAspect.num, m_PixelAspect.den);
+       DBG(DEMUX_DBG_DEBUG, "HEVC SPS: DAR %.2f\n", DAR);
+ 
+-      uint64_t duration;
+-      if (c_dts != PTS_UNSET && p_dts != PTS_UNSET && c_dts > p_dts)
+-        duration = c_dts - p_dts;
+-      else
+-        duration = static_cast<int>(Rescale(20000, PTS_TIME_BASE, RESCALE_TIME_BASE));
++      const uint64_t duration = FrameDuration(
++          m_DTS, static_cast<int>(Rescale(20000, PTS_TIME_BASE, RESCALE_TIME_BASE)));
+ 
+       bool streamChange = false;
+       if (es_frame_valid)
+@@ -157,6 +154,8 @@ void ES_hevc::Parse_HEVC(int buf_ptr, unsigned int NumBytesInNalUnit, bool &comp
+   {
+     if (m_NeedSPS || m_NeedPPS)
+     {
++      if (!es_found_frame)
++        StartPicture(buf_ptr - 3);
+       es_found_frame = true;
+       return;
+     }
+@@ -178,16 +177,9 @@ void ES_hevc::Parse_HEVC(int buf_ptr, unsigned int NumBytesInNalUnit, bool &comp
+       m_recoveryPoint = hdr.nal_unit_type >= NAL_BLA_W_LP;
+       if (m_recoveryPoint)
+         m_NeedIRAP = false;
+-      if (buf_ptr - 3 >= (int)es_pts_pointer)
+-      {
+-        m_DTS = c_dts;
+-        m_PTS = c_pts;
+-      }
+-      else
+-      {
+-        m_DTS = p_dts;
+-        m_PTS = p_pts;
+-      }
++      const PesStart* pes = StartPicture(buf_ptr - 3);
++      m_DTS = pes ? pes->dts : PTS_UNSET;
++      m_PTS = pes ? pes->pts : PTS_UNSET;
+     }
+ 
+     m_streamData.vcl_nal = vcl;
+diff --git a/lib/mpegts/mpegts/elementaryStream.cpp b/lib/mpegts/mpegts/elementaryStream.cpp
+index 72ecba7..b093500 100644
+--- a/lib/mpegts/mpegts/elementaryStream.cpp
++++ b/lib/mpegts/mpegts/elementaryStream.cpp
+@@ -30,7 +30,6 @@ ElementaryStream::ElementaryStream(uint16_t pes_pid)
+   , es_alloc(0)
+   , es_len(0)
+   , es_consumed(0)
+-  , es_pts_pointer(0)
+   , es_parsed(0)
+   , es_end_of_data(false)
+   , es_skip_to_pts(false)
+@@ -39,6 +38,10 @@ ElementaryStream::ElementaryStream(uint16_t pes_pid)
+   , es_pes_start_position(0)
+   , es_pes_start_segment(0)
+   , es_found_frame(false)
++  , es_picture_start(0)
++  , es_frame_duration(0)
++  , es_pts_position(UINT64_MAX)
++  , es_next_pts(PTS_UNSET)
+   , es_frame_valid(false)
+   , es_extraDataChanged(false)
+ {
+@@ -61,12 +64,14 @@ void ElementaryStream::Reset(void)
+   es_found_frame = false;
+   es_frame_valid = false;
+   es_skip_to_pts = false;
++  es_pts_position = UINT64_MAX;
++  es_next_pts = PTS_UNSET;
+ }
+ 
+ void ElementaryStream::ClearBuffer()
+ {
+   ShiftPesStarts(es_len);
+-  es_len = es_consumed = es_pts_pointer = es_parsed = 0;
++  es_len = es_consumed = es_parsed = 0;
+ }
+ 
+ void ElementaryStream::StartPes(uint64_t position, uint32_t segment)
+@@ -90,18 +95,55 @@ const ElementaryStream::PesStart* ElementaryStream::GetPesStart(const unsigned c
+   return NULL;
+ }
+ 
+-void ElementaryStream::EndLastFrame(size_t frameStart)
++const ElementaryStream::PesStart* ElementaryStream::StartPicture(size_t offset)
++{
++  es_picture_start = offset - es_consumed;
++  return GetPesStart(es_buf + offset);
++}
++
++uint64_t ElementaryStream::FrameDuration(int64_t dts, uint64_t fallback)
++{
++  // The next frame starts at es_consumed. Without the DTS of the next frame,
++  // as for the last frame of the data, the frame takes the last duration.
++  const PesStart* next = GetPesStart(es_buf + es_consumed);
++  if (next && next->dts != PTS_UNSET && dts != PTS_UNSET && next->dts > dts)
++    es_frame_duration = next->dts - dts;
++  return es_frame_duration ? es_frame_duration : fallback;
++}
++
++int64_t ElementaryStream::AudioFramePts(size_t offset, int64_t duration)
++{
++  // The PTS of a PES belongs to the first frame that starts in the PES. Each
++  // later frame follows the frame before.
++  const PesStart* pes = GetPesStart(es_buf + offset);
++  if (pes && pes->timestamped && pes->position != es_pts_position)
++  {
++    es_pts_position = pes->position;
++    es_next_pts = pes->pts;
++  }
++  const int64_t pts = es_next_pts;
++  if (es_next_pts != PTS_UNSET)
++    es_next_pts += duration;
++  return pts;
++}
++
++void ElementaryStream::EndLastFrame()
+ {
+   // The PTS of a PES belongs to the first frame that starts in the PES, and
+-  // HLS puts each video frame in its own PES. So a later PES with a PTS starts
+-  // the next frame, and the next data continues that frame.
+-  if (es_pts_pointer > frameStart)
+-    es_consumed = es_pts_pointer;
+-  else
++  // the picture of a frame starts in one PES. So a later PES with a PTS starts
++  // the next frame, and the next data continues that frame. A PES with a PTS
++  // before the picture, as with the parameter sets, belongs to the frame.
++  const size_t picture = es_consumed + es_picture_start;
++  for (const PesStart& pes : es_pes_starts)
+   {
+-    es_consumed = es_len;
+-    es_skip_to_pts = true;
++    if (pes.timestamped && pes.offset > picture)
++    {
++      es_consumed = pes.offset;
++      return;
++    }
+   }
++  es_consumed = es_len;
++  es_skip_to_pts = true;
+ }
+ 
+ bool ElementaryStream::AppendExtraData(const uint8_t* nal, size_t size)
+@@ -144,10 +186,6 @@ int ElementaryStream::Append(const unsigned char* buf, size_t len, bool new_pts)
+     es_skip_to_pts = false;
+   }
+ 
+-  // Mark position where current pts become applicable
+-  if (new_pts)
+-    es_pts_pointer = es_len;
+-
+   if (es_buf && es_consumed)
+   {
+     if (es_consumed < es_len)
+@@ -155,10 +193,6 @@ int ElementaryStream::Append(const unsigned char* buf, size_t len, bool new_pts)
+       memmove(es_buf, es_buf + es_consumed, es_len - es_consumed);
+       es_len -= es_consumed;
+       es_parsed -= es_consumed;
+-      if (es_pts_pointer > es_consumed)
+-        es_pts_pointer -= es_consumed;
+-      else
+-        es_pts_pointer = 0;
+       ShiftPesStarts(es_consumed);
+ 
+       es_consumed = 0;
+@@ -197,10 +231,12 @@ int ElementaryStream::Append(const unsigned char* buf, size_t len, bool new_pts)
+   if (es_pes_start_pending)
+   {
+     es_pes_start_pending = false;
++    // The data of a PES without a PTS has the timestamps of the PES before
++    PesStart start{es_len, es_pes_start_position, es_pes_start_segment, new_pts, c_pts, c_dts};
+     if (!es_pes_starts.empty() && es_pes_starts.back().offset == es_len)
+-      es_pes_starts.back() = {es_len, es_pes_start_position, es_pes_start_segment};
++      es_pes_starts.back() = start;
+     else
+-      es_pes_starts.push_back({es_len, es_pes_start_position, es_pes_start_segment});
++      es_pes_starts.push_back(start);
+   }
+ 
+   memcpy(es_buf + es_len, buf, len);
+diff --git a/lib/mpegts/mpegts/elementaryStream.h b/lib/mpegts/mpegts/elementaryStream.h
+index ef92000..2755687 100644
+--- a/lib/mpegts/mpegts/elementaryStream.h
++++ b/lib/mpegts/mpegts/elementaryStream.h
+@@ -112,6 +112,9 @@ namespace TSDemux
+       size_t offset;              ///< Position in buffer where the PES data starts
+       uint64_t position;          ///< Stream position of the PES
+       uint32_t segment;           ///< Media segment of the PES
++      bool timestamped;           ///< The PES has a PTS
++      int64_t pts;                ///< The PTS of the PES data: of the PES, or of the last PES with a PTS before
++      int64_t dts;                ///< The DTS of the PES data
+     };
+     void StartPes(uint64_t position, uint32_t segment); ///< The next appended data starts a PES
+     const PesStart* GetPesStart(const unsigned char* data) const; ///< The PES where packet data starts
+@@ -128,7 +131,6 @@ namespace TSDemux
+     size_t es_alloc;              ///< Allocated size of memory for buffer
+     size_t es_len;                ///< Size of data in buffer
+     size_t es_consumed;           ///< Consumed payload. Will be erased on next append
+-    size_t es_pts_pointer;        ///< Position in buffer where current PTS becomes applicable
+     size_t es_parsed;             ///< Parser: Last processed position in buffer
+     bool   es_end_of_data;        ///< Parser: In GetEndPacket(), the last frame ends at the end of the buffer
+     bool   es_skip_to_pts;        ///< Parser: The end of the data completed the last frame. The rest of that frame follows up to the next PES with a PTS.
+@@ -139,9 +141,16 @@ namespace TSDemux
+     uint64_t es_pes_start_position;
+     uint32_t es_pes_start_segment;
+     void ShiftPesStarts(size_t consumed);
+-    void EndLastFrame(size_t frameStart); ///< Parser: In GetEndPacket(), the end of the found frame
++    const PesStart* StartPicture(size_t offset); ///< Parser: The first picture of the found frame starts at offset. Returns the PES of the frame.
++    uint64_t FrameDuration(int64_t dts, uint64_t fallback); ///< Parser: The duration of the frame with the DTS that ends at es_consumed
++    int64_t AudioFramePts(size_t offset, int64_t duration); ///< Parser: The PTS of the audio frame that starts at offset
++    void EndLastFrame(); ///< Parser: In GetEndPacket(), the end of the found frame
+     bool AppendExtraData(const uint8_t* nal, size_t size); ///< Appends a NAL unit with a 4 byte start code
+     bool   es_found_frame;        ///< Parser: Found frame
++    size_t es_picture_start;      ///< Parser: The first picture of the found frame, relative to es_consumed
++    uint64_t es_frame_duration;   ///< Parser: The last duration from the DTS of two frames
++    uint64_t es_pts_position;     ///< Parser: The stream position of the PES of the last audio frame PTS
++    int64_t es_next_pts;          ///< Parser: The PTS of the next audio frame
+     bool   es_frame_valid;
+     bool   es_extraDataChanged;
+   };
+diff --git a/src/test/TestTSReader.cpp b/src/test/TestTSReader.cpp
+index 7083aa8..aa51eb1 100644
+--- a/src/test/TestTSReader.cpp
++++ b/src/test/TestTSReader.cpp
+@@ -176,6 +176,27 @@ std::vector<uint8_t> KeyFrameUnits(const VideoCodec& codec, bool parameterSets)
+   return result;
+ }
+ 
++// The start of the first picture unit of an access unit: a slice NAL unit or
++// an MPEG-2 picture
++size_t PictureStart(const VideoCodec& codec, const std::vector<uint8_t>& au)
++{
++  for (size_t i = 0; i + 3 < au.size(); ++i)
++  {
++    if (au[i] != 0 || au[i + 1] != 0 || au[i + 2] != 1)
++      continue;
++    bool picture;
++    if (codec.streamType == H264.streamType)
++      picture = (au[i + 3] & 0x1F) >= 1 && (au[i + 3] & 0x1F) <= 5;
++    else if (codec.streamType == HEVC.streamType)
++      picture = ((au[i + 3] >> 1) & 0x3F) <= 31;
++    else
++      picture = au[i + 3] == 0;
++    if (picture)
++      return i > 0 && au[i - 1] == 0 ? i - 1 : i;
++  }
++  return au.size();
++}
++
+ // The stream information of a parser
+ struct ParsedInfo
+ {
+@@ -206,9 +227,8 @@ ParsedInfo ParseAccessUnits(const VideoCodec& codec,
+   TSDemux::STREAM_PKT pkt;
+   for (size_t n = 0; n < accessUnits.size(); ++n)
+   {
+-    stream->p_pts = stream->c_pts;
+-    stream->p_dts = stream->c_dts;
+     stream->c_pts = stream->c_dts = 90000 + 3000 * n;
++    stream->StartPes(n, 0);
+     const std::vector<uint8_t>& au{accessUnits[n]};
+     std::vector<size_t> ends;
+     for (size_t end = chunk; end < au.size(); end += chunk)
+@@ -286,6 +306,29 @@ public:
+     }
+   }
+ 
++  // Audio frames in PES packets of pesSize bytes, which can end inside a frame
++  // or a frame header. A PES has the PTS of the first frame that starts in it.
++  void WriteAudioInPesOfSize(int count, size_t pesSize)
++  {
++    std::vector<uint8_t> payload;
++    std::vector<size_t> frameStarts;
++    for (int i = 0; i < count; ++i)
++    {
++      frameStarts.push_back(payload.size());
++      const std::vector<uint8_t> aac{AacFrame(i)};
++      payload.insert(payload.end(), aac.begin(), aac.end());
++    }
++    for (size_t start = 0; start < payload.size(); start += pesSize)
++    {
++      const size_t end{std::min(start + pesSize, payload.size())};
++      const auto frame{std::lower_bound(frameStarts.begin(), frameStarts.end(), start)};
++      std::optional<uint64_t> pts;
++      if (frame != frameStarts.end() && *frame < end)
++        pts = AudioPts(static_cast<int>(frame - frameStarts.begin()));
++      WritePes(AUDIO_PID, 0xC0, pts, {payload.begin() + start, payload.begin() + end}, false);
++    }
++  }
++
+   // One video frame per PES without a length, as HLS segments carry video,
+   // with a key frame every keyInterval frames
+   void WriteVideo(int firstFrame, int count, int keyInterval = 1)
+@@ -308,6 +351,16 @@ public:
+     WritePes(VIDEO_PID, 0xE0, std::nullopt, {half, accessUnit.end()}, false);
+   }
+ 
++  // GStreamer puts the units before the picture, as the parameter sets, in a
++  // PES of their own with the PTS of the frame
++  void WriteVideoFrameInTimestampedPes(int frame, const std::vector<uint8_t>& accessUnit)
++  {
++    const auto picture{accessUnit.begin() + PictureStart(m_codec, accessUnit)};
++    if (picture != accessUnit.begin())
++      WritePes(VIDEO_PID, 0xE0, VideoPts(frame), {accessUnit.begin(), picture}, false);
++    WritePes(VIDEO_PID, 0xE0, VideoPts(frame), {picture, accessUnit.end()}, false);
++  }
++
+   std::vector<uint8_t> Take() { return std::move(m_data); }
+ 
+ private:
+@@ -1252,6 +1305,36 @@ TEST_F(TSSampleReaderTest, AFrameAcrossTwoLiveSegmentsIsReadWhole)
+   EXPECT_TRUE(m_reader->EOS());
+ }
+ 
++// A frame can span two PES packets with the PTS of the frame, the parameter
++// sets and the picture. At the end of the stream, the last frame is read whole.
++TEST_F(TSSampleReaderTest, AFrameInTwoTimestampedPesPacketsIsReadWholeAtTheEndOfTheStream)
++{
++  for (const VideoCodec* codec : {&H264, &HEVC, &MPEG2})
++  {
++    SCOPED_TRACE(codec->name);
++    TSWriter writer{*codec};
++    writer.WriteTables(true);
++    for (int frame = 0; frame < SEGMENT_VIDEO_FRAMES; ++frame)
++      writer.WriteVideoFrameInTimestampedPes(frame, frame % 5 ? codec->frame : codec->keyFrame);
++    Open(writer.Take(), Time(VideoPts(0)) - DIFF, INPUTSTREAM_TYPE_VIDEO);
++    std::vector<uint64_t> read;
++    bool started{false};
++    for (AP4_Result result{m_reader->Start(started)}; AP4_SUCCEEDED(result);
++         result = m_reader->ReadSample())
++    {
++      SCOPED_TRACE(read.size());
++      read.push_back(m_reader->PTS());
++      EXPECT_GE(m_reader->GetSampleDataSize(),
++                ((read.size() - 1) % 5 ? codec->frame : codec->keyFrame).size() - 1);
++    }
++    std::vector<uint64_t> expected;
++    for (int i = 0; i < SEGMENT_VIDEO_FRAMES; ++i)
++      expected.push_back(Time(VideoPts(i)));
++    EXPECT_EQ(read, expected);
++    EXPECT_TRUE(m_reader->EOS());
++  }
++}
++
+ // After the seek scan reads the last frames of a segment, the parser again
+ // waits for the start of the next frame, as a frame can span two PES packets.
+ TEST_F(TSSampleReaderTest, AFrameInTwoPesPacketsIsReadWholeAfterASeek)
+@@ -1691,6 +1774,30 @@ TEST_F(TSSampleReaderTest, SeekToAKeyFrameAcrossTwoSegmentsKeepsTheAudioThatEnds
+                                            SPLIT_AUDIO + 3}));
+ }
+ 
++// A PES of audio can end inside a frame or inside a frame header. The parser
++// finds a frame only after more data, so the next PES headers came before.
++// Each frame still takes the PTS of the PES where the frame starts.
++TEST_F(TSSampleReaderTest, AudioFramesAcrossPesPacketsTakeTheirPts)
++{
++  for (size_t pesSize = 1; pesSize <= 2 * AacFrame(0).size() + 8; ++pesSize)
++  {
++    SCOPED_TRACE(pesSize);
++    TSWriter writer;
++    writer.WriteTables(false);
++    writer.WriteAudioInPesOfSize(SEGMENT_FRAMES, pesSize);
++    Open(writer.Take(), Time(AudioPts(0)) - DIFF, INPUTSTREAM_TYPE_AUDIO);
++    std::vector<std::pair<int, uint64_t>> read;
++    bool started{false};
++    for (AP4_Result result{m_reader->Start(started)}; AP4_SUCCEEDED(result);
++         result = m_reader->ReadSample())
++      read.emplace_back(FrameIndex(), m_reader->PTS());
++    std::vector<std::pair<int, uint64_t>> expected;
++    for (int i = 0; i < SEGMENT_FRAMES; ++i)
++      expected.emplace_back(i, Time(AudioPts(i)));
++    ASSERT_EQ(read, expected);
++  }
++}
++
+ // A PES of audio holds several frames. A seek lands on the frame of the seek
+ // time, not on the first frame of its PES.
+ TEST_F(TSSampleReaderTest, AudioSeekLandsOnTheFrameInsideThePes)
+-- 
+2.47.3
+

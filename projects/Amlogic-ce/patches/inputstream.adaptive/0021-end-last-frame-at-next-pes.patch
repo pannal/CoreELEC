@@ -1,0 +1,336 @@
+From 8ed142eab8b54cf7b2d10be2f115f2269b7fac36 Mon Sep 17 00:00:00 2001
+From: primez <mpincoski@gmail.com>
+Date: Sat, 31 Oct 2026 05:17:01 -0600
+Subject: [PATCH 21/21] [mpegts] End the last frame of a segment where the next
+ PES starts
+
+At the end of the data of a segment, the seek scan completes the last
+frame. The parsers took all the data up to the end as that frame, also
+the start of the next PES, and then dropped the rest of that PES in the
+next segment. So when a segment ended in the first bytes of a key frame
+or right after the PES header, the seek lost that key frame. The PTS of
+a PES belongs to the first frame that starts in the PES, and HLS puts
+each video frame in its own PES. So the last frame now ends where a
+later PES with a PTS starts, and the next segment continues the next
+frame.
+
+At the end of the data, the last HEVC NAL unit can continue in the next
+segment. The parser read a parameter set there as a complete parameter
+set, and then did not read the rest. The parser now uses that NAL unit
+only to end a frame, and reads the NAL unit again with the data of the
+next segment.
+
+The tests end the first segment at each byte of the first TS packet of
+the key frame for H.264, HEVC and MPEG-2, and check the stream
+information at the landing and at the end. The parser test ends the
+data at each byte of a key frame.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ inputstream.adaptive/changelog.txt     |  1 +
+ lib/mpegts/mpegts/ES_MPEGVideo.cpp     |  3 +-
+ lib/mpegts/mpegts/ES_h264.cpp          |  3 +-
+ lib/mpegts/mpegts/ES_hevc.cpp          | 23 ++++++------
+ lib/mpegts/mpegts/ES_hevc.h            |  2 +-
+ lib/mpegts/mpegts/elementaryStream.cpp | 14 ++++++++
+ lib/mpegts/mpegts/elementaryStream.h   |  1 +
+ src/test/TestTSReader.cpp              | 48 +++++++++++++++++++-------
+ 8 files changed, 68 insertions(+), 27 deletions(-)
+
+diff --git a/inputstream.adaptive/changelog.txt b/inputstream.adaptive/changelog.txt
+index 70639d2..1c4db22 100644
+--- a/inputstream.adaptive/changelog.txt
++++ b/inputstream.adaptive/changelog.txt
+@@ -17,6 +17,7 @@ v21.5.25-p3i.4 (2026-10-31)
+ - Fix a seek in an MPEG-2 TS stream to an I picture without a sequence header, which continued at the next sequence header
+ - Fix a seek in a TS stream to a key frame whose PES starts in the segment before, which continued at the next key frame and lost the audio of a PES across the two segments
+ - Fix reads past the data, crashes and wrong decoder setups from H.264 and HEVC TS streams with corrupt parameter sets, an H.264 SPS longer than 256 bytes, an HEVC parameter set after a 3 byte start code, or an HEVC VPS in another TS packet than the PPS
++- Fix a seek in a TS stream to a key frame whose PES starts at the end of the segment before with no frame data or only the first bytes of the frame, which continued at the next key frame
+ 
+ v21.5.25-p3i.3 (2026-10-30)
+ - Fix a seek in a live HLS stream that ended the audio when the next audio segment was not available yet
+diff --git a/lib/mpegts/mpegts/ES_MPEGVideo.cpp b/lib/mpegts/mpegts/ES_MPEGVideo.cpp
+index af6ef8a..8497b49 100644
+--- a/lib/mpegts/mpegts/ES_MPEGVideo.cpp
++++ b/lib/mpegts/mpegts/ES_MPEGVideo.cpp
+@@ -88,8 +88,7 @@ void ES_MPEG2Video::Parse(STREAM_PKT *pkt)
+   if (!frameComplete && es_end_of_data && es_found_frame)
+   {
+     frameComplete = true;
+-    es_consumed = es_len;
+-    es_skip_to_pts = true;
++    EndLastFrame(frame_ptr);
+   }
+ 
+   if (frameComplete)
+diff --git a/lib/mpegts/mpegts/ES_h264.cpp b/lib/mpegts/mpegts/ES_h264.cpp
+index 1218a40..728a368 100644
+--- a/lib/mpegts/mpegts/ES_h264.cpp
++++ b/lib/mpegts/mpegts/ES_h264.cpp
+@@ -141,8 +141,7 @@ void ES_h264::Parse(STREAM_PKT* pkt)
+   if (!frameComplete && es_end_of_data && es_found_frame)
+   {
+     frameComplete = true;
+-    es_consumed = es_len;
+-    es_skip_to_pts = true;
++    EndLastFrame(frame_ptr);
+   }
+ 
+   if (frameComplete)
+diff --git a/lib/mpegts/mpegts/ES_hevc.cpp b/lib/mpegts/mpegts/ES_hevc.cpp
+index 8751bf9..89a1339 100644
+--- a/lib/mpegts/mpegts/ES_hevc.cpp
++++ b/lib/mpegts/mpegts/ES_hevc.cpp
+@@ -57,7 +57,7 @@ void ES_hevc::Parse(STREAM_PKT* pkt)
+     {
+       // The NAL unit ends at the start code
+       if (m_LastStartPos != -1)
+-         Parse_HEVC(frame_ptr + m_LastStartPos, p - 3 - frame_ptr - m_LastStartPos, frameComplete);
++         Parse_HEVC(frame_ptr + m_LastStartPos, p - 3 - frame_ptr - m_LastStartPos, frameComplete, false);
+       m_LastStartPos = p - frame_ptr; // save relative position from start
+       if (frameComplete)
+         break;
+@@ -66,19 +66,16 @@ void ES_hevc::Parse(STREAM_PKT* pkt)
+   es_parsed = p;
+   m_StartCode = startcode;
+ 
+-  // The last NAL unit ends at the end of the data, and so does the last frame
++  // The last NAL unit ends at the end of the data. Without a frame, the next
++  // data continues the NAL unit, and the parse of that data parses it again.
+   if (!frameComplete && es_end_of_data)
+   {
+     if (m_LastStartPos != -1)
+-    {
+-      Parse_HEVC(frame_ptr + m_LastStartPos, es_len - frame_ptr - m_LastStartPos, frameComplete);
+-      m_LastStartPos = -1;
+-    }
++      Parse_HEVC(frame_ptr + m_LastStartPos, es_len - frame_ptr - m_LastStartPos, frameComplete, true);
+     if (!frameComplete && es_found_frame)
+     {
+       frameComplete = true;
+-      es_consumed = es_len;
+-      es_skip_to_pts = true;
++      EndLastFrame(frame_ptr);
+     }
+   }
+ 
+@@ -137,7 +134,7 @@ void ES_hevc::Reset()
+ }
+ 
+ 
+-void ES_hevc::Parse_HEVC(int buf_ptr, unsigned int NumBytesInNalUnit, bool &complete)
++void ES_hevc::Parse_HEVC(int buf_ptr, unsigned int NumBytesInNalUnit, bool &complete, bool canContinue)
+ {
+   uint8_t *buf = es_buf + buf_ptr;
+   uint16_t header;
+@@ -200,8 +197,10 @@ void ES_hevc::Parse_HEVC(int buf_ptr, unsigned int NumBytesInNalUnit, bool &comp
+   {
+     switch (hdr.nal_unit_type)
+     {
++    // A parameter set at the end of the data can continue in the next data.
++    // Then the parse of the next data reads the parameter set.
+     case NAL_VPS_NUT:
+-      if (m_NeedVPS && AppendExtraData(buf, NumBytesInNalUnit))
++      if (m_NeedVPS && !canContinue && AppendExtraData(buf, NumBytesInNalUnit))
+         m_NeedVPS = false;
+       break;
+ 
+@@ -213,6 +212,8 @@ void ES_hevc::Parse_HEVC(int buf_ptr, unsigned int NumBytesInNalUnit, bool &comp
+         es_consumed = buf_ptr - 3;
+         return;
+       }
++      if (canContinue)
++        break;
+       Parse_SPS(buf, NumBytesInNalUnit, hdr);
+       if (m_NeedSPS && AppendExtraData(buf, NumBytesInNalUnit))
+         m_NeedSPS = false;
+@@ -227,6 +228,8 @@ void ES_hevc::Parse_HEVC(int buf_ptr, unsigned int NumBytesInNalUnit, bool &comp
+         es_consumed = buf_ptr - 3;
+         return;
+       }
++      if (canContinue)
++        break;
+       Parse_PPS(buf, NumBytesInNalUnit);
+       if (m_NeedPPS && AppendExtraData(buf, NumBytesInNalUnit))
+         m_NeedPPS = false;
+diff --git a/lib/mpegts/mpegts/ES_hevc.h b/lib/mpegts/mpegts/ES_hevc.h
+index 444fd55..f781c98 100644
+--- a/lib/mpegts/mpegts/ES_hevc.h
++++ b/lib/mpegts/mpegts/ES_hevc.h
+@@ -91,7 +91,7 @@ namespace TSDemux
+     int64_t         m_PTS;
+     bool            m_Interlaced;
+ 
+-    void Parse_HEVC(int buf_ptr, unsigned int NumBytesInNalUnit, bool &complete);
++    void Parse_HEVC(int buf_ptr, unsigned int NumBytesInNalUnit, bool &complete, bool canContinue);
+     void Parse_PPS(uint8_t *buf, int len);
+     void Parse_SLH(uint8_t *buf, int len, HDR_NAL hdr, hevc_private::VCL_NAL &vcl);
+     void Parse_SPS(uint8_t *buf, int len, HDR_NAL hdr);
+diff --git a/lib/mpegts/mpegts/elementaryStream.cpp b/lib/mpegts/mpegts/elementaryStream.cpp
+index e2a1ecc..b8bb4fe 100644
+--- a/lib/mpegts/mpegts/elementaryStream.cpp
++++ b/lib/mpegts/mpegts/elementaryStream.cpp
+@@ -89,6 +89,20 @@ const ElementaryStream::PesStart* ElementaryStream::GetPesStart(const unsigned c
+   return NULL;
+ }
+ 
++void ElementaryStream::EndLastFrame(size_t frameStart)
++{
++  // The PTS of a PES belongs to the first frame that starts in the PES, and
++  // HLS puts each video frame in its own PES. So a later PES with a PTS starts
++  // the next frame, and the next data continues that frame.
++  if (es_pts_pointer > frameStart)
++    es_consumed = es_pts_pointer;
++  else
++  {
++    es_consumed = es_len;
++    es_skip_to_pts = true;
++  }
++}
++
+ bool ElementaryStream::AppendExtraData(const uint8_t* nal, size_t size)
+ {
+   uint8_t* ed = stream_info.extra_data + stream_info.extra_data_size;
+diff --git a/lib/mpegts/mpegts/elementaryStream.h b/lib/mpegts/mpegts/elementaryStream.h
+index 6946538..b703150 100644
+--- a/lib/mpegts/mpegts/elementaryStream.h
++++ b/lib/mpegts/mpegts/elementaryStream.h
+@@ -135,6 +135,7 @@ namespace TSDemux
+     uint64_t es_pes_start_position;
+     uint32_t es_pes_start_segment;
+     void ShiftPesStarts(size_t consumed);
++    void EndLastFrame(size_t frameStart); ///< Parser: In GetEndPacket(), the end of the found frame
+     bool AppendExtraData(const uint8_t* nal, size_t size); ///< Appends a NAL unit with a 4 byte start code
+     bool   es_found_frame;        ///< Parser: Found frame
+     bool   es_frame_valid;
+diff --git a/src/test/TestTSReader.cpp b/src/test/TestTSReader.cpp
+index 848cd91..2f4122e 100644
+--- a/src/test/TestTSReader.cpp
++++ b/src/test/TestTSReader.cpp
+@@ -189,10 +189,12 @@ struct ParsedInfo
+ };
+ 
+ // Parses access units, each in its own PES with a PTS. The parser gets the
+-// data in chunks, as from TS packets.
++// data in chunks, as from TS packets. Optionally the data ends at a cut in an
++// access unit, as at the end of a segment, and the next data continues there.
+ ParsedInfo ParseAccessUnits(const VideoCodec& codec,
+                             const std::vector<std::vector<uint8_t>>& accessUnits,
+-                            size_t chunk)
++                            size_t chunk,
++                            std::optional<std::pair<size_t, size_t>> cut = std::nullopt)
+ {
+   std::unique_ptr<TSDemux::ElementaryStream> stream;
+   if (codec.streamType == H264.streamType)
+@@ -211,6 +213,8 @@ ParsedInfo ParseAccessUnits(const VideoCodec& codec,
+     std::vector<size_t> ends;
+     for (size_t end = chunk; end < au.size(); end += chunk)
+       ends.push_back(end);
++    if (cut && cut->first == n)
++      ends.push_back(cut->second);
+     ends.push_back(au.size());
+     std::sort(ends.begin(), ends.end());
+     size_t start{0};
+@@ -219,6 +223,11 @@ ParsedInfo ParseAccessUnits(const VideoCodec& codec,
+       stream->Append(au.data() + start, end - start, start == 0);
+       while (stream->GetStreamPacket(&pkt))
+         ;
++      if (cut && cut->first == n && cut->second == end)
++      {
++        while (stream->GetEndPacket(&pkt))
++          ;
++      }
+       start = end;
+     }
+   }
+@@ -733,8 +742,8 @@ TEST_F(TSSampleReaderTest, ALongSpsKeepsTheFrames)
+   EXPECT_EQ(frames, SEGMENT_VIDEO_FRAMES);
+ }
+ 
+-// TS packets split the parameter sets. The stream information stays the same
+-// as from whole access units.
++// TS packets split the parameter sets, and a segment can end in a parameter
++// set. The stream information stays the same as from whole access units.
+ TEST(TSParserTest, ThePartsOfTheParameterSetsGiveTheSameStreamInformation)
+ {
+   for (const VideoCodec* codec : {&H264, &HEVC, &MPEG2})
+@@ -752,6 +761,13 @@ TEST(TSParserTest, ThePartsOfTheParameterSetsGiveTheSameStreamInformation)
+     {
+       SCOPED_TRACE(testing::Message() << "chunk " << chunk);
+       EXPECT_EQ(ParseAccessUnits(*codec, accessUnits, chunk), expected);
++      // The first key frame or the next key frame ends the data
++      for (const size_t keyFrame : {size_t{0}, size_t{2}})
++      for (size_t cut = 1; cut < codec->keyFrame.size(); ++cut)
++      {
++        SCOPED_TRACE(testing::Message() << "key frame " << keyFrame << ", cut " << cut);
++        EXPECT_EQ(ParseAccessUnits(*codec, accessUnits, chunk, {{keyFrame, cut}}), expected);
++      }
+     }
+   }
+ }
+@@ -1432,16 +1448,18 @@ TEST_F(TSSampleReaderTest, PtsDiffOfAPesHeaderAcrossTwoSegments)
+ // The last key frame of a segment can continue in the next segment, with a
+ // part of the PES header or with a part of the frame data. The stream cannot
+ // read the previous segment again, but a seek still lands on that key frame,
+-// also when the seek waits for the next live segment.
++// also when the seek waits for the next live segment. The stream information
++// stays the same, also when the segment ends in a parameter set.
+ TEST_F(TSSampleReaderTest, SeekLandsOnAKeyFrameAcrossTwoSegments)
+ {
+   constexpr int SPLIT_FRAME{SEGMENT_VIDEO_FRAMES - 1};
+-  std::vector<uint8_t> bigKeyFrame{H264.keyFrame};
+-  bigKeyFrame.resize(500, 0);
+-  // 9 of the 14 bytes of the PES header, or the PES header and a part of the frame
+-  for (const size_t firstPacket : {size_t{9}, size_t{184}})
++  // The first packet ends in the PES header, in the parameter sets or in the frame
++  for (const VideoCodec* codec : {&H264, &HEVC, &MPEG2})
++  for (size_t firstPacket = 1; firstPacket <= 184; ++firstPacket)
+   {
+-    TSWriter writer;
++    std::vector<uint8_t> bigKeyFrame{codec->keyFrame};
++    bigKeyFrame.resize(500, 0);
++    TSWriter writer{*codec};
+     writer.WriteTables(true);
+     writer.WriteVideo(0, SPLIT_FRAME, 5);
+     std::vector<uint8_t> first{writer.Take()};
+@@ -1460,8 +1478,9 @@ TEST_F(TSSampleReaderTest, SeekLandsOnAKeyFrameAcrossTwoSegments)
+     for (const uint64_t target : {VideoPts(SPLIT_FRAME - 2), VideoPts(SPLIT_FRAME),
+                                   VideoPts(SPLIT_FRAME) + VIDEO_TICKS / 2})
+     {
+-      SCOPED_TRACE(testing::Message() << "first packet " << firstPacket << ", target "
+-                                      << target << (preceeding ? "" : ", not preceeding")
++      SCOPED_TRACE(testing::Message() << codec->name << ", first packet " << firstPacket
++                                      << ", target " << target
++                                      << (preceeding ? "" : ", not preceeding")
+                                       << (live ? ", live" : ""));
+       const int landing{preceeding && target < VideoPts(SPLIT_FRAME) ? 10
+                         : !preceeding && target > VideoPts(SPLIT_FRAME) ? SEGMENT_VIDEO_FRAMES
+@@ -1470,6 +1489,9 @@ TEST_F(TSSampleReaderTest, SeekLandsOnAKeyFrameAcrossTwoSegments)
+       if (live && landing < SPLIT_FRAME)
+         continue;
+       Open(first, Time(VideoPts(0)) - DIFF, INPUTSTREAM_TYPE_VIDEO);
++      kodi::addon::InputstreamInfo info;
++      info.SetStreamType(INPUTSTREAM_TYPE_VIDEO);
++      ASSERT_TRUE(m_reader->GetInformation(info));
+       if (live)
+         m_segments->m_waitingForSegment = true;
+       else
+@@ -1486,6 +1508,7 @@ TEST_F(TSSampleReaderTest, SeekLandsOnAKeyFrameAcrossTwoSegments)
+         m_segments->m_waitingForSegment = false;
+         ASSERT_EQ(m_reader->ReadSample(), AP4_SUCCESS);
+       }
++      EXPECT_FALSE(m_reader->GetInformation(info));
+       // The PTS and the PTS diff of each frame
+       std::vector<std::pair<uint64_t, int64_t>> read;
+       AP4_Size landingSize{m_reader->GetSampleDataSize()};
+@@ -1498,6 +1521,7 @@ TEST_F(TSSampleReaderTest, SeekLandsOnAKeyFrameAcrossTwoSegments)
+       EXPECT_EQ(read, expected);
+       if (landing == SPLIT_FRAME)
+         EXPECT_GE(landingSize, bigKeyFrame.size() - 1);
++      EXPECT_FALSE(m_reader->GetInformation(info));
+     }
+   }
+ }
+-- 
+2.47.3
+

@@ -1,0 +1,542 @@
+From 8509ade0ff6977ff213bfed9416c1a4a73000813 Mon Sep 17 00:00:00 2001
+From: primez <mpincoski@gmail.com>
+Date: Sat, 31 Oct 2026 13:19:40 -0600
+Subject: [PATCH] [AdaptiveStream] Fix seeks at exact time boundaries and at a
+ pending quality change
+
+- A seek compares the segment and chapter starts in whole microseconds,
+  rounded down as the PTS offsets of the streams. The seek time in
+  microseconds converted to timescale ticks fell before a segment start
+  between two microseconds (for example at a 90 kHz timescale), and the
+  chapter starts summed in double precision fell after the seek time, so the
+  seek continued in the segment or chapter before.
+- CSession::CheckChange waits until no reader of an enabled stream reads
+  asynchronously, and only then reads the state that the reader thread
+  writes. m_changed and m_oldRepresentationEnded are atomic.
+- A seek at a pending change of the representation always restarts the
+  segment, also inside the current segment. Before, the next read returned
+  data of the new representation into the reader of the old one. The reopen
+  uses the buffer number of the change only while the buffers have data, so
+  a seek to the first segment no longer continues at the segment of the
+  change.
+- start_stream allocates the segment buffers under mutex_dl_, the lock of the
+  download worker, which reads the buffer list.
+- The test deletes the stream before the tree.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ inputstream.adaptive/changelog.txt |   4 +
+ src/Session.cpp                    |  50 ++++----
+ src/Session.h                      |   5 +-
+ src/common/AdaptiveStream.cpp      |  37 +++---
+ src/common/AdaptiveStream.h        |   5 +-
+ src/common/AdaptiveUtils.cpp       |   7 ++
+ src/common/AdaptiveUtils.h         |  10 ++
+ src/test/TestDASHTree.cpp          | 179 +++++++++++++++++++++--------
+ 8 files changed, 210 insertions(+), 87 deletions(-)
+
+diff --git a/inputstream.adaptive/changelog.txt b/inputstream.adaptive/changelog.txt
+index 32e9d4b..4fcc1c4 100644
+--- a/inputstream.adaptive/changelog.txt
++++ b/inputstream.adaptive/changelog.txt
+@@ -9,7 +9,11 @@ v21.5.25-p3i.4 (2026-10-31)
+ - Fix a seek in a TS stream with video and audio that continued at the key frame before the key frame of the seek time
+ - Fix a seek to the time of a key frame, which continued at the next key frame: the seek time in milliseconds came with a float error
+ - Fix a seek to the start time of some segments, which chose the segment before: a TS seek downloaded and scanned one more segment, and a seek to the frame at or before the seek time continued in the segment before
++- Fix a seek to the start time of some chapters, and to the start time of a segment between two microseconds (for example at a 90 kHz timescale), which continued in the chapter or segment before
+ - Fix a change of the stream quality in a TS stream, which lost the last frames of the old quality: two video frames, and the audio frames that waited for a PTS
++- Fix a change of the stream quality that could start before the reader of the old quality returned all frames, while a read of the next frame was still in progress
++- Fix a seek during a change of the stream quality: a seek into the segment of the change read data of the new quality into the reader of the old quality, and a seek to the first segment continued at the segment of the change
++- Fix a possible crash at a change of the stream quality: the reopen of the stream allocated more segment buffers while a download used the buffers
+ - Fix a seek to an earlier time inside the current segment, which continued at the start of the segment instead of at the frame of the seek time
+ - Fix a seek in a TS stream with video and audio that returned an audio frame first, so the other streams aligned to the audio time instead of the video frame of the seek
+ - Fix a seek in an HEVC or MPEG-2 TS stream, which continued at the segment start instead of at the key frame of the seek time
+diff --git a/src/Session.cpp b/src/Session.cpp
+index ac2b2c0..a09404d 100644
+--- a/src/Session.cpp
++++ b/src/Session.cpp
+@@ -1180,21 +1180,26 @@ bool CSession::SeekTime(double seekTime, unsigned int streamId, bool preceeding)
+   if (seekTime < 0)
+     seekTime = 0;
+ 
+-  // Check if we leave our current period
+-  double chapterTime{0};
++  // Round to the nearest microsecond. A time above the exact value skips a key
++  // frame at the seek time.
++  uint64_t seekTimeCorrected{static_cast<uint64_t>(std::llround(seekTime * STREAM_TIME_BASE))};
++
++  // Check if we leave our current period. The chapter starts have whole
++  // microseconds, as in GetChapterStartTime.
++  uint64_t chapterTime{0};
+   auto pi = m_adaptiveTree->m_periods.cbegin();
+ 
+   for (; pi != m_adaptiveTree->m_periods.cend(); pi++)
+   {
+-    chapterTime += double((*pi)->GetDuration()) / (*pi)->GetTimescale();
+-    if (chapterTime > seekTime)
++    chapterTime += TimeToUs((*pi)->GetDuration(), (*pi)->GetTimescale());
++    if (chapterTime > seekTimeCorrected)
+       break;
+   }
+ 
+   if (pi == m_adaptiveTree->m_periods.cend())
+     --pi;
+ 
+-  chapterTime -= double((*pi)->GetDuration()) / (*pi)->GetTimescale();
++  chapterTime -= TimeToUs((*pi)->GetDuration(), (*pi)->GetTimescale());
+ 
+   if ((*pi).get() != m_adaptiveTree->m_currentPeriod)
+   {
+@@ -1205,12 +1210,11 @@ bool CSession::SeekTime(double seekTime, unsigned int streamId, bool preceeding)
+     return true;
+   }
+ 
+-  seekTime -= chapterTime;
++  seekTimeCorrected -= chapterTime;
+ 
+   // don't try to seek past the end of the stream, leave a sensible amount so we can buffer properly
+   if (m_adaptiveTree->IsLive())
+   {
+-    double maxSeek{0};
+     uint64_t curTime;
+     uint64_t maxTime{0};
+     for (auto& stream : m_streams)
+@@ -1221,18 +1225,16 @@ bool CSession::SeekTime(double seekTime, unsigned int streamId, bool preceeding)
+       }
+     }
+ 
+-    maxSeek = (static_cast<double>(maxTime) / 1000) - m_adaptiveTree->m_liveDelay;
+-    if (maxSeek < 0)
+-      maxSeek = 0;
++    const uint64_t maxTimeUs{maxTime * 1000};
++    const uint64_t liveDelayUs{m_adaptiveTree->m_liveDelay * STREAM_TIME_BASE};
++    const uint64_t maxSeek{maxTimeUs > liveDelayUs ? maxTimeUs - liveDelayUs : 0};
+ 
+-    if (seekTime > maxSeek)
+-      seekTime = maxSeek;
++    if (seekTimeCorrected > maxSeek)
++      seekTimeCorrected = maxSeek;
+   }
++  seekTime = static_cast<double>(seekTimeCorrected) / STREAM_TIME_BASE;
+ 
+   // correct for starting segment pts value of chapter and chapter offset within program
+-  // Round to the nearest microsecond. A time above the exact value skips a key
+-  // frame at the seek time.
+-  uint64_t seekTimeCorrected{static_cast<uint64_t>(std::llround(seekTime * STREAM_TIME_BASE))};
+   int64_t ptsDiff{0};
+   if (m_timingStream)
+   {
+@@ -1344,16 +1346,22 @@ void CSession::OnSegmentChanged(adaptive::AdaptiveStream* adStream)
+ 
+ bool CSession::CheckChange()
+ {
++  // A reader thread notifies the change. The change waits until no reader
++  // works, then the state of the readers and of the streams is complete.
++  for (const auto& stream : m_streams)
++  {
++    ISampleReader* reader{stream->GetReader()};
++    if (stream->m_isEnabled && reader && reader->IsReadSampleAsyncWorking())
++      return false;
++  }
+   for (const auto& stream : m_streams)
+   {
+     ISampleReader* reader{stream->GetReader()};
+-    if (stream->m_isEnabled && stream->m_adStream.IsOldRepresentationEnded() && reader &&
+-        (reader->IsReadSampleAsyncWorking() || !reader->EOS()))
++    if (stream->m_isEnabled && reader && stream->m_adStream.IsOldRepresentationEnded() &&
++        !reader->EOS())
+       return false;
+   }
+-  const bool changed{m_changed};
+-  m_changed = false;
+-  return changed;
++  return m_changed.exchange(false);
+ }
+ 
+ void CSession::OnStreamChange(adaptive::AdaptiveStream* adStream)
+@@ -1503,7 +1511,7 @@ uint64_t CSession::GetChapterStartTime() const
+     if (p.get() == m_adaptiveTree->m_currentPeriod)
+       break;
+     else
+-      start_time += (p->GetDuration() * STREAM_TIME_BASE) / p->GetTimescale();
++      start_time += TimeToUs(p->GetDuration(), p->GetTimescale());
+   }
+   return start_time;
+ }
+diff --git a/src/Session.h b/src/Session.h
+index d5ea376..35d90e5 100644
+--- a/src/Session.h
++++ b/src/Session.h
+@@ -13,6 +13,8 @@
+ #include "common/AdaptiveTree.h"
+ #include "decrypters/IDecrypter.h"
+ 
++#include <atomic>
++
+ #include <bento4/Ap4.h>
+ #include <kodi/tools/DllHelper.h>
+ 
+@@ -360,7 +362,8 @@ private:
+   std::vector<std::unique_ptr<CStream>> m_streams;
+   CStream* m_timingStream{nullptr};
+ 
+-  bool m_changed{false};
++  // Set also by the reader threads (OnStreamChange)
++  std::atomic<bool> m_changed{false};
+   uint64_t m_elapsedTime{0};
+   uint64_t m_chapterStartTime{0}; // In STREAM_TIME_BASE
+   double m_chapterSeekTime{0.0}; // In seconds
+diff --git a/src/common/AdaptiveStream.cpp b/src/common/AdaptiveStream.cpp
+index 472564e..bee6bbb 100644
+--- a/src/common/AdaptiveStream.cpp
++++ b/src/common/AdaptiveStream.cpp
+@@ -666,7 +666,14 @@ bool AdaptiveStream::start_stream(const uint64_t startPts)
+   if(max_buffer_length_<=assured_buffer_length_)//for incorrect settings input
+     max_buffer_length_=assured_buffer_length_+4u;
+ 
+-  AllocateSegmentBuffers(max_buffer_length_);
++  {
++    // The worker takes the next segment buffer under mutex_dl_, also at the reopen
++    // of a change of the representation
++    std::unique_lock<std::mutex> lckdl;
++    if (thread_data_)
++      lckdl = std::unique_lock<std::mutex>(thread_data_->mutex_dl_);
++    AllocateSegmentBuffers(max_buffer_length_);
++  }
+ 
+   if (!thread_data_)
+   {
+@@ -740,7 +747,9 @@ bool AdaptiveStream::start_stream(const uint64_t startPts)
+ 
+       current_rep_->current_segment_ = current_rep_->Timeline().Get(segPos);
+     }
+-    else if (m_startEvent == EVENT_TYPE::REP_CHANGE) // switching streams, align new stream segment no.
++    // switching streams, align new stream segment no. A seek to the first
++    // segment empties the buffers, then the stream starts at the first segment.
++    else if (m_startEvent == EVENT_TYPE::REP_CHANGE && available_segment_buffers_ > 0)
+     {
+       uint64_t segmentId = segment_buffers_[0]->segment_number;
+       if (segmentId >= current_rep_->GetStartNumber() + current_rep_->Timeline().GetSize())
+@@ -1239,18 +1248,17 @@ bool AdaptiveStream::seek_time(double seek_seconds, bool preceeding, bool& needR
+ 
+   std::lock_guard<adaptive::AdaptiveTree::TreeUpdateThread> lckUpdTree(m_tree->GetTreeUpdMutex());
+ 
+-  // The seek time has microseconds. Seconds times the timescale can be a bit
+-  // less than a segment start, and the seek then chose the segment before.
++  // The seek time has whole microseconds, on the time line of the PTS offsets.
++  // The segment starts are compared on the same time line: in ticks, a segment
++  // start can be between two microseconds.
+   const uint64_t seekUs{static_cast<uint64_t>(std::llround(seek_seconds * STREAM_TIME_BASE))};
+-  const uint64_t timescale{current_rep_->GetTimescale()};
+-  const uint64_t sec_in_ts{seekUs / STREAM_TIME_BASE * timescale +
+-                           seekUs % STREAM_TIME_BASE * timescale / STREAM_TIME_BASE};
++  const auto startUs = [this](size_t pos)
++  { return TimeToUs(current_rep_->Timeline().Get(pos)->startPTS_, current_rep_->GetTimescale()); };
+ 
+   //Skip initialization
+   size_t choosen_seg{0};
+ 
+-  while (choosen_seg < current_rep_->Timeline().GetSize() &&
+-         sec_in_ts > current_rep_->Timeline().Get(choosen_seg)->startPTS_)
++  while (choosen_seg < current_rep_->Timeline().GetSize() && seekUs > startUs(choosen_seg))
+   {
+     ++choosen_seg;
+   }
+@@ -1264,13 +1272,14 @@ bool AdaptiveStream::seek_time(double seek_seconds, bool preceeding, bool& needR
+       return false;
+     }
+ 
+-    if (sec_in_ts < current_rep_->Timeline().Get(0)->startPTS_ + current_rep_->GetDuration())
++    if (seekUs < TimeToUs(current_rep_->Timeline().Get(0)->startPTS_ + current_rep_->GetDuration(),
++                          current_rep_->GetTimescale()))
+       --choosen_seg;
+     else
+       return false;
+   }
+ 
+-  if (choosen_seg && current_rep_->Timeline().Get(choosen_seg)->startPTS_ > sec_in_ts)
++  if (choosen_seg && startUs(choosen_seg) > seekUs)
+     --choosen_seg;
+ 
+   // Never seek into expired segments.....
+@@ -1279,7 +1288,7 @@ bool AdaptiveStream::seek_time(double seek_seconds, bool preceeding, bool& needR
+ 
+   // The TS reader finds the key frame at or after the seek time, also in the next
+   // segments. The other readers seek inside one segment.
+-  if (!preceeding && sec_in_ts > current_rep_->Timeline().Get(choosen_seg)->startPTS_ &&
++  if (!preceeding && seekUs > startUs(choosen_seg) &&
+       current_adp_->GetStreamType() == StreamType::VIDEO &&
+       current_rep_->GetContainerType() != ContainerType::TS)
+   {
+@@ -1293,7 +1302,9 @@ bool AdaptiveStream::seek_time(double seek_seconds, bool preceeding, bool& needR
+   if (newSeg)
+   {
+     needReset = true;
+-    if (newSeg != old_seg)
++    // At a pending change of the representation, the buffers have the data of
++    // the new representation for the reopen, also for the current segment
++    if (newSeg != old_seg || m_startEvent == EVENT_TYPE::REP_CHANGE)
+     {
+       ResetCurrentSegment(newSeg);
+     }
+diff --git a/src/common/AdaptiveStream.h b/src/common/AdaptiveStream.h
+index 689701e..ab076d5 100644
+--- a/src/common/AdaptiveStream.h
++++ b/src/common/AdaptiveStream.h
+@@ -312,8 +312,9 @@ enum class EVENT_TYPE
+ 
+     // Defines the event to start the stream, the status will be resetted by start stream method.
+     EVENT_TYPE m_startEvent{EVENT_TYPE::STREAM_START};
+-    // The reader of the old representation reads no data of the new one
+-    bool m_oldRepresentationEnded{false};
++    // The reader of the old representation reads no data of the new one. Set by
++    // the reader thread, read by the session.
++    std::atomic<bool> m_oldRepresentationEnded{false};
+ 
+     // Class ID for debug log purpose, allow the LOG prints of each AdaptiveStream to be distinguished
+     uint32_t clsId;
+diff --git a/src/common/AdaptiveUtils.cpp b/src/common/AdaptiveUtils.cpp
+index 63024cf..05ddeb2 100644
+--- a/src/common/AdaptiveUtils.cpp
++++ b/src/common/AdaptiveUtils.cpp
+@@ -18,6 +18,7 @@
+ #include <cstdio> // sscanf
+ 
+ #include <bento4/Ap4.h>
++#include <kodi/addon-instance/inputstream/TimingConstants.h>
+ 
+ #ifdef INPUTSTREAM_TEST_BUILD
+ #include "test/KodiStubs.h"
+@@ -73,6 +74,12 @@ bool PLAYLIST::ParseRangeValues(std::string_view range,
+   return false;
+ }
+ 
++uint64_t PLAYLIST::TimeToUs(uint64_t time, uint64_t timescale)
++{
++  // The remainder is less than the 32-bit timescale: the product has no overflow
++  return time / timescale * STREAM_TIME_BASE + time % timescale * STREAM_TIME_BASE / timescale;
++}
++
+ AP4_Movie* PLAYLIST::CreateMovieAtom(adaptive::AdaptiveStream& adStream,
+                                      kodi::addon::InputstreamInfo& streamInfo)
+ {
+diff --git a/src/common/AdaptiveUtils.h b/src/common/AdaptiveUtils.h
+index 8981253..1b037b8 100644
+--- a/src/common/AdaptiveUtils.h
++++ b/src/common/AdaptiveUtils.h
+@@ -110,6 +110,16 @@ bool ParseRangeValues(std::string_view range,
+                       uint64_t& second,
+                       char separator = '@');
+ 
++/*!
++ * \brief Convert a time in a timescale to microseconds (STREAM_TIME_BASE). The
++ *        result is rounded down, as the PTS offsets of the streams, and has no
++ *        overflow.
++ * \param time The time in the timescale
++ * \param timescale The timescale, not 0
++ * \return The time in microseconds
++ */
++uint64_t TimeToUs(uint64_t time, uint64_t timescale);
++
+ /*!
+  * \brief Create a Movie atom based on stream properties and info.
+  * \param adStream The adaptive stream
+diff --git a/src/test/TestDASHTree.cpp b/src/test/TestDASHTree.cpp
+index eda9c04..3bf7cc7 100644
+--- a/src/test/TestDASHTree.cpp
++++ b/src/test/TestDASHTree.cpp
+@@ -931,62 +931,141 @@ TEST_F(DASHTreeAdaptiveStreamTest, RepresentationChangeEndsTheOldData)
+     int m_changes{0};
+   };
+ 
+-  for (const bool seek : {false, true})
++  // A seek before the reopen: into another segment, into the segment of the
++  // new representation at the change, and into the first segment. The reopen
++  // continues in the segment of the seek time, also without a read before the
++  // reopen.
++  enum class Seek
+   {
+-    SCOPED_TRACE(seek ? "seek before the reopen" : "reopen");
+-    delete m_reprChooser;
+-    m_reprChooser = new CAlternatingChooser();
+-    tree->Uninitialize();
+-    delete tree;
+-    tree = new DASHTestTree();
+-    OpenTestFile("mpd/segtpl_multiple.mpd", "https://foo.bar/dash/multiple.mpd");
+-    PLAYLIST::CAdaptationSet* adp{tree->m_periods[0]->GetAdaptationSets()[0].get()};
+-    SetTestStream(NewStream(adp));
+-    CObserver observer;
+-    testStream->set_observer(&observer);
+-    ASSERT_TRUE(testStream->start_stream());
+-    const PLAYLIST::CRepresentation* first{testStream->getRepresentation()};
+-
+-    // The segments of the first representation, up to the change. A read
+-    // fails also while the download of the next segment has not started.
+-    for (int reads = 0; observer.m_changes == 0; ++reads)
++    NONE,
++    OTHER_SEGMENT,
++    CHANGE_SEGMENT,
++    FIRST_SEGMENT,
++  };
++  for (const Seek seek :
++       {Seek::NONE, Seek::OTHER_SEGMENT, Seek::CHANGE_SEGMENT, Seek::FIRST_SEGMENT})
++  {
++    for (const bool readBeforeReopen : {true, false})
+     {
+-      ASSERT_LT(reads, 50);
+-      testStream->read(buf, 16);
+-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
++      if (seek == Seek::NONE && !readBeforeReopen)
++        continue;
++      SCOPED_TRACE(testing::Message() << "seek=" << static_cast<int>(seek)
++                                      << " readBeforeReopen=" << readBeforeReopen);
++      // The stream uses the representations of the tree
++      SetTestStream(nullptr);
++      tree->Uninitialize();
++      delete tree;
++      delete m_reprChooser;
++      m_reprChooser = new CAlternatingChooser();
++      tree = new DASHTestTree();
++      OpenTestFile("mpd/segtpl_multiple.mpd", "https://foo.bar/dash/multiple.mpd");
++      PLAYLIST::CAdaptationSet* adp{tree->m_periods[0]->GetAdaptationSets()[0].get()};
++      SetTestStream(NewStream(adp));
++      CObserver observer;
++      testStream->set_observer(&observer);
++      ASSERT_TRUE(testStream->start_stream());
++      const PLAYLIST::CRepresentation* first{testStream->getRepresentation()};
++
++      // The segments of the first representation, up to the change. A read
++      // fails also while the download of the next segment has not started.
++      for (int reads = 0; observer.m_changes == 0; ++reads)
++      {
++        ASSERT_LT(reads, 50);
++        testStream->read(buf, 16);
++        std::this_thread::sleep_for(std::chrono::milliseconds(10));
++      }
++      ASSERT_EQ(observer.m_changes, 1);
++      ASSERT_TRUE(testStream->StreamChanged());
++      const PLAYLIST::CRepresentation* rep{testStream->getRepresentation()};
++      ASSERT_NE(rep, first);
++      const PLAYLIST::CSegment* changeSegment{rep->current_segment_};
++      ASSERT_NE(changeSegment, nullptr);
++      ASSERT_NE(changeSegment, rep->Timeline().Get(0));
++
++      // No data of the new representation before the reopen
++      for (int read = 0; read < 3; ++read)
++        EXPECT_EQ(testStream->read(buf, 16), 0U);
++      EXPECT_EQ(observer.m_changes, 1);
++
++      double seconds{0};
++      if (seek == Seek::OTHER_SEGMENT)
++        seconds = 10.0;
++      else if (seek == Seek::CHANGE_SEGMENT)
++        seconds = static_cast<double>(changeSegment->startPTS_) / rep->GetTimescale() + 0.5;
++      if (seek != Seek::NONE)
++      {
++        // The change is still pending after the seek
++        bool needReset{false};
++        ASSERT_TRUE(testStream->seek_time(seconds, true, needReset));
++        if (readBeforeReopen)
++          EXPECT_EQ(testStream->read(buf, 16), 0U);
++        EXPECT_TRUE(testStream->StreamChanged());
++      }
++      ASSERT_TRUE(testStream->start_stream());
++      EXPECT_FALSE(testStream->StreamChanged());
++      // The initialization segment, then the first media segment
++      EXPECT_EQ(testStream->read(buf, 16), 16U);
++      EXPECT_EQ(testStream->read(buf, 16), 16U);
++      if (seek != Seek::NONE)
++      {
++        const PLAYLIST::CSegment* segment{rep->current_segment_};
++        ASSERT_NE(segment, nullptr);
++        const double start{static_cast<double>(segment->startPTS_) / rep->GetTimescale()};
++        const double end{static_cast<double>(segment->m_endPts) / rep->GetTimescale()};
++        EXPECT_LE(start, seconds);
++        EXPECT_GT(end, seconds);
++      }
++      testStream->Stop();
+     }
+-    ASSERT_EQ(observer.m_changes, 1);
+-    ASSERT_TRUE(testStream->StreamChanged());
+-    ASSERT_NE(testStream->getRepresentation(), first);
+-
+-    // No data of the new representation before the reopen
+-    for (int read = 0; read < 3; ++read)
+-      EXPECT_EQ(testStream->read(buf, 16), 0U);
+-    EXPECT_EQ(observer.m_changes, 1);
++  }
++}
+ 
+-    if (seek)
++// The session time line has whole microseconds: the PTS offsets of a stream
++// round the segment starts down to microseconds. A seek to the time of a segment
++// start on that time line chooses the segment, also when the start in ticks is
++// between two microseconds.
++TEST_F(DASHTreeTest, SeekSegmentAtASegmentStartBetweenMicroseconds)
++{
++  // The timescale, and the start of the first segment in ticks
++  for (const auto& [timescale, first] : std::vector<std::pair<uint64_t, uint64_t>>{
++           {90000, 1}, {90000, 153000000000001}, {10000000, 5}})
++  {
++    for (const bool preceeding : {true, false})
+     {
+-      // The change is still pending after the seek, and the reopen continues
+-      // in the segment of the seek time
++      SCOPED_TRACE(testing::Message() << "timescale=" << timescale << " first=" << first
++                                      << " preceeding=" << preceeding);
++      CSrvBroker::GetInstance()->Init(m_kodiProps);
++      DASHTestTree dash;
++      dash.Configure(m_reprChooser, {}, "");
++      // Segments of 2 s
++      const std::string mpd{
++          "<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" type=\"static\" "
++          "mediaPresentationDuration=\"PT8S\"><Period duration=\"PT8S\">"
++          "<AdaptationSet contentType=\"video\" mimeType=\"video/mp4\">"
++          "<Representation id=\"v\" bandwidth=\"1000000\" codecs=\"avc1.4d401f\">"
++          "<SegmentTemplate timescale=\"" +
++          std::to_string(timescale) + "\" presentationTimeOffset=\"" + std::to_string(first) +
++          "\" initialization=\"init.mp4\" media=\"$Time$.m4s\"><SegmentTimeline><S t=\"" +
++          std::to_string(first) + "\" d=\"" + std::to_string(2 * timescale) +
++          "\" r=\"3\"/></SegmentTimeline></SegmentTemplate></Representation></AdaptationSet>"
++          "</Period></MPD>"};
++      ASSERT_TRUE(dash.Open("http://foo.bar/test.mpd", {}, mpd));
++      dash.PostOpen();
++      PLAYLIST::CAdaptationSet* adp{dash.m_periods[0]->GetAdaptationSets()[0].get()};
++      PLAYLIST::CRepresentation* rep{adp->GetRepresentations()[0].get()};
++      ASSERT_EQ(rep->GetTimescale(), timescale);
++      ASSERT_EQ(rep->Timeline().Get(1)->startPTS_, first + 2 * timescale);
++      TestAdaptiveStream stream{&dash, adp, rep};
++      ASSERT_TRUE(stream.start_stream());
++      // The session passes the elapsed time plus the PTS offset of the stream,
++      // in seconds
++      const uint64_t seekUs{2000000 + stream.GetAbsolutePTSOffset()};
+       bool needReset{false};
+-      ASSERT_TRUE(testStream->seek_time(10.0, true, needReset));
+-      EXPECT_EQ(testStream->read(buf, 16), 0U);
+-      EXPECT_TRUE(testStream->StreamChanged());
+-    }
+-    ASSERT_TRUE(testStream->start_stream());
+-    EXPECT_FALSE(testStream->StreamChanged());
+-    EXPECT_EQ(testStream->read(buf, 16), 16U);
+-    if (seek)
+-    {
+-      const PLAYLIST::CRepresentation* rep{testStream->getRepresentation()};
+-      const PLAYLIST::CSegment* segment{rep->current_segment_};
+-      ASSERT_NE(segment, nullptr);
+-      const double start{static_cast<double>(segment->startPTS_) / rep->GetTimescale()};
+-      const double end{static_cast<double>(segment->m_endPts) /
+-                       rep->GetTimescale()};
+-      EXPECT_LE(start, 10.0);
+-      EXPECT_GT(end, 10.0);
++      ASSERT_TRUE(
++          stream.seek_time(static_cast<double>(seekUs) / 1000000, preceeding, needReset));
++      EXPECT_EQ(rep->GetNextSegment(), rep->Timeline().Get(1));
++      stream.Stop();
++      dash.Uninitialize();
+     }
+-    testStream->Stop();
+   }
+ }
+-- 
+2.47.3
+

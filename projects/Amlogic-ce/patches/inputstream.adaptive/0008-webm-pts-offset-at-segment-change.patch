@@ -1,0 +1,371 @@
+From a98f5bb6d4c1fe4889ab084587ba2e255d60c8f1 Mon Sep 17 00:00:00 2001
+From: primez <mpincoski@gmail.com>
+Date: Sat, 31 Oct 2026 01:54:34 -0600
+Subject: [PATCH 08/12] [WebmReader] Take the PTS offset from the first frame
+ of a segment
+
+The parser reads the header of the next block to find the duration of
+a frame. After the last frame of a cluster, that read switches to the
+next segment, and the session sets the PTS offset of that segment. The
+sample reader took the PTS of the last frame of the cluster only after
+that, so the frame took the offset of the next segment. The PTS diff
+was then one frame wrong until the next seek. YouTube DASH sends VP9
+and HDR video as WebM with one cluster per segment.
+
+WebmReader now records the PTS of the first frame it reads after the
+offset changes, and the sample reader takes the diff from that PTS.
+
+The test copy of AdaptiveStream keeps the reads in a fixated
+initialization segment, as the WebM reader expects.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ inputstream.adaptive/changelog.txt    |   2 +-
+ src/demuxers/WebmReader.cpp           |   2 +
+ src/demuxers/WebmReader.h             |  12 ++
+ src/samplereader/WebmSampleReader.cpp |  14 ++-
+ src/samplereader/WebmSampleReader.h   |   2 +-
+ src/test/CMakeLists.txt               |   6 +-
+ src/test/TestAdaptiveStream.cpp       |   9 ++
+ src/test/TestAdaptiveStream.h         |   5 +-
+ src/test/TestWebmReader.cpp           | 152 ++++++++++++++++++++++++++
+ 9 files changed, 198 insertions(+), 6 deletions(-)
+ create mode 100644 src/test/TestWebmReader.cpp
+
+diff --git a/inputstream.adaptive/changelog.txt b/inputstream.adaptive/changelog.txt
+index 540f492..8b9c53d 100644
+--- a/inputstream.adaptive/changelog.txt
++++ b/inputstream.adaptive/changelog.txt
+@@ -1,5 +1,5 @@
+ v21.5.25-p3i.4 (2026-10-31)
+-- Fix the timing offset of HLS audio and TS video after each segment change, which was one or more frames wrong until the next seek
++- Fix the timing offset of HLS audio, TS video and WebM streams after each segment change, which was one or more frames wrong until the next seek
+ 
+ v21.5.25-p3i.3 (2026-10-30)
+ - Fix a seek in a live HLS stream that ended the audio when the next audio segment was not available yet
+diff --git a/src/demuxers/WebmReader.cpp b/src/demuxers/WebmReader.cpp
+index cb36be8..dc55a87 100644
+--- a/src/demuxers/WebmReader.cpp
++++ b/src/demuxers/WebmReader.cpp
+@@ -255,6 +255,8 @@ webm::Status WebmReader::OnSimpleBlockBegin(const webm::ElementMetadata& metadat
+   }
+ 
+   m_pts = m_ptsOffset + simple_block.timecode;
++  if (!m_segmentPts)
++    m_segmentPts = m_pts;
+   *action = webm::Action::kRead;
+   return webm::Status(webm::Status::kOkCompleted);
+ }
+diff --git a/src/demuxers/WebmReader.h b/src/demuxers/WebmReader.h
+index b095914..1aaaac5 100644
+--- a/src/demuxers/WebmReader.h
++++ b/src/demuxers/WebmReader.h
+@@ -8,6 +8,7 @@
+ 
+ #pragma once
+ 
++#include <optional>
+ #include <stdint.h>
+ #include <vector>
+ 
+@@ -46,6 +47,16 @@ public:
+   bool GetInformation(kodi::addon::InputstreamInfo& info);
+   bool ReadPacket();
+ 
++  /*!
++   * \brief Wait for the PTS of the first frame of a new segment.
++   */
++  void MarkSegmentStart() { m_segmentPts.reset(); }
++  /*!
++   * \brief The PTS of the first frame read after MarkSegmentStart().
++   * \return The PTS, or nothing while the frame is not read yet
++   */
++  std::optional<uint64_t> GetSegmentPts() const { return m_segmentPts; }
++
+   webm::Status OnSegmentBegin(const webm::ElementMetadata& metadata, webm::Action* action) override;
+ 
+   webm::Status OnElementBegin(const webm::ElementMetadata& metadata, webm::Action* action) override;
+@@ -69,6 +80,7 @@ private:
+   bool m_needFrame = false;
+   uint64_t m_pts = STREAM_NOPTS_VALUE;
+   uint64_t m_ptsOffset = 0;
++  std::optional<uint64_t> m_segmentPts;
+   uint64_t m_duration = 0;
+   std::vector<CUEPOINT> *m_cuePoints = nullptr;
+   AP4_DataBuffer m_frameBuffer, m_codecPrivate;
+diff --git a/src/samplereader/WebmSampleReader.cpp b/src/samplereader/WebmSampleReader.cpp
+index b09bd3e..661578e 100644
+--- a/src/samplereader/WebmSampleReader.cpp
++++ b/src/samplereader/WebmSampleReader.cpp
+@@ -41,9 +41,10 @@ AP4_Result CWebmSampleReader::ReadSample()
+     m_dts = GetDts() * 1000;
+     m_pts = GetPts() * 1000;
+ 
+-    if (~m_ptsOffs)
++    const std::optional<uint64_t> segmentPts{GetSegmentPts()};
++    if (~m_ptsOffs && segmentPts)
+     {
+-      m_ptsDiff = m_pts - m_ptsOffs;
++      m_ptsDiff = *segmentPts * 1000 - m_ptsOffs;
+       m_ptsOffs = ~0ULL;
+     }
+     return AP4_SUCCESS;
+@@ -53,6 +54,15 @@ AP4_Result CWebmSampleReader::ReadSample()
+   return AP4_ERROR_EOS;
+ }
+ 
++void CWebmSampleReader::SetPTSOffset(uint64_t offset)
++{
++  m_ptsOffs = offset;
++  // The parser reads the header of the next block to find the frame duration.
++  // So the segment can change before the last frame of the previous segment
++  // is a sample, and the offset applies to the first frame of the new segment.
++  MarkSegmentStart();
++}
++
+ void CWebmSampleReader::Reset(bool bEOS)
+ {
+   WebmReader::Reset();
+diff --git a/src/samplereader/WebmSampleReader.h b/src/samplereader/WebmSampleReader.h
+index e5cf70f..dfb222f 100644
+--- a/src/samplereader/WebmSampleReader.h
++++ b/src/samplereader/WebmSampleReader.h
+@@ -30,7 +30,7 @@ public:
+     return WebmReader::GetInformation(info);
+   }
+   bool TimeSeek(uint64_t pts, bool preceeding) override;
+-  void SetPTSOffset(uint64_t offset) override { m_ptsOffs = offset; }
++  void SetPTSOffset(uint64_t offset) override;
+   int64_t GetPTSDiff() const override { return m_ptsDiff; }
+   uint32_t GetTimeScale() const override { return 1000; }
+   AP4_UI32 GetStreamId() const override { return m_streamId; }
+diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
+index f14ee6b..fb5a922 100644
+--- a/src/test/CMakeLists.txt
++++ b/src/test/CMakeLists.txt
+@@ -64,13 +64,17 @@ add_executable(${DEMUXER_BINARY}
+     TestAdaptiveStream.cpp
+     TestADTSReader.cpp
+     TestTSReader.cpp
++    TestWebmReader.cpp
+     ../demuxers/ADTSReader.cpp
+     ../demuxers/TSReader.cpp
++    ../demuxers/WebmReader.cpp
+     ../parser/CodecParser.cpp
+     ../samplereader/ADTSSampleReader.cpp
+     ../samplereader/TSSampleReader.cpp
++    ../samplereader/WebmSampleReader.cpp
++    ../utils/StringUtils.cpp
+     )
+ 
+-target_link_libraries(${DEMUXER_BINARY} PRIVATE ${BENTO4_LIBRARIES} mpegts ${GTEST_LIBRARIES} Threads::Threads)
++target_link_libraries(${DEMUXER_BINARY} PRIVATE ${BENTO4_LIBRARIES} mpegts webm_parser ${GTEST_LIBRARIES} Threads::Threads)
+ 
+ add_test(NAME demuxer_tests COMMAND ${DEMUXER_BINARY} "${TEST_DATA_DIR}")
+diff --git a/src/test/TestAdaptiveStream.cpp b/src/test/TestAdaptiveStream.cpp
+index 31869b7..ff39333 100644
+--- a/src/test/TestAdaptiveStream.cpp
++++ b/src/test/TestAdaptiveStream.cpp
+@@ -47,3 +47,12 @@ bool CAdaptiveByteStream::waitingForSegment() const
+ {
+   return m_adStream->m_waitingForSegment;
+ }
++
++void CAdaptiveByteStream::FixateInitialization(bool on)
++{
++  m_adStream->m_fixateInitialization = on;
++}
++
++void CAdaptiveByteStream::SetSegmentFileOffset(uint64_t offset)
++{
++}
+diff --git a/src/test/TestAdaptiveStream.h b/src/test/TestAdaptiveStream.h
+index 3b4f69e..0112712 100644
+--- a/src/test/TestAdaptiveStream.h
++++ b/src/test/TestAdaptiveStream.h
+@@ -19,6 +19,7 @@
+ // the read, seek and tell rules of AdaptiveStream for downloaded segments: a
+ // read never spans two segments, a seek stays in the current segment, a failed
+ // seek moves only the segment read position, and tell can switch segments.
++// A fixated initialization segment does not switch.
+ // A switch calls the observer with the segment start time, as
+ // CSession::OnSegmentChanged sets the PTS offset of the sample reader.
+ namespace adaptive
+@@ -28,7 +29,8 @@ class AdaptiveStream
+ public:
+   bool ensureSegment()
+   {
+-    if (m_segments.size() > 1 && m_segmentReadPos >= m_segments.front().size())
++    if (!m_fixateInitialization && m_segments.size() > 1 &&
++        m_segmentReadPos >= m_segments.front().size())
+     {
+       m_segments.pop_front();
+       m_starts.pop_front();
+@@ -74,5 +76,6 @@ public:
+   size_t m_segmentReadPos{0};
+   uint64_t m_absolutePosition{0};
+   bool m_waitingForSegment{false};
++  bool m_fixateInitialization{false}; // Reads stay in the initialization segment
+ };
+ } // namespace adaptive
+diff --git a/src/test/TestWebmReader.cpp b/src/test/TestWebmReader.cpp
+new file mode 100644
+index 0000000..e65d717
+--- /dev/null
++++ b/src/test/TestWebmReader.cpp
+@@ -0,0 +1,152 @@
++/*
++ *  Copyright (C) 2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "AdaptiveByteStream.h"
++#include "TestAdaptiveStream.h"
++#include "samplereader/WebmSampleReader.h"
++
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <vector>
++
++#include <gtest/gtest.h>
++
++namespace
++{
++constexpr uint64_t BASE_MS = 100000; // 100 s
++constexpr uint64_t FRAME_MS = 20;
++constexpr int CLUSTERS = 3;
++constexpr int CLUSTER_FRAMES = 10;
++constexpr int64_t DIFF = 5000;
++
++// PTS of a frame in the microseconds of the sample reader
++uint64_t FrameTime(int frame)
++{
++  return (BASE_MS + frame * FRAME_MS) * 1000;
++}
++
++// An EBML element with an 8 byte size
++std::vector<uint8_t> Element(std::vector<uint8_t> id, const std::vector<uint8_t>& body)
++{
++  id.push_back(0x01);
++  for (int shift = 48; shift >= 0; shift -= 8)
++    id.push_back(static_cast<uint8_t>(body.size() >> shift));
++  id.insert(id.end(), body.begin(), body.end());
++  return id;
++}
++
++std::vector<uint8_t> UInt(std::vector<uint8_t> id, uint64_t value)
++{
++  std::vector<uint8_t> body;
++  for (int shift = 56; shift >= 0; shift -= 8)
++    body.push_back(static_cast<uint8_t>(value >> shift));
++  return Element(id, body);
++}
++
++std::vector<uint8_t> Concat(std::initializer_list<std::vector<uint8_t>> parts)
++{
++  std::vector<uint8_t> data;
++  for (const auto& part : parts)
++    data.insert(data.end(), part.begin(), part.end());
++  return data;
++}
++
++// The initialization segment: EBML header, segment of unknown size, one VP9 track
++std::vector<uint8_t> Initialization()
++{
++  const std::string codec{"V_VP9"};
++  const std::vector<uint8_t> track{Concat(
++      {UInt({0xD7}, 1), UInt({0x73, 0xC5}, 1), UInt({0x83}, 1),
++       Element({0x86}, std::vector<uint8_t>(codec.begin(), codec.end())),
++       Element({0xE0}, Concat({UInt({0xB0}, 16), UInt({0xBA}, 16)}))})};
++  const std::string docType{"webm"};
++  return Concat({Element({0x1A, 0x45, 0xDF, 0xA3},
++                         Element({0x42, 0x82}, std::vector<uint8_t>(docType.begin(), docType.end()))),
++                 {0x18, 0x53, 0x80, 0x67, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
++                 Element({0x16, 0x54, 0xAE, 0x6B}, Element({0xAE}, track))});
++}
++
++// One cluster per media segment. The last two bytes of each frame hold the frame index.
++std::vector<uint8_t> Cluster(int cluster)
++{
++  std::vector<uint8_t> body{UInt({0xE7}, BASE_MS + cluster * CLUSTER_FRAMES * FRAME_MS)};
++  for (int i = 0; i < CLUSTER_FRAMES; ++i)
++  {
++    const int frame{cluster * CLUSTER_FRAMES + i};
++    const uint64_t timecode{i * FRAME_MS};
++    std::vector<uint8_t> block{0x81, static_cast<uint8_t>(timecode >> 8),
++                               static_cast<uint8_t>(timecode), 0x80};
++    block.resize(block.size() + 30, 0);
++    block.push_back(static_cast<uint8_t>(frame >> 8));
++    block.push_back(static_cast<uint8_t>(frame));
++    const std::vector<uint8_t> simpleBlock{Element({0xA3}, block)};
++    body.insert(body.end(), simpleBlock.begin(), simpleBlock.end());
++  }
++  return Element({0x1F, 0x43, 0xB6, 0x75}, body);
++}
++
++class WebmSampleReaderTest : public ::testing::Test
++{
++protected:
++  // The session opens the reader on the initialization segment
++  void Open()
++  {
++    m_reader.reset();
++    m_segments = std::make_unique<adaptive::AdaptiveStream>();
++    m_segments->m_segments = {Initialization()};
++    m_segments->m_starts = {0};
++    m_segments->m_onSegmentChanged = [this](uint64_t start) { m_reader->SetPTSOffset(start); };
++    m_stream = std::make_unique<CAdaptiveByteStream>(m_segments.get());
++    m_reader = std::make_unique<CWebmSampleReader>(m_stream.get(), 1);
++    ASSERT_TRUE(m_reader->Initialize(nullptr));
++  }
++
++  // The next segment is downloaded
++  void AppendSegment(const std::vector<uint8_t>& data, uint64_t segmentStart)
++  {
++    m_segments->m_segments.push_back(data);
++    m_segments->m_starts.push_back(segmentStart);
++  }
++
++  int FrameIndex() const
++  {
++    const AP4_Byte* data{m_reader->GetSampleData()};
++    const AP4_Size size{m_reader->GetSampleDataSize()};
++    return size < 2 ? -1 : (data[size - 2] << 8) | data[size - 1];
++  }
++
++  std::unique_ptr<adaptive::AdaptiveStream> m_segments;
++  std::unique_ptr<CAdaptiveByteStream> m_stream;
++  std::unique_ptr<CWebmSampleReader> m_reader;
++};
++} // namespace
++
++// The parser reads the header of the next block to find the frame duration.
++// After the last frame of a cluster, that read switches to the next segment,
++// and the session sets the offset of the next segment. The offset must apply
++// to the first frame of the next segment, not to the last frame of the cluster.
++TEST_F(WebmSampleReaderTest, PtsDiffStaysTheSameAcrossSegments)
++{
++  Open();
++  for (int c = 0; c < CLUSTERS; ++c)
++    AppendSegment(Cluster(c), FrameTime(c * CLUSTER_FRAMES) - DIFF);
++
++  bool started{false};
++  ASSERT_EQ(m_reader->Start(started), AP4_SUCCESS);
++  for (int i = 0; i < CLUSTERS * CLUSTER_FRAMES; ++i)
++  {
++    SCOPED_TRACE(i);
++    if (i > 0)
++      ASSERT_EQ(m_reader->ReadSample(), AP4_SUCCESS);
++    EXPECT_EQ(FrameIndex(), i);
++    EXPECT_EQ(m_reader->PTS(), FrameTime(i));
++    EXPECT_EQ(m_reader->GetPTSDiff(), DIFF);
++  }
++  EXPECT_EQ(m_reader->ReadSample(), AP4_ERROR_EOS);
++}
+-- 
+2.47.3
+

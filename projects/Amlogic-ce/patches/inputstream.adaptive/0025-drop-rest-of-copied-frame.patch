@@ -1,0 +1,390 @@
+From 6150630285ff55f0b0bba877cce52106df757236 Mon Sep 17 00:00:00 2001
+From: primez <mpincoski@gmail.com>
+Date: Sat, 31 Oct 2026 06:03:09 -0600
+Subject: [PATCH] [TSReader] Drop the rest of a copied frame after a seek
+
+A seek can return a copy of a frame whose PES starts before the position
+where the read after the seek starts. The rest of that frame can follow
+after that position in a PES of its own, as the picture PES of a key
+frame whose parameter sets came in a PES before the segment end. The
+read after the seek parsed that PES again, and returned the key frame a
+second time without its parameter sets.
+
+ElementaryStream::NextFramePosition() gives the stream position of the
+PES where the next frame starts, and ContinueAfterCopy() replaces
+ContinueDecode(): after the next reset, the stream drops the PES that
+start before that position. If the end of the data completed the copied
+frame, the stream drops the data up to the next PES with a PTS.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ inputstream.adaptive/changelog.txt     |   1 +
+ lib/mpegts/mpegts/elementaryStream.cpp |  29 +++++-
+ lib/mpegts/mpegts/elementaryStream.h   |   6 +-
+ src/demuxers/TSReader.cpp              |  26 +++--
+ src/demuxers/TSReader.h                |   1 +
+ src/test/TestTSReader.cpp              | 131 +++++++++++++++++++++++--
+ 6 files changed, 175 insertions(+), 19 deletions(-)
+
+diff --git a/inputstream.adaptive/changelog.txt b/inputstream.adaptive/changelog.txt
+index 8f655f2..a03fd8b 100644
+--- a/inputstream.adaptive/changelog.txt
++++ b/inputstream.adaptive/changelog.txt
+@@ -22,6 +22,7 @@ v21.5.25-p3i.4 (2026-10-31)
+ - Fix a seek in a TS stream to a key frame whose PES starts in the segment before, which dropped the frames after that key frame up to the next key frame
+ - Fix the timestamps of TS video and audio frames that the parser read only after the next PES started, which took the PTS of the next frame, as with HEVC access unit delimiters or parameter sets in a PES of their own, or with an audio frame header across two PES
+ - Fix the last frame of a TS segment or stream whose parameter sets came in a PES of their own, which was read as two frames
++- Fix a seek in a TS stream to a key frame whose picture PES starts in the next segment, which returned that key frame twice
+ 
+ v21.5.25-p3i.3 (2026-10-30)
+ - Fix a seek in a live HLS stream that ended the audio when the next audio segment was not available yet
+diff --git a/lib/mpegts/mpegts/elementaryStream.cpp b/lib/mpegts/mpegts/elementaryStream.cpp
+index b093500..71cec40 100644
+--- a/lib/mpegts/mpegts/elementaryStream.cpp
++++ b/lib/mpegts/mpegts/elementaryStream.cpp
+@@ -34,6 +34,9 @@ ElementaryStream::ElementaryStream(uint16_t pes_pid)
+   , es_end_of_data(false)
+   , es_skip_to_pts(false)
+   , es_continue_decode(false)
++  , es_copy_next_position(0)
++  , es_resume_position(0)
++  , es_drop_pes(false)
+   , es_pes_start_pending(false)
+   , es_pes_start_position(0)
+   , es_pes_start_segment(0)
+@@ -63,7 +66,11 @@ void ElementaryStream::Reset(void)
+   ClearBuffer();
+   es_found_frame = false;
+   es_frame_valid = false;
+-  es_skip_to_pts = false;
++  // After a frame copy, the PES that start before the next frame belong to the copy
++  const uint64_t next = std::exchange(es_copy_next_position, 0);
++  es_skip_to_pts = next == UINT64_MAX;
++  es_resume_position = next == UINT64_MAX ? 0 : next;
++  es_drop_pes = false;
+   es_pts_position = UINT64_MAX;
+   es_next_pts = PTS_UNSET;
+ }
+@@ -76,6 +83,7 @@ void ElementaryStream::ClearBuffer()
+ 
+ void ElementaryStream::StartPes(uint64_t position, uint32_t segment)
+ {
++  es_drop_pes = position < es_resume_position;
+   es_pes_start_pending = true;
+   es_pes_start_position = position;
+   es_pes_start_segment = segment;
+@@ -95,6 +103,20 @@ const ElementaryStream::PesStart* ElementaryStream::GetPesStart(const unsigned c
+   return NULL;
+ }
+ 
++uint64_t ElementaryStream::NextFramePosition() const
++{
++  if (es_skip_to_pts)
++    return UINT64_MAX;
++  const PesStart* pes = GetPesStart(es_buf + es_consumed);
++  return pes ? pes->position : 0;
++}
++
++void ElementaryStream::ContinueAfterCopy(uint64_t nextFramePosition, bool keyFrame)
++{
++  es_copy_next_position = nextFramePosition;
++  es_continue_decode = keyFrame;
++}
++
+ const ElementaryStream::PesStart* ElementaryStream::StartPicture(size_t offset)
+ {
+   es_picture_start = offset - es_consumed;
+@@ -174,6 +196,11 @@ void ElementaryStream::ShiftPesStarts(size_t consumed)
+ 
+ int ElementaryStream::Append(const unsigned char* buf, size_t len, bool new_pts)
+ {
++  if (es_drop_pes)
++  {
++    es_pes_start_pending = false;
++    return 0;
++  }
+   // A seek scan reads on after the end of a segment. The rest of a frame that
+   // the end of the segment completed is not the start of the next frame.
+   if (es_skip_to_pts)
+diff --git a/lib/mpegts/mpegts/elementaryStream.h b/lib/mpegts/mpegts/elementaryStream.h
+index 2755687..d7a7699 100644
+--- a/lib/mpegts/mpegts/elementaryStream.h
++++ b/lib/mpegts/mpegts/elementaryStream.h
+@@ -104,7 +104,8 @@ namespace TSDemux
+ 
+     bool GetStreamPacket(STREAM_PKT* pkt);
+     bool GetEndPacket(STREAM_PKT* pkt); ///< Like GetStreamPacket(), but the buffer ends with the end of the last frame
+-    void ContinueDecode(bool continueDecode) { es_continue_decode = continueDecode; } ///< After the next reset, the frames continue the decode of a key frame that the reader returned
++    uint64_t NextFramePosition() const; ///< After GetStreamPacket(), the stream position of the PES where the next frame starts. UINT64_MAX: the next PES with a PTS.
++    void ContinueAfterCopy(uint64_t nextFramePosition, bool keyFrame); ///< After the next reset, the data continues after a frame copy that the reader returned
+     virtual void Parse(STREAM_PKT* pkt);
+ 
+     struct PesStart
+@@ -135,6 +136,9 @@ namespace TSDemux
+     bool   es_end_of_data;        ///< Parser: In GetEndPacket(), the last frame ends at the end of the buffer
+     bool   es_skip_to_pts;        ///< Parser: The end of the data completed the last frame. The rest of that frame follows up to the next PES with a PTS.
+     bool   es_continue_decode;    ///< Parser: After the next reset, the frames continue a decode
++    uint64_t es_copy_next_position; ///< After the next reset, the PES before this position belong to a frame copy. UINT64_MAX: up to the next PES with a PTS.
++    uint64_t es_resume_position;  ///< The PES before this position belong to a frame copy
++    bool   es_drop_pes;           ///< The PES belongs to a frame copy
+     bool TakeContinueDecode() { return std::exchange(es_continue_decode, false); } ///< Parser: In Reset(), the frames continue a decode
+     std::vector<PesStart> es_pes_starts; ///< The PES starts in buffer order, the first PES can start before the buffer
+     bool   es_pes_start_pending;
+diff --git a/src/demuxers/TSReader.cpp b/src/demuxers/TSReader.cpp
+index bc54d66..ed4a3ba 100644
+--- a/src/demuxers/TSReader.cpp
++++ b/src/demuxers/TSReader.cpp
+@@ -14,6 +14,7 @@
+ #include "utils/log.h"
+ 
+ #include <algorithm>
++#include <map>
+ #include <stdlib.h>
+ 
+ #include <bento4/Ap4ByteStream.h>
+@@ -241,7 +242,8 @@ bool TSReader::SeekTime(uint64_t timeInTs, bool preceeding)
+   std::deque<FrameCopy> previousPesFrames{std::move(m_seekPesFrames)};
+   m_seekPesFrames.clear();
+   m_frameCopies.clear();
+-  const auto keepCopy = [&](const TSDemux::ElementaryStream::PesStart& pes)
++  const auto keepCopy = [&](const TSDemux::ElementaryStream& stream,
++                            const TSDemux::ElementaryStream::PesStart& pes)
+   {
+     // The PES continues, so the frames of the PES that came before are copies too
+     for (auto frame{previousPesFrames.begin()}; frame != previousPesFrames.end();)
+@@ -255,7 +257,7 @@ bool TSReader::SeekTime(uint64_t timeInTs, bool preceeding)
+         ++frame;
+     }
+     copies.push_back({m_pkt, {m_pkt.data, m_pkt.data + m_pkt.size}, GetSegmentStart(),
+-                      pes.position});
++                      pes.position, stream.NextFramePosition()});
+   };
+   // The stream cannot seek back into a segment after a read of the next
+   // segment. So the scan reads the frames left in the buffers at the end of a
+@@ -298,7 +300,7 @@ bool TSReader::SeekTime(uint64_t timeInTs, bool preceeding)
+       continue;
+     const bool isCopy{pes->position < readStart};
+     if (isCopy)
+-      keepCopy(*pes);
++      keepCopy(*stream, *pes);
+     else if (hasVideo && GetStreamType() != INPUTSTREAM_TYPE_VIDEO)
+     {
+       const uint16_t pid{m_pkt.pid};
+@@ -309,7 +311,7 @@ bool TSReader::SeekTime(uint64_t timeInTs, bool preceeding)
+                                          }),
+                           lastPesFrames.end());
+       lastPesFrames.push_back({m_pkt, {m_pkt.data, m_pkt.data + m_pkt.size}, GetSegmentStart(),
+-                               pes->position});
++                               pes->position, stream->NextFramePosition()});
+     }
+     if (m_pkt.pts == PTS_UNSET)
+       continue;
+@@ -353,7 +355,7 @@ bool TSReader::SeekTime(uint64_t timeInTs, bool preceeding)
+       if (!pes)
+         continue;
+       if (pes->position < readStart)
+-        keepCopy(*pes);
++        keepCopy(*stream, *pes);
+       else
+         pending.erase(std::remove(pending.begin(), pending.end(), m_pkt.pid), pending.end());
+     }
+@@ -367,12 +369,16 @@ bool TSReader::SeekTime(uint64_t timeInTs, bool preceeding)
+     }
+   }
+   m_AVContext->GoPosition(lastRecovery, true);
+-  // The parser does not see a copied key frame, so the frames after the copy
+-  // continue the decode of that key frame
+-  if (seekFrameIsCopy)
++  // The data of the last copied frame of a stream can continue after
++  // lastRecovery, also in a PES of its own. The parser does not see a copied
++  // key frame, so the frames after the copy continue the decode of that key frame.
++  std::map<uint16_t, uint64_t> nextPositions;
++  for (const FrameCopy& copy : m_frameCopies)
++    nextPositions[copy.pkt.pid] = copy.nextPosition;
++  for (const auto& [pid, position] : nextPositions)
+   {
+-    if (TSDemux::ElementaryStream* stream{m_AVContext->GetStream(seekFrame->pid)})
+-      stream->ContinueDecode(true);
++    if (TSDemux::ElementaryStream* stream{m_AVContext->GetStream(pid)})
++      stream->ContinueAfterCopy(position, seekFrameIsCopy && pid == seekFrame->pid);
+   }
+   m_seekFrame = seekFrame;
+ 
+diff --git a/src/demuxers/TSReader.h b/src/demuxers/TSReader.h
+index d9af33a..0d0d41e 100644
+--- a/src/demuxers/TSReader.h
++++ b/src/demuxers/TSReader.h
+@@ -133,6 +133,7 @@ private:
+     std::vector<uint8_t> data;
+     std::optional<SegmentStart> segmentStart;
+     uint64_t pesPosition;
++    uint64_t nextPosition; // The PES of the next frame, see ElementaryStream::NextFramePosition()
+   };
+   std::deque<FrameCopy> m_frameCopies; // The read after a seek starts with these frames
+   std::optional<FrameCopy> m_frameCopy; // The data of the packet, if the packet is a copy
+diff --git a/src/test/TestTSReader.cpp b/src/test/TestTSReader.cpp
+index aa51eb1..838ff27 100644
+--- a/src/test/TestTSReader.cpp
++++ b/src/test/TestTSReader.cpp
+@@ -209,6 +209,15 @@ struct ParsedInfo
+   }
+ };
+ 
++std::unique_ptr<TSDemux::ElementaryStream> MakeParser(const VideoCodec& codec)
++{
++  if (codec.streamType == H264.streamType)
++    return std::make_unique<TSDemux::ES_h264>(VIDEO_PID);
++  if (codec.streamType == HEVC.streamType)
++    return std::make_unique<TSDemux::ES_hevc>(VIDEO_PID);
++  return std::make_unique<TSDemux::ES_MPEG2Video>(VIDEO_PID);
++}
++
+ // Parses access units, each in its own PES with a PTS. The parser gets the
+ // data in chunks, as from TS packets. Optionally the data ends at a cut in an
+ // access unit, as at the end of a segment, and the next data continues there.
+@@ -217,13 +226,7 @@ ParsedInfo ParseAccessUnits(const VideoCodec& codec,
+                             size_t chunk,
+                             std::optional<std::pair<size_t, size_t>> cut = std::nullopt)
+ {
+-  std::unique_ptr<TSDemux::ElementaryStream> stream;
+-  if (codec.streamType == H264.streamType)
+-    stream = std::make_unique<TSDemux::ES_h264>(VIDEO_PID);
+-  else if (codec.streamType == HEVC.streamType)
+-    stream = std::make_unique<TSDemux::ES_hevc>(VIDEO_PID);
+-  else
+-    stream = std::make_unique<TSDemux::ES_MPEG2Video>(VIDEO_PID);
++  const std::unique_ptr<TSDemux::ElementaryStream> stream{MakeParser(codec)};
+   TSDemux::STREAM_PKT pkt;
+   for (size_t n = 0; n < accessUnits.size(); ++n)
+   {
+@@ -827,6 +830,50 @@ TEST(TSParserTest, ThePartsOfTheParameterSetsGiveTheSameStreamInformation)
+ 
+ // A 3 byte start code can start a parameter set, also at the start of the
+ // data. The extra data has the parameter sets with 4 byte start codes.
++// A seek can copy the last frame of the data, which the end of the data
++// completed. The rest of that frame follows up to the next PES with a PTS, and
++// after the reset of the seek, the stream drops that rest.
++TEST(TSParserTest, TheRestOfACopiedLastFrameIsDropped)
++{
++  for (const VideoCodec* codec : {&H264, &HEVC, &MPEG2})
++  {
++    SCOPED_TRACE(codec->name);
++    const std::unique_ptr<TSDemux::ElementaryStream> stream{MakeParser(*codec)};
++    const std::vector<uint8_t>& key{codec->keyFrame};
++    const size_t cut{PictureStart(*codec, key) + 8};
++    std::vector<int64_t> read;
++    TSDemux::STREAM_PKT pkt;
++    const auto append = [&](int pes, const std::vector<uint8_t>& data, bool timestamped)
++    {
++      if (timestamped)
++        stream->c_pts = stream->c_dts = 90000 + 3000 * pes;
++      stream->StartPes(pes, 0);
++      stream->Append(data.data(), data.size(), timestamped);
++      while (stream->GetStreamPacket(&pkt))
++        read.push_back(pkt.pts);
++    };
++    append(0, key, true);
++    append(1, {key.begin(), key.begin() + cut}, true);
++    while (stream->GetEndPacket(&pkt))
++      read.push_back(pkt.pts);
++    EXPECT_EQ(read, (std::vector<int64_t>{90000, 93000}));
++    EXPECT_EQ(stream->NextFramePosition(), UINT64_MAX);
++
++    stream->ContinueAfterCopy(stream->NextFramePosition(), true);
++    stream->Reset();
++    read.clear();
++    // The rest of the copied frame, and a frame in the same PES without a PTS
++    std::vector<uint8_t> rest{key.begin() + cut, key.end()};
++    rest.insert(rest.end(), codec->frame.begin(), codec->frame.end());
++    append(2, rest, false);
++    append(3, codec->frame, true);
++    append(4, codec->frame, true);
++    while (stream->GetEndPacket(&pkt))
++      read.push_back(pkt.pts);
++    EXPECT_EQ(read, (std::vector<int64_t>{99000, 102000}));
++  }
++}
++
+ TEST(TSParserTest, TheExtraDataHasTheParameterSetsAfter3ByteStartCodes)
+ {
+   const auto shortStartCodes = [](const std::vector<uint8_t>& au) {
+@@ -1611,6 +1658,76 @@ TEST_F(TSSampleReaderTest, SeekLandsOnAKeyFrameAcrossTwoSegments)
+   }
+ }
+ 
++// The parameter sets and the picture of a key frame can come in two PES
++// packets with the PTS of the frame, and the segment can end after the first
++// TS packets of the frame. A seek to that key frame returns the whole frame,
++// and the frame before does not take the parameter sets.
++TEST_F(TSSampleReaderTest, SeekLandsOnAKeyFrameInTwoTimestampedPesAcrossTwoSegments)
++{
++  constexpr int SPLIT_FRAME{SEGMENT_VIDEO_FRAMES - 1};
++  for (const VideoCodec* codec : {&H264, &HEVC, &MPEG2})
++  {
++    std::vector<uint8_t> bigKeyFrame{codec->keyFrame};
++    bigKeyFrame.resize(500, 0);
++    TSWriter writer{*codec};
++    writer.WriteTables(true);
++    for (int frame = 0; frame < SPLIT_FRAME; ++frame)
++      writer.WriteVideoFrameInTimestampedPes(frame, frame % 5 ? codec->frame : codec->keyFrame);
++    const std::vector<uint8_t> frames{writer.Take()};
++    writer.WriteVideoFrameInTimestampedPes(SPLIT_FRAME, bigKeyFrame);
++    const std::vector<uint8_t> split{writer.Take()};
++    writer.WriteTables(true);
++    const std::vector<uint8_t> tables{writer.Take()};
++    for (int frame = SEGMENT_VIDEO_FRAMES; frame < 2 * SEGMENT_VIDEO_FRAMES; ++frame)
++      writer.WriteVideoFrameInTimestampedPes(frame, frame % 5 ? codec->frame : codec->keyFrame);
++    const std::vector<uint8_t> rest{writer.Take()};
++
++    for (size_t cut = 188; cut < split.size(); cut += 188)
++    for (const bool live : {false, true})
++    {
++      SCOPED_TRACE(testing::Message() << codec->name << ", cut " << cut << (live ? ", live" : ""));
++      std::vector<uint8_t> first{frames};
++      first.insert(first.end(), split.begin(), split.begin() + cut);
++      std::vector<uint8_t> second{tables};
++      second.insert(second.end(), split.begin() + cut, split.end());
++      second.insert(second.end(), rest.begin(), rest.end());
++
++      Open(first, Time(VideoPts(0)) - DIFF, INPUTSTREAM_TYPE_VIDEO);
++      if (live)
++        m_segments->m_waitingForSegment = true;
++      else
++        AppendSegment(second, Time(VideoPts(SEGMENT_VIDEO_FRAMES)) - SegmentDiff(1));
++      m_segments->m_absolutePosition -= m_segments->m_segmentReadPos;
++      m_segments->m_segmentReadPos = 0;
++      m_reader->Reset(false);
++      ASSERT_TRUE(m_reader->TimeSeek(Time(VideoPts(SPLIT_FRAME)), true));
++      if (live)
++      {
++        AppendSegment(second, Time(VideoPts(SEGMENT_VIDEO_FRAMES)) - SegmentDiff(1));
++        m_segments->m_waitingForSegment = false;
++        ASSERT_EQ(m_reader->ReadSample(), AP4_SUCCESS);
++      }
++      std::vector<uint64_t> read;
++      do
++      {
++        const int frame{SPLIT_FRAME + static_cast<int>(read.size())};
++        SCOPED_TRACE(frame);
++        read.push_back(m_reader->PTS());
++        EXPECT_GE(m_reader->GetSampleDataSize(),
++                  (frame == SPLIT_FRAME ? bigKeyFrame
++                   : frame % 5           ? codec->frame
++                                         : codec->keyFrame)
++                          .size() -
++                      1);
++      } while (AP4_SUCCEEDED(m_reader->ReadSample()));
++      std::vector<uint64_t> expected;
++      for (int frame = SPLIT_FRAME; frame < 2 * SEGMENT_VIDEO_FRAMES; ++frame)
++        expected.push_back(Time(VideoPts(frame)));
++      EXPECT_EQ(read, expected);
++    }
++  }
++}
++
+ // The last video and audio PES of a segment can continue in the next segment.
+ // After a seek to the key frame of that video PES, the audio of that audio PES
+ // follows the key frame, as the stream cannot read the PES again. This is also
+-- 
+2.47.3
+

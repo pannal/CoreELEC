@@ -1,0 +1,355 @@
+From 041f29fbeab9b66a97269b902bf7440dadaa51f2 Mon Sep 17 00:00:00 2001
+From: primez <mpincoski@gmail.com>
+Date: Sat, 31 Oct 2026 08:07:09 -0600
+Subject: [PATCH 36/41] [mpegts] Tell the end of a segment from the end of the
+ stream
+
+4875af2 sent an E-AC-3 frame alone at the end of the data when no byte
+followed, and waited in every other case. Both rules were wrong:
+
+- At a segment end exactly between the two frames of a 7.1 access unit,
+  the seek scan sent the independent frame alone, and the dependent
+  frame in the next segment had no frame before. With video, a seek to
+  the key frame of the next segment returned that frame as a copy
+  without the dependent frame (all 12 variants of the new 0-byte case).
+- At the real end of the stream, a dependent frame or header that the
+  stream cut made the parser wait for data that never came, and the
+  independent frame before was lost.
+
+GetEndPacket now takes endOfStream. The flush at a segment end
+(ReadNextPacket with m_stopAtSegmentEnd) passes false, and the public
+ReadEndPacket, which the sample reader calls only when no segment
+follows, passes true. The E-AC-3 parser waits for the rest of an access
+unit at a segment end, and sends the frame alone only at the end of the
+stream. The video parsers keep es_end_of_data and flush at both ends.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ lib/mpegts/mpegts/ES_AC3.cpp           |  9 ++-
+ lib/mpegts/mpegts/elementaryStream.cpp |  5 +-
+ lib/mpegts/mpegts/elementaryStream.h   |  3 +-
+ src/demuxers/TSReader.cpp              |  8 +--
+ src/demuxers/TSReader.h                |  2 +-
+ src/test/TestTSReader.cpp              | 89 ++++++++++++++++----------
+ 6 files changed, 70 insertions(+), 46 deletions(-)
+
+diff --git a/lib/mpegts/mpegts/ES_AC3.cpp b/lib/mpegts/mpegts/ES_AC3.cpp
+index 5bb197e..067dc7a 100644
+--- a/lib/mpegts/mpegts/ES_AC3.cpp
++++ b/lib/mpegts/mpegts/ES_AC3.cpp
+@@ -145,13 +145,12 @@ void ES_AC3::Parse(STREAM_PKT* pkt)
+       const int dependent = DependentFrameSize(es_buf + p + size, rest);
+       if (dependent > 0 && rest >= dependent)
+         size += dependent;
+-      // No dependent frame follows. At the end of the data, nothing can follow
+-      // too: the end of a segment between the frames looks the same as the
+-      // end of the stream.
+-      else if (!dependent || (es_end_of_data && !rest))
++      // No dependent frame follows, or the stream ends without the rest of
++      // the dependent frame
++      else if (!dependent || es_end_of_stream)
+         break;
+       else
+-        return; // The rest of the dependent frame or of the header follows
++        return; // The rest of the dependent frame or of the header can follow
+     }
+     bool streamChange = SetAudioInformation(m_Channels, m_SampleRate, m_BitRate, 0, 0);
+     pkt->pid            = pid;
+diff --git a/lib/mpegts/mpegts/elementaryStream.cpp b/lib/mpegts/mpegts/elementaryStream.cpp
+index b07fad4..0beb339 100644
+--- a/lib/mpegts/mpegts/elementaryStream.cpp
++++ b/lib/mpegts/mpegts/elementaryStream.cpp
+@@ -32,6 +32,7 @@ ElementaryStream::ElementaryStream(uint16_t pes_pid)
+   , es_consumed(0)
+   , es_parsed(0)
+   , es_end_of_data(false)
++  , es_end_of_stream(false)
+   , es_skip_to_pts(false)
+   , es_continue_decode(false)
+   , es_copy_next_position(0)
+@@ -342,11 +343,13 @@ bool ElementaryStream::GetStreamPacket(STREAM_PKT* pkt)
+   return false;
+ }
+ 
+-bool ElementaryStream::GetEndPacket(STREAM_PKT* pkt)
++bool ElementaryStream::GetEndPacket(STREAM_PKT* pkt, bool endOfStream)
+ {
+   es_end_of_data = true;
++  es_end_of_stream = endOfStream;
+   const bool ret = GetStreamPacket(pkt);
+   es_end_of_data = false;
++  es_end_of_stream = false;
+   return ret;
+ }
+ 
+diff --git a/lib/mpegts/mpegts/elementaryStream.h b/lib/mpegts/mpegts/elementaryStream.h
+index fd45df4..c8679f1 100644
+--- a/lib/mpegts/mpegts/elementaryStream.h
++++ b/lib/mpegts/mpegts/elementaryStream.h
+@@ -104,7 +104,7 @@ namespace TSDemux
+     STREAM_INFO stream_info;
+ 
+     bool GetStreamPacket(STREAM_PKT* pkt);
+-    bool GetEndPacket(STREAM_PKT* pkt); ///< Like GetStreamPacket(), but the buffer ends with the end of the last frame
++    bool GetEndPacket(STREAM_PKT* pkt, bool endOfStream); ///< Like GetStreamPacket(), but the buffer ends with the end of the last frame. Without endOfStream, the next segment can continue the data.
+     uint64_t NextFramePosition() const; ///< After GetStreamPacket(), the stream position of the PES where the next frame starts. UINT64_MAX: the next PES with a PTS.
+     void ContinueAfterCopy(uint64_t nextFramePosition, bool keyFrame); ///< After the next reset, the data continues after a frame copy that the reader returned
+     struct Clock
+@@ -142,6 +142,7 @@ namespace TSDemux
+     size_t es_consumed;           ///< Consumed payload. Will be erased on next append
+     size_t es_parsed;             ///< Parser: Last processed position in buffer
+     bool   es_end_of_data;        ///< Parser: In GetEndPacket(), the last frame ends at the end of the buffer
++    bool   es_end_of_stream;      ///< Parser: In GetEndPacket(), no data follows the buffer
+     bool   es_skip_to_pts;        ///< Parser: The end of the data completed the last frame. The rest of that frame follows up to the next PES with a PTS.
+     bool   es_continue_decode;    ///< Parser: After the next reset, the frames continue a decode
+     uint64_t es_copy_next_position; ///< After the next reset, the PES before this position belong to a frame copy. UINT64_MAX: up to the next PES with a PTS.
+diff --git a/src/demuxers/TSReader.cpp b/src/demuxers/TSReader.cpp
+index 53b008b..35a23bf 100644
+--- a/src/demuxers/TSReader.cpp
++++ b/src/demuxers/TSReader.cpp
+@@ -452,7 +452,7 @@ bool TSReader::ReadPacket(bool scanStreamInfo)
+ 
+ bool TSReader::ReadEndPacket()
+ {
+-  return PacketRead(ReadNextEndPacket());
++  return PacketRead(ReadNextEndPacket(true));
+ }
+ 
+ bool TSReader::PacketRead(bool read)
+@@ -492,7 +492,7 @@ bool TSReader::ReadNextPacket(bool scanStreamInfo)
+   while (!ret)
+   {
+     if (m_stopAtSegmentEnd && IsSegmentEnd(m_AVContext->GetPosition()))
+-      return ReadNextEndPacket();
++      return ReadNextEndPacket(false);
+ 
+     int errorCode;
+     if ((errorCode = m_AVContext->TSResync()) != TSDemux::AVCONTEXT_CONTINUE)
+@@ -629,11 +629,11 @@ void TSReader::ResumeClocks(const std::map<uint16_t, TSDemux::ElementaryStream::
+   }
+ }
+ 
+-bool TSReader::ReadNextEndPacket()
++bool TSReader::ReadNextEndPacket(bool endOfStream)
+ {
+   for (auto& tsInfo : m_streamInfos)
+   {
+-    if (tsInfo.m_enabled && tsInfo.m_stream->GetEndPacket(&m_pkt))
++    if (tsInfo.m_enabled && tsInfo.m_stream->GetEndPacket(&m_pkt, endOfStream))
+     {
+       if (m_pkt.streamChange)
+         HandleStreamChange(m_pkt.pid);
+diff --git a/src/demuxers/TSReader.h b/src/demuxers/TSReader.h
+index 299bf87..510bdf4 100644
+--- a/src/demuxers/TSReader.h
++++ b/src/demuxers/TSReader.h
+@@ -111,7 +111,7 @@ protected:
+ private:
+   bool GetPacket();
+   bool ReadNextPacket(bool scanStreamInfo);
+-  bool ReadNextEndPacket();
++  bool ReadNextEndPacket(bool endOfStream);
+   /*!
+    * \brief The packet of a read, if the read returned one, sets the state that
+    *        each packet sets
+diff --git a/src/test/TestTSReader.cpp b/src/test/TestTSReader.cpp
+index 25d32cf..bc80f15 100644
+--- a/src/test/TestTSReader.cpp
++++ b/src/test/TestTSReader.cpp
+@@ -292,13 +292,13 @@ ParsedInfo ParseAccessUnits(const VideoCodec& codec,
+         ;
+       if (cut && cut->first == n && cut->second == end)
+       {
+-        while (stream->GetEndPacket(&pkt))
++        while (stream->GetEndPacket(&pkt, false))
+           ;
+       }
+       start = end;
+     }
+   }
+-  while (stream->GetEndPacket(&pkt))
++  while (stream->GetEndPacket(&pkt, true))
+     ;
+   const TSDemux::STREAM_INFO& info{stream->stream_info};
+   return {{info.extra_data, info.extra_data + info.extra_data_size}, info.width, info.height};
+@@ -923,7 +923,7 @@ TEST(TSParserTest, TheRestOfACopiedLastFrameIsDropped)
+     };
+     append(0, key, true);
+     append(1, {key.begin(), key.begin() + cut}, true);
+-    while (stream->GetEndPacket(&pkt))
++    while (stream->GetEndPacket(&pkt, false))
+       read.push_back(pkt.pts);
+     EXPECT_EQ(read, (std::vector<int64_t>{90000, 93000}));
+     EXPECT_EQ(stream->NextFramePosition(), UINT64_MAX);
+@@ -937,7 +937,7 @@ TEST(TSParserTest, TheRestOfACopiedLastFrameIsDropped)
+     append(2, rest, false);
+     append(3, codec->frame, true);
+     append(4, codec->frame, true);
+-    while (stream->GetEndPacket(&pkt))
++    while (stream->GetEndPacket(&pkt, true))
+       read.push_back(pkt.pts);
+     EXPECT_EQ(read, (std::vector<int64_t>{99000, 102000}));
+   }
+@@ -1016,7 +1016,7 @@ TEST(TSParserTest, ALatmFrameWithoutDataIsSkipped)
+   stream.Append(data.data(), data.size(), true);
+   std::vector<std::pair<int, int64_t>> read;
+   TSDemux::STREAM_PKT pkt;
+-  while (read.size() < 10 && (stream.GetStreamPacket(&pkt) || stream.GetEndPacket(&pkt)))
++  while (read.size() < 10 && (stream.GetStreamPacket(&pkt) || stream.GetEndPacket(&pkt, true)))
+     read.emplace_back(pkt.size == 123 ? (pkt.data[121] << 8) | pkt.data[122] : -1, pkt.pts);
+   EXPECT_EQ(read, (std::vector<std::pair<int, int64_t>>{
+                       {0, 90000}, {2, 90000 + AUDIO_TICKS}, {3, 90000 + 2 * AUDIO_TICKS}}));
+@@ -1055,7 +1055,7 @@ std::vector<AudioFrame> ReadAudioFrames(TSDemux::ElementaryStream& stream,
+     while (read.size() < 10 && stream.GetStreamPacket(&pkt))
+       read.push_back({static_cast<unsigned int>(pkt.size), pkt.pts, pkt.duration});
+   }
+-  while (read.size() < 10 && stream.GetEndPacket(&pkt))
++  while (read.size() < 10 && stream.GetEndPacket(&pkt, true))
+     read.push_back({static_cast<unsigned int>(pkt.size), pkt.pts, pkt.duration});
+   return read;
+ }
+@@ -1211,12 +1211,6 @@ TEST(TSParserTest, EAc3FramesHaveTheDurationOfTheirBlocks)
+                                      {128, 90000 + 3 * EAC3_TICKS, EAC3_TICKS}}));
+ }
+ 
+-// The end of a segment can come between the frames of an E-AC-3 access unit.
+-// With the start of a dependent header after the frame, the parser keeps the
+-// frame for the rest of the access unit in the next segment. A frame with no
+-// data after the frame, or with other data, comes at the end of the data: the
+-// end of the stream looks the same. Then a dependent frame in the next data
+-// has no frame before.
+ // Dependent frames without the frame before, as at the start of the data,
+ // are no frames, and the frames after them come
+ TEST(TSParserTest, EAc3DependentFramesWithoutAFrameBeforeAreSkipped)
+@@ -1242,30 +1236,47 @@ TEST(TSParserTest, EAc3DependentFramesWithoutAFrameBeforeAreSkipped)
+   }
+ }
+ 
+-TEST(TSParserTest, AnEAc3AccessUnitWaitsForTheRestAtTheEndOfTheData)
++// The end of a segment can come between the frames of an E-AC-3 access unit,
++// or inside the dependent frame. The next segment can continue the access
++// unit, so the parser keeps the frame for the rest. At the end of the stream,
++// the frame comes alone, without the dependent frame that the stream cuts.
++TEST(TSParserTest, AnEAc3AccessUnitWaitsForTheRestAtTheEndOfASegment)
+ {
+   for (const size_t split : {size_t{128}, size_t{129}, size_t{130}, size_t{134}, size_t{200}})
+   {
+-    SCOPED_TRACE(testing::Message() << "end after " << split << " bytes");
+     std::vector<uint8_t> data{Eac3AccessUnit(0)};
+     const std::vector<uint8_t> next{Eac3AccessUnit(1)};
+     data.insert(data.end(), next.begin(), next.end());
++    const auto readFrames = [](TSDemux::ES_AC3& stream, std::vector<AudioFrame>& read,
++                               std::optional<bool> endOfStream)
++    {
++      TSDemux::STREAM_PKT pkt;
++      while (read.size() < 10 &&
++             (stream.GetStreamPacket(&pkt) ||
++              (endOfStream && stream.GetEndPacket(&pkt, *endOfStream))))
++        read.push_back({static_cast<unsigned int>(pkt.size), pkt.pts, pkt.duration});
++    };
++    {
++      SCOPED_TRACE(testing::Message() << "segment end after " << split << " bytes");
++      TSDemux::ES_AC3 stream{AUDIO_PID};
++      stream.c_pts = stream.c_dts = 90000;
++      stream.StartPes(0, 0);
++      stream.Append(data.data(), split, true);
++      std::vector<AudioFrame> read;
++      readFrames(stream, read, false);
++      stream.Append(data.data() + split, data.size() - split, false);
++      readFrames(stream, read, true);
++      EXPECT_EQ(read, (std::vector<AudioFrame>{{256, 90000, EAC3_TICKS},
++                                               {256, 90000 + EAC3_TICKS, EAC3_TICKS}}));
++    }
++    SCOPED_TRACE(testing::Message() << "stream end after " << split << " bytes");
+     TSDemux::ES_AC3 stream{AUDIO_PID};
+     stream.c_pts = stream.c_dts = 90000;
+     stream.StartPes(0, 0);
+     stream.Append(data.data(), split, true);
+     std::vector<AudioFrame> read;
+-    TSDemux::STREAM_PKT pkt;
+-    const auto readFrames = [&](bool end)
+-    {
+-      while (read.size() < 10 && (stream.GetStreamPacket(&pkt) || (end && stream.GetEndPacket(&pkt))))
+-        read.push_back({static_cast<unsigned int>(pkt.size), pkt.pts, pkt.duration});
+-    };
+-    readFrames(true);
+-    stream.Append(data.data() + split, data.size() - split, false);
+-    readFrames(true);
+-    EXPECT_EQ(read, (std::vector<AudioFrame>{{split == 128 ? 128U : 256U, 90000, EAC3_TICKS},
+-                                             {256, 90000 + EAC3_TICKS, EAC3_TICKS}}));
++    readFrames(stream, read, true);
++    EXPECT_EQ(read, (std::vector<AudioFrame>{{128, 90000, EAC3_TICKS}}));
+   }
+   // Other data after the frame
+   std::vector<uint8_t> data{Eac3Frame(0)};
+@@ -2140,15 +2151,17 @@ TEST_F(TSSampleReaderTest, SeekToAKeyFrameAcrossTwoSegmentsKeepsTheAudioAcrossTh
+   // The audio of the next segment comes before or after the video of a frame.
+   // With the video first, the rest of the audio PES comes after the next video PES.
+   // A live seek waits for the next segment, also over more reads. The first
+-  // segment holds one or more frames of the audio PES.
++  // segment holds one or more frames of the audio PES. With 0 audio bytes, the
++  // first TS packet ends after the first frame of the PES, between the two
++  // frames of an E-AC-3 access unit.
+   for (const AudioCodec* codec : {&AAC, &EAC3_71})
+-  for (const size_t audioSplit : {size_t{188}, size_t{376}})
++  for (const size_t audioSplit : {size_t{0}, size_t{188}, size_t{376}})
+   for (const bool live : {false, true})
+   for (const int waitReads : {0, 2})
+   for (const bool audioFirst : {true, false})
+   for (const bool preceeding : {true, false})
+   {
+-    if (!live && waitReads)
++    if ((!live && waitReads) || (!audioSplit && codec != &EAC3_71))
+       continue;
+     SCOPED_TRACE(testing::Message() << (codec == &AAC ? "AAC, " : "7.1 E-AC-3, ") << audioSplit
+                                     << " audio bytes, "
+@@ -2169,16 +2182,24 @@ TEST_F(TSSampleReaderTest, SeekToAKeyFrameAcrossTwoSegmentsKeepsTheAudioAcrossTh
+     // 9 of the 14 bytes of the PES header of the key frame
+     writer.WriteVideoFrame(SPLIT_FRAME, H264.keyFrame, 9);
+     const std::vector<uint8_t> keyFrame{writer.Take()};
+-    writer.WriteAudio(audioPts(SPLIT_AUDIO) - AUDIO_LEAD, SPLIT_AUDIO, SPLIT_FRAMES, SPLIT_FRAMES,
+-                      false);
++    std::vector<uint8_t> payload;
++    for (int a = SPLIT_AUDIO; a < SPLIT_AUDIO + SPLIT_FRAMES; ++a)
++    {
++      const std::vector<uint8_t> frame{codec->frame(a)};
++      payload.insert(payload.end(), frame.begin(), frame.end());
++    }
++    // The PES header has 14 bytes
++    writer.WriteAudioPes(audioPts(SPLIT_AUDIO) - AUDIO_LEAD, payload,
++                         audioSplit ? 184 : 14 + Eac3Frame(0).size());
+     const std::vector<uint8_t> audio{writer.Take()};
++    const size_t firstBytes{audioSplit ? audioSplit : 188};
+     first.insert(first.end(), keyFrame.begin(), keyFrame.begin() + 188);
+-    first.insert(first.end(), audio.begin(), audio.begin() + audioSplit);
++    first.insert(first.end(), audio.begin(), audio.begin() + firstBytes);
+     writer.WriteTables(true);
+     std::vector<uint8_t> second{writer.Take()};
+     second.insert(second.end(), keyFrame.begin() + 188, keyFrame.end());
+     if (audioFirst)
+-      second.insert(second.end(), audio.begin() + audioSplit, audio.end());
++      second.insert(second.end(), audio.begin() + firstBytes, audio.end());
+     for (int v = SEGMENT_VIDEO_FRAMES; v < 2 * SEGMENT_VIDEO_FRAMES; ++v)
+     {
+       const int a{2 * v + SPLIT_FRAMES};
+@@ -2188,7 +2209,7 @@ TEST_F(TSSampleReaderTest, SeekToAKeyFrameAcrossTwoSegmentsKeepsTheAudioAcrossTh
+       {
+         const std::vector<uint8_t> video{writer.Take()};
+         second.insert(second.end(), video.begin(), video.end());
+-        second.insert(second.end(), audio.begin() + audioSplit, audio.end());
++        second.insert(second.end(), audio.begin() + firstBytes, audio.end());
+       }
+       writer.WriteAudio(audioPts(a) - AUDIO_LEAD, a, 2, 1, false);
+       if (audioFirst)
+@@ -2579,7 +2600,7 @@ TEST_F(TSSampleReaderTest, AudioReleasedBeforeASeekDoesNotComeAfterTheSeek)
+ TEST_F(TSSampleReaderTest, Eac3AccessUnitsAcrossSegmentsAreWhole)
+ {
+   const auto eac3Pts = [](int unit) { return BASE_PTS + unit * EAC3_TICKS; };
+-  for (const size_t dependentBytes : {size_t{3}, size_t{6}})
++  for (const size_t dependentBytes : {size_t{0}, size_t{3}, size_t{6}})
+   for (const std::optional<int> target : {std::optional<int>{}, std::optional<int>{5},
+                                           std::optional<int>{7}})
+   {
+-- 
+2.47.3
+

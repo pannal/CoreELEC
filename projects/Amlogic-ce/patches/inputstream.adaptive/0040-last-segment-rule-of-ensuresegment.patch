@@ -1,0 +1,236 @@
+From 7a4f916b18c598ce7a1bea6bb8284270abb10dd7 Mon Sep 17 00:00:00 2001
+From: primez <mpincoski@gmail.com>
+Date: Sat, 31 Oct 2026 08:44:27 -0600
+Subject: [PATCH 40/41] [AdaptiveStream] Tell the last segment with the rule
+ that loads the next segment
+
+IsLastSegment asked only the tree. For a live DASH period with a
+presentationTimeOffset before the last period, the tree compares segment
+times that include the offset with the period end, and so called the first
+segments of the period the last. The TS reader then flushed an E-AC-3
+access unit across those segments as two samples.
+
+IsLastSegment now uses the same rule as ensureSegment: a segment follows
+when the timeline has a next segment, or when a manifest update can add
+one. Both share CanAddLiveSegment.
+
+The TS reader tests convert the packet duration without a narrowing warning.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/common/AdaptiveStream.cpp | 12 +++++--
+ src/common/AdaptiveStream.h   |  4 +++
+ src/test/TestDASHTree.cpp     | 54 ++++++++++++++++++++++++++++++
+ src/test/TestHLSTree.cpp      | 62 +++++++++++++++++++++++++++++++++++
+ src/test/TestTSReader.cpp     |  9 +++--
+ 5 files changed, 135 insertions(+), 6 deletions(-)
+
+diff --git a/src/common/AdaptiveStream.cpp b/src/common/AdaptiveStream.cpp
+index 1515dde..b8d8146 100644
+--- a/src/common/AdaptiveStream.cpp
++++ b/src/common/AdaptiveStream.cpp
+@@ -902,8 +902,7 @@ bool AdaptiveStream::ensureSegment()
+     else
+       nextSegment = current_rep_->GetNextSegment();
+ 
+-    if (!nextSegment && (m_tree->HasManifestUpdates() || m_tree->HasManifestUpdatesSegs()) &&
+-        !m_tree->IsLastSegment(current_period_, current_rep_, current_rep_->current_segment_))
++    if (!nextSegment && CanAddLiveSegment())
+     {
+       // Ensure to add a new segment only when the last one in the buffer has been consumed
+       if (available_segment_buffers_ == 0)
+@@ -1334,7 +1333,14 @@ bool AdaptiveStream::IsLastSegment() const
+   if (!current_rep_)
+     return true;
+   std::lock_guard<adaptive::AdaptiveTree::TreeUpdateThread> lckUpdTree(m_tree->GetTreeUpdMutex());
+-  return m_tree->IsLastSegment(current_period_, current_rep_, current_rep_->current_segment_);
++  // The same rule as ensureSegment, which loads the next segment
++  return !current_rep_->GetNextSegment() && !CanAddLiveSegment();
++}
++
++bool AdaptiveStream::CanAddLiveSegment() const
++{
++  return (m_tree->HasManifestUpdates() || m_tree->HasManifestUpdatesSegs()) &&
++         !m_tree->IsLastSegment(current_period_, current_rep_, current_rep_->current_segment_);
+ }
+ 
+ bool AdaptiveStream::waitingForSegment() const
+diff --git a/src/common/AdaptiveStream.h b/src/common/AdaptiveStream.h
+index 1d195a7..b5cfa9b 100644
+--- a/src/common/AdaptiveStream.h
++++ b/src/common/AdaptiveStream.h
+@@ -147,6 +147,10 @@ enum class EVENT_TYPE
+     bool IsRequiredCreateMovieAtom();
+ 
+   protected:
++    /*!
++     * \brief True if a manifest update can add a segment after the current segment
++     */
++    bool CanAddLiveSegment() const;
+     virtual bool parseIndexRange(PLAYLIST::CRepresentation* rep,
+                                  const std::vector<uint8_t>& buffer);
+ 
+diff --git a/src/test/TestDASHTree.cpp b/src/test/TestDASHTree.cpp
+index fc33621..f7e06b8 100644
+--- a/src/test/TestDASHTree.cpp
++++ b/src/test/TestDASHTree.cpp
+@@ -782,3 +782,57 @@ TEST_F(DASHTreeTest, TSBAvailabilityStartTime)
+   EXPECT_EQ(tl.GetFront()->m_number, 129069);
+   EXPECT_EQ(tl.GetBack()->m_number, 130268);
+ }
++
++TEST_F(DASHTreeTest, LastSegmentOfEachPeriod)
++{
++  // Two periods of three segments. In a live stream, the last period continues.
++  // An update period of 0 updates the manifest at each segment.
++  for (const bool live : {false, true})
++  {
++    for (const auto [offset, update] : {std::pair{false, "PT2S"}, std::pair{true, "PT2S"},
++                                        std::pair{false, "PT0S"}, std::pair{true, "PT0S"}})
++    {
++      SCOPED_TRACE(testing::Message() << "live=" << live << " presentationTimeOffset=" << offset
++                                      << " minimumUpdatePeriod=" << update);
++      tree->Uninitialize();
++      delete tree;
++      tree = new DASHTestTree();
++      CSrvBroker::GetInstance()->Init(m_kodiProps);
++      tree->Configure(m_reprChooser, {}, "");
++      const std::string start{offset ? "100" : "0"};
++      std::string manifest{"<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" type=\"" +
++                           std::string{live ? "dynamic" : "static"} +
++                           "\" minimumUpdatePeriod=\"" + update + "\">"};
++      for (int period = 0; period < 2; ++period)
++      {
++        manifest += "<Period id=\"" + std::to_string(period) + "\" start=\"PT" +
++                    std::to_string(period * 6) +
++                    "S\" duration=\"PT6S\"><AdaptationSet mimeType=\"video/mp2t\" "
++                    "contentType=\"video\"><SegmentTemplate timescale=\"1\" "
++                    "media=\"seg-$Number$.ts\"" +
++                    (offset ? " presentationTimeOffset=\"100\"" : "") +
++                    "><SegmentTimeline><S t=\"" + start +
++                    "\" d=\"2\" r=\"2\"/></SegmentTimeline></SegmentTemplate>"
++                    "<Representation id=\"1\" codecs=\"avc1.4d401f\" bandwidth=\"1000000\"/>"
++                    "</AdaptationSet></Period>";
++      }
++      manifest += "</MPD>";
++      ASSERT_TRUE(tree->Open("http://foo.bar/periods.mpd", {}, manifest));
++      ASSERT_EQ(tree->m_periods.size(), 2);
++      for (int period = 0; period < 2; ++period)
++      {
++        tree->m_currentPeriod = tree->m_periods[period].get();
++        auto adp = tree->m_currentPeriod->GetAdaptationSets()[0].get();
++        auto rep = adp->GetRepresentations()[0].get();
++        adaptive::AdaptiveStream stream{tree, adp, rep};
++        ASSERT_EQ(rep->Timeline().GetSize(), 3);
++        for (int segment = 0; segment < 3; ++segment)
++        {
++          rep->current_segment_ = rep->Timeline().Get(segment);
++          EXPECT_EQ(stream.IsLastSegment(), segment == 2 && (!live || period == 0))
++              << "period=" << period << " segment=" << segment;
++        }
++      }
++    }
++  }
++}
+diff --git a/src/test/TestHLSTree.cpp b/src/test/TestHLSTree.cpp
+index ee42bdb..8326707 100644
+--- a/src/test/TestHLSTree.cpp
++++ b/src/test/TestHLSTree.cpp
+@@ -439,3 +439,65 @@ TEST_F(HLSTreeTest, MultipleEncryptionSequenceDrm)
+   EXPECT_EQ(periods[0]->GetEncryptionState(), PLAYLIST::EncryptionState::ENCRYPTED_DRM);
+   EXPECT_EQ(periods[1]->GetEncryptionState(), PLAYLIST::EncryptionState::ENCRYPTED_DRM);
+ }
++
++namespace
++{
++class ChildManifestTree : public HLSTestTree
++{
++public:
++  using HLSTestTree::ParseChildManifest;
++};
++} // namespace
++
++TEST_F(HLSTreeTest, LastSegmentOfEachPeriod)
++{
++  // Two periods of three segments. In a live stream, the last period continues.
++  for (const bool live : {false, true})
++  {
++    for (const bool dateTime : {false, true})
++    {
++      SCOPED_TRACE(testing::Message() << "live=" << live << " program date time=" << dateTime);
++      CSrvBroker::GetInstance()->Init(m_kodiProps);
++      ChildManifestTree hls;
++      hls.Configure(m_reprChooser, {}, "");
++      ASSERT_TRUE(hls.Open("http://foo.bar/master.m3u8", {},
++                           "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,CODECS=\"avc1.4d401f\"\n"
++                           "video.m3u8\n"));
++      auto period = hls.m_periods[0].get();
++      auto adp = period->GetAdaptationSets()[0].get();
++      auto rep = adp->GetRepresentations()[0].get();
++      std::string media{"#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:1\n"};
++      if (!live)
++        media += "#EXT-X-PLAYLIST-TYPE:VOD\n";
++      for (int p = 0; p < 2; ++p)
++      {
++        if (p)
++          media += "#EXT-X-DISCONTINUITY\n";
++        if (dateTime)
++          media += "#EXT-X-PROGRAM-DATE-TIME:2026-10-30T00:00:0" + std::to_string(p * 6) + "Z\n";
++        for (int segment = 0; segment < 3; ++segment)
++          media += "#EXTINF:2,\nseg" + std::to_string(p * 3 + segment) + ".ts\n";
++      }
++      if (!live)
++        media += "#EXT-X-ENDLIST\n";
++      ASSERT_EQ(hls.ParseChildManifest(media, "http://foo.bar/video.m3u8", period, adp, rep),
++                adaptive::CHLSTree::ParseStatus::SUCCESS);
++      ASSERT_EQ(hls.m_periods.size(), 2);
++      for (int p = 0; p < 2; ++p)
++      {
++        hls.m_currentPeriod = hls.m_periods[p].get();
++        adp = hls.m_currentPeriod->GetAdaptationSets()[0].get();
++        rep = adp->GetRepresentations()[0].get();
++        adaptive::AdaptiveStream stream{&hls, adp, rep};
++        ASSERT_EQ(rep->Timeline().GetSize(), 3);
++        for (int segment = 0; segment < 3; ++segment)
++        {
++          rep->current_segment_ = rep->Timeline().Get(segment);
++          EXPECT_EQ(stream.IsLastSegment(), segment == 2 && (!live || p == 0))
++              << "period=" << p << " segment=" << segment;
++        }
++      }
++      hls.Uninitialize();
++    }
++  }
++}
+diff --git a/src/test/TestTSReader.cpp b/src/test/TestTSReader.cpp
+index 5f8df6b..3326d33 100644
+--- a/src/test/TestTSReader.cpp
++++ b/src/test/TestTSReader.cpp
+@@ -1054,10 +1054,12 @@ std::vector<AudioFrame> ReadAudioFrames(TSDemux::ElementaryStream& stream,
+   {
+     stream.Append(data.data() + pos, std::min(chunk, data.size() - pos), pos == 0);
+     while (read.size() < 10 && stream.GetStreamPacket(&pkt))
+-      read.push_back({static_cast<unsigned int>(pkt.size), pkt.pts, pkt.duration});
++      read.push_back(
++          {static_cast<unsigned int>(pkt.size), pkt.pts, static_cast<int64_t>(pkt.duration)});
+   }
+   while (read.size() < 10 && stream.GetEndPacket(&pkt, true))
+-    read.push_back({static_cast<unsigned int>(pkt.size), pkt.pts, pkt.duration});
++    read.push_back(
++        {static_cast<unsigned int>(pkt.size), pkt.pts, static_cast<int64_t>(pkt.duration)});
+   return read;
+ }
+ 
+@@ -1255,7 +1257,8 @@ TEST(TSParserTest, AnEAc3AccessUnitWaitsForTheRestAtTheEndOfASegment)
+       while (read.size() < 10 &&
+              (stream.GetStreamPacket(&pkt) ||
+               (endOfStream && stream.GetEndPacket(&pkt, *endOfStream))))
+-        read.push_back({static_cast<unsigned int>(pkt.size), pkt.pts, pkt.duration});
++        read.push_back(
++            {static_cast<unsigned int>(pkt.size), pkt.pts, static_cast<int64_t>(pkt.duration)});
+     };
+     {
+       SCOPED_TRACE(testing::Message() << "segment end after " << split << " bytes");
+-- 
+2.47.3
+

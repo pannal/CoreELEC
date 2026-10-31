@@ -1,0 +1,259 @@
+From b5474e80d3719084ce19121d462628f1a4b46320 Mon Sep 17 00:00:00 2001
+From: primez <mpincoski@gmail.com>
+Date: Sat, 31 Oct 2026 08:16:54 -0600
+Subject: [PATCH 37/41] [TSReader] Flush the last segment of a stream as the
+ end of the stream
+
+Round 11 finding (Astra): after 041f29f, the segment-end flush of the
+seek scan and the clock scan always let the E-AC-3 parser wait for the
+next segment. In the last segment of a stream, no next segment comes:
+a seek to the last frame of an E-AC-3 stream (also 5.1 without
+dependent frames) failed with EOS, and with the only PTS in the last
+access unit, a seek anywhere in that segment failed.
+
+AdaptiveStream::IsLastSegment() asks the tree whether a segment follows
+the current segment (AdaptiveTree::IsLastSegment, as ensureSegment
+does). The segment-end flush passes that value as endOfStream. A live
+stream in the last period always has a next segment.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/AdaptiveByteStream.cpp          |  5 +++
+ src/AdaptiveByteStream.h            |  1 +
+ src/common/AdaptiveStream.cpp       |  8 +++++
+ src/common/AdaptiveStream.h         |  4 +++
+ src/demuxers/TSReader.cpp           |  2 +-
+ src/demuxers/TSReader.h             |  5 +++
+ src/samplereader/TSSampleReader.cpp |  5 +++
+ src/samplereader/TSSampleReader.h   |  1 +
+ src/test/TestAdaptiveStream.cpp     |  5 +++
+ src/test/TestAdaptiveStream.h       |  3 ++
+ src/test/TestTSReader.cpp           | 56 +++++++++++++++++++++++++++++
+ 11 files changed, 94 insertions(+), 1 deletion(-)
+
+diff --git a/src/AdaptiveByteStream.cpp b/src/AdaptiveByteStream.cpp
+index e7eed12..8cae06b 100644
+--- a/src/AdaptiveByteStream.cpp
++++ b/src/AdaptiveByteStream.cpp
+@@ -56,6 +56,11 @@ bool CAdaptiveByteStream::IsSegmentEnd(AP4_Position position)
+   return m_adStream->IsSegmentEnd(position);
+ }
+ 
++bool CAdaptiveByteStream::IsLastSegment() const
++{
++  return m_adStream->IsLastSegment();
++}
++
+ void CAdaptiveByteStream::FixateInitialization(bool on)
+ {
+   m_adStream->FixateInitialization(on);
+diff --git a/src/AdaptiveByteStream.h b/src/AdaptiveByteStream.h
+index bc46be1..f819d18 100644
+--- a/src/AdaptiveByteStream.h
++++ b/src/AdaptiveByteStream.h
+@@ -50,6 +50,7 @@ public:
+   void Release() override{};
+   bool waitingForSegment() const;
+   bool IsSegmentEnd(AP4_Position position);
++  bool IsLastSegment() const;
+   void FixateInitialization(bool on);
+   void SetSegmentFileOffset(uint64_t offset);
+ 
+diff --git a/src/common/AdaptiveStream.cpp b/src/common/AdaptiveStream.cpp
+index 5bafd12..1515dde 100644
+--- a/src/common/AdaptiveStream.cpp
++++ b/src/common/AdaptiveStream.cpp
+@@ -1329,6 +1329,14 @@ bool AdaptiveStream::IsSegmentEnd(uint64_t position)
+   return position >= segmentStart + segment_buffers_[0]->buffer.size();
+ }
+ 
++bool AdaptiveStream::IsLastSegment() const
++{
++  if (!current_rep_)
++    return true;
++  std::lock_guard<adaptive::AdaptiveTree::TreeUpdateThread> lckUpdTree(m_tree->GetTreeUpdMutex());
++  return m_tree->IsLastSegment(current_period_, current_rep_, current_rep_->current_segment_);
++}
++
+ bool AdaptiveStream::waitingForSegment() const
+ {
+   if ((m_tree->HasManifestUpdates() || m_tree->HasManifestUpdatesSegs()) && state_ == RUNNING)
+diff --git a/src/common/AdaptiveStream.h b/src/common/AdaptiveStream.h
+index 0321538..1d195a7 100644
+--- a/src/common/AdaptiveStream.h
++++ b/src/common/AdaptiveStream.h
+@@ -129,6 +129,10 @@ enum class EVENT_TYPE
+      *        the download of the current segment continues at the position.
+      */
+     bool IsSegmentEnd(uint64_t position);
++    /*!
++     * \brief True if no segment of the stream follows the current segment
++     */
++    bool IsLastSegment() const;
+     void FixateInitialization(bool on);
+     void SetSegmentFileOffset(uint64_t offset) { m_segmentFileOffset = offset; };
+     bool StreamChanged() { return m_startEvent == EVENT_TYPE::REP_CHANGE; }
+diff --git a/src/demuxers/TSReader.cpp b/src/demuxers/TSReader.cpp
+index 35a23bf..4c7d0e9 100644
+--- a/src/demuxers/TSReader.cpp
++++ b/src/demuxers/TSReader.cpp
+@@ -492,7 +492,7 @@ bool TSReader::ReadNextPacket(bool scanStreamInfo)
+   while (!ret)
+   {
+     if (m_stopAtSegmentEnd && IsSegmentEnd(m_AVContext->GetPosition()))
+-      return ReadNextEndPacket(false);
++      return ReadNextEndPacket(IsLastSegment());
+ 
+     int errorCode;
+     if ((errorCode = m_AVContext->TSResync()) != TSDemux::AVCONTEXT_CONTINUE)
+diff --git a/src/demuxers/TSReader.h b/src/demuxers/TSReader.h
+index 510bdf4..982c9a0 100644
+--- a/src/demuxers/TSReader.h
++++ b/src/demuxers/TSReader.h
+@@ -107,6 +107,11 @@ protected:
+    * \brief True if the data of the current segment ends at the position
+    */
+   virtual bool IsSegmentEnd(uint64_t position) { return false; }
++  /*!
++   * \brief True if no segment follows the current segment, so the end of the
++   *        segment is the end of the stream
++   */
++  virtual bool IsLastSegment() { return false; }
+ 
+ private:
+   bool GetPacket();
+diff --git a/src/samplereader/TSSampleReader.cpp b/src/samplereader/TSSampleReader.cpp
+index 040df3e..93d3c86 100644
+--- a/src/samplereader/TSSampleReader.cpp
++++ b/src/samplereader/TSSampleReader.cpp
+@@ -194,6 +194,11 @@ bool CTSSampleReader::IsSegmentEnd(uint64_t position)
+   return m_adByteStream && m_adByteStream->IsSegmentEnd(position);
+ }
+ 
++bool CTSSampleReader::IsLastSegment()
++{
++  return m_adByteStream && m_adByteStream->IsLastSegment();
++}
++
+ void CTSSampleReader::SetPTSOffset(uint64_t offset)
+ {
+   // The demuxer emits a PES only when the next PES starts. So after a segment
+diff --git a/src/samplereader/TSSampleReader.h b/src/samplereader/TSSampleReader.h
+index d234dea..94b6da8 100644
+--- a/src/samplereader/TSSampleReader.h
++++ b/src/samplereader/TSSampleReader.h
+@@ -63,6 +63,7 @@ public:
+ 
+ protected:
+   bool IsSegmentEnd(uint64_t position) override;
++  bool IsLastSegment() override;
+ 
+ private:
+   bool Seek(uint64_t pts);
+diff --git a/src/test/TestAdaptiveStream.cpp b/src/test/TestAdaptiveStream.cpp
+index f718cac..dc60147 100644
+--- a/src/test/TestAdaptiveStream.cpp
++++ b/src/test/TestAdaptiveStream.cpp
+@@ -53,6 +53,11 @@ bool CAdaptiveByteStream::IsSegmentEnd(AP4_Position position)
+   return m_adStream->IsSegmentEnd(position);
+ }
+ 
++bool CAdaptiveByteStream::IsLastSegment() const
++{
++  return m_adStream->IsLastSegment();
++}
++
+ void CAdaptiveByteStream::FixateInitialization(bool on)
+ {
+   m_adStream->m_fixateInitialization = on;
+diff --git a/src/test/TestAdaptiveStream.h b/src/test/TestAdaptiveStream.h
+index 3e135e2..b62e395 100644
+--- a/src/test/TestAdaptiveStream.h
++++ b/src/test/TestAdaptiveStream.h
+@@ -63,6 +63,9 @@ public:
+            position >= m_absolutePosition - m_segmentReadPos + m_segments.front().size();
+   }
+ 
++  // A live stream that waits has a next segment
++  bool IsLastSegment() const { return m_segments.size() <= 1 && !m_waitingForSegment; }
++
+   bool seek(uint64_t pos)
+   {
+     if (m_segments.empty() || pos < m_absolutePosition - m_segmentReadPos)
+diff --git a/src/test/TestTSReader.cpp b/src/test/TestTSReader.cpp
+index bc80f15..b6fff16 100644
+--- a/src/test/TestTSReader.cpp
++++ b/src/test/TestTSReader.cpp
+@@ -129,6 +129,7 @@ struct AudioCodec
+ };
+ 
+ const AudioCodec AAC{0x0F, [](int index) { return AacFrame(index); }, AUDIO_TICKS};
++const AudioCodec EAC3{0x87, [](int index) { return Eac3Frame(0, 3, index); }, EAC3_TICKS};
+ const AudioCodec EAC3_71{0x87, Eac3AccessUnit, EAC3_TICKS};
+ 
+ // The parser reads an H.264 SPS or PPS only with 64 bytes after the start
+@@ -2573,6 +2574,61 @@ TEST_F(TSSampleReaderTest, HeldAudioOfShortSegmentsHasTheDiffOfItsSegment)
+   EXPECT_EQ(read, expected);
+ }
+ 
++// In the last segment of the stream, the E-AC-3 parser does not wait for
++// the next segment: a seek finds the last audio frame of the stream
++TEST_F(TSSampleReaderTest, ASeekFindsTheLastAudioFrameOfTheStream)
++{
++  for (const AudioCodec* codec : {&AAC, &EAC3, &EAC3_71})
++  for (const bool preceeding : {true, false})
++  for (const int target : {8, 9})
++  {
++    SCOPED_TRACE(testing::Message() << (codec == &AAC ? "AAC" : codec == &EAC3 ? "E-AC-3" : "7.1 E-AC-3")
++                                    << (preceeding ? "" : ", not preceeding") << ", seek to " << target);
++    TSWriter writer{H264, *codec};
++    writer.WriteTables(false);
++    writer.WriteAudio(BASE_PTS, 0, 10, 1, false);
++    Open(writer.Take(), Time(BASE_PTS) - DIFF, INPUTSTREAM_TYPE_AUDIO);
++    bool started{false};
++    ASSERT_EQ(m_reader->Start(started), AP4_SUCCESS);
++    m_segments->m_absolutePosition -= m_segments->m_segmentReadPos;
++    m_segments->m_segmentReadPos = 0;
++    m_reader->Reset(false);
++    ASSERT_TRUE(m_reader->TimeSeek(Time(BASE_PTS + target * codec->ticks), preceeding));
++    EXPECT_FALSE(m_reader->EOS());
++    EXPECT_EQ(FrameIndex(), target);
++    EXPECT_EQ(m_reader->GetSampleDataSize(), codec->frame(target).size());
++  }
++}
++
++// The only PTS of the last segment of the stream comes with the last access
++// unit. The clock scan of a seek takes the clock from that PTS.
++TEST_F(TSSampleReaderTest, ASeekTakesTheClockFromTheLastAudioFrameOfTheStream)
++{
++  for (const AudioCodec* codec : {&EAC3, &EAC3_71})
++  for (const int target : {0, 5, 9})
++  {
++    SCOPED_TRACE(testing::Message() << (codec == &EAC3 ? "E-AC-3" : "7.1 E-AC-3") << ", seek to "
++                                    << target);
++    TSWriter writer{H264, *codec};
++    writer.WriteTables(false);
++    for (int a = 0; a < 10; ++a)
++      writer.WriteAudioPes(a == 9 ? std::optional<uint64_t>{BASE_PTS + 9 * EAC3_TICKS}
++                                  : std::nullopt,
++                           codec->frame(a));
++    Open(writer.Take(), Time(BASE_PTS) - DIFF, INPUTSTREAM_TYPE_AUDIO);
++    bool started{false};
++    ASSERT_EQ(m_reader->Start(started), AP4_SUCCESS);
++    ASSERT_EQ(FrameIndex(), 0);
++    ASSERT_EQ(m_reader->PTS(), Time(BASE_PTS));
++    m_segments->m_absolutePosition -= m_segments->m_segmentReadPos;
++    m_segments->m_segmentReadPos = 0;
++    m_reader->Reset(false);
++    ASSERT_TRUE(m_reader->TimeSeek(Time(BASE_PTS + target * EAC3_TICKS), true));
++    EXPECT_EQ(FrameIndex(), target);
++    EXPECT_EQ(m_reader->PTS(), Time(BASE_PTS + target * EAC3_TICKS));
++  }
++}
++
+ // A seek drops the audio frames that came with the first PTS and still wait
+ // to be read
+ TEST_F(TSSampleReaderTest, AudioReleasedBeforeASeekDoesNotComeAfterTheSeek)
+-- 
+2.47.3
+

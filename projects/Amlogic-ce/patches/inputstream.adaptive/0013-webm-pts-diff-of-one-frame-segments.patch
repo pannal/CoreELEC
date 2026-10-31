@@ -1,0 +1,175 @@
+From fe11f505a8a70f816626165ed5c85447b15c65fa Mon Sep 17 00:00:00 2001
+From: primez <mpincoski@gmail.com>
+Date: Sat, 31 Oct 2026 03:08:01 -0600
+Subject: [PATCH 13/14] [WebmReader] Take the PTS diff of segments with one
+ frame
+
+The parser reads the header of the next block to find the duration of a
+frame. With one frame per segment, that read switches to the segment
+after the next frame before that frame is a sample. The reader now keeps
+the PTS offset with the first frame of the segment, so each frame takes
+the diff of its own segment.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/demuxers/WebmReader.cpp           | 10 +++++++--
+ src/demuxers/WebmReader.h             | 17 +++++++++------
+ src/samplereader/WebmSampleReader.cpp | 11 +++-------
+ src/samplereader/WebmSampleReader.h   |  1 -
+ src/test/TestWebmReader.cpp           | 30 +++++++++++++++++++++++----
+ 5 files changed, 48 insertions(+), 21 deletions(-)
+
+diff --git a/src/demuxers/WebmReader.cpp b/src/demuxers/WebmReader.cpp
+index dc55a87..a456499 100644
+--- a/src/demuxers/WebmReader.cpp
++++ b/src/demuxers/WebmReader.cpp
+@@ -255,8 +255,14 @@ webm::Status WebmReader::OnSimpleBlockBegin(const webm::ElementMetadata& metadat
+   }
+ 
+   m_pts = m_ptsOffset + simple_block.timecode;
+-  if (!m_segmentPts)
+-    m_segmentPts = m_pts;
++  // The read of the next block header can mark the next segment before this
++  // frame is a sample, so the frame keeps the offset of its own segment
++  m_segmentStart.reset();
++  if (m_segmentOffset)
++  {
++    m_segmentStart = {m_pts, *m_segmentOffset};
++    m_segmentOffset.reset();
++  }
+   *action = webm::Action::kRead;
+   return webm::Status(webm::Status::kOkCompleted);
+ }
+diff --git a/src/demuxers/WebmReader.h b/src/demuxers/WebmReader.h
+index 1aaaac5..97c35bf 100644
+--- a/src/demuxers/WebmReader.h
++++ b/src/demuxers/WebmReader.h
+@@ -47,15 +47,19 @@ public:
+   bool GetInformation(kodi::addon::InputstreamInfo& info);
+   bool ReadPacket();
+ 
++  struct SegmentStart
++  {
++    uint64_t pts; // PTS of the first frame of the segment
++    uint64_t offset; // Offset of MarkSegmentStart()
++  };
+   /*!
+-   * \brief Wait for the PTS of the first frame of a new segment.
++   * \brief The next frame read starts a segment with the offset.
+    */
+-  void MarkSegmentStart() { m_segmentPts.reset(); }
++  void MarkSegmentStart(uint64_t offset) { m_segmentOffset = offset; }
+   /*!
+-   * \brief The PTS of the first frame read after MarkSegmentStart().
+-   * \return The PTS, or nothing while the frame is not read yet
++   * \brief The segment start of the frame read, if the frame starts a segment.
+    */
+-  std::optional<uint64_t> GetSegmentPts() const { return m_segmentPts; }
++  std::optional<SegmentStart> GetSegmentStart() const { return m_segmentStart; }
+ 
+   webm::Status OnSegmentBegin(const webm::ElementMetadata& metadata, webm::Action* action) override;
+ 
+@@ -80,7 +84,8 @@ private:
+   bool m_needFrame = false;
+   uint64_t m_pts = STREAM_NOPTS_VALUE;
+   uint64_t m_ptsOffset = 0;
+-  std::optional<uint64_t> m_segmentPts;
++  std::optional<uint64_t> m_segmentOffset;
++  std::optional<SegmentStart> m_segmentStart;
+   uint64_t m_duration = 0;
+   std::vector<CUEPOINT> *m_cuePoints = nullptr;
+   AP4_DataBuffer m_frameBuffer, m_codecPrivate;
+diff --git a/src/samplereader/WebmSampleReader.cpp b/src/samplereader/WebmSampleReader.cpp
+index 661578e..9932fd1 100644
+--- a/src/samplereader/WebmSampleReader.cpp
++++ b/src/samplereader/WebmSampleReader.cpp
+@@ -41,12 +41,8 @@ AP4_Result CWebmSampleReader::ReadSample()
+     m_dts = GetDts() * 1000;
+     m_pts = GetPts() * 1000;
+ 
+-    const std::optional<uint64_t> segmentPts{GetSegmentPts()};
+-    if (~m_ptsOffs && segmentPts)
+-    {
+-      m_ptsDiff = *segmentPts * 1000 - m_ptsOffs;
+-      m_ptsOffs = ~0ULL;
+-    }
++    if (const std::optional<SegmentStart> start{GetSegmentStart()})
++      m_ptsDiff = start->pts * 1000 - start->offset;
+     return AP4_SUCCESS;
+   }
+   if (!m_adByteStream || !m_adByteStream->waitingForSegment())
+@@ -56,11 +52,10 @@ AP4_Result CWebmSampleReader::ReadSample()
+ 
+ void CWebmSampleReader::SetPTSOffset(uint64_t offset)
+ {
+-  m_ptsOffs = offset;
+   // The parser reads the header of the next block to find the frame duration.
+   // So the segment can change before the last frame of the previous segment
+   // is a sample, and the offset applies to the first frame of the new segment.
+-  MarkSegmentStart();
++  MarkSegmentStart(offset);
+ }
+ 
+ void CWebmSampleReader::Reset(bool bEOS)
+diff --git a/src/samplereader/WebmSampleReader.h b/src/samplereader/WebmSampleReader.h
+index dfb222f..8ae75a9 100644
+--- a/src/samplereader/WebmSampleReader.h
++++ b/src/samplereader/WebmSampleReader.h
+@@ -43,7 +43,6 @@ private:
+   AP4_UI32 m_streamId;
+   uint64_t m_pts{0};
+   uint64_t m_dts{0};
+-  uint64_t m_ptsOffs{~0ULL};
+   int64_t m_ptsDiff{0};
+   bool m_eos{false};
+   bool m_started{false};
+diff --git a/src/test/TestWebmReader.cpp b/src/test/TestWebmReader.cpp
+index cb4fd15..dfd318d 100644
+--- a/src/test/TestWebmReader.cpp
++++ b/src/test/TestWebmReader.cpp
+@@ -79,12 +79,12 @@ std::vector<uint8_t> Initialization()
+ }
+ 
+ // One cluster per media segment. The last two bytes of each frame hold the frame index.
+-std::vector<uint8_t> Cluster(int cluster)
++std::vector<uint8_t> Cluster(int cluster, int frames = CLUSTER_FRAMES)
+ {
+-  std::vector<uint8_t> body{UInt({0xE7}, BASE_MS + cluster * CLUSTER_FRAMES * FRAME_MS)};
+-  for (int i = 0; i < CLUSTER_FRAMES; ++i)
++  std::vector<uint8_t> body{UInt({0xE7}, BASE_MS + cluster * frames * FRAME_MS)};
++  for (int i = 0; i < frames; ++i)
+   {
+-    const int frame{cluster * CLUSTER_FRAMES + i};
++    const int frame{cluster * frames + i};
+     const uint64_t timecode{i * FRAME_MS};
+     std::vector<uint8_t> block{0x81, static_cast<uint8_t>(timecode >> 8),
+                                static_cast<uint8_t>(timecode), 0x80};
+@@ -156,3 +156,25 @@ TEST_F(WebmSampleReaderTest, PtsDiffChangesWithTheFirstFrameOfASegment)
+   }
+   EXPECT_EQ(m_reader->ReadSample(), AP4_ERROR_EOS);
+ }
++
++// With one frame per segment, the read of the next block header switches to
++// the segment after the next frame before that frame is a sample.
++TEST_F(WebmSampleReaderTest, PtsDiffOfSegmentsWithOneFrame)
++{
++  Open();
++  for (int c = 0; c < CLUSTERS; ++c)
++    AppendSegment(Cluster(c, 1), FrameTime(c) - SegmentDiff(c));
++
++  bool started{false};
++  ASSERT_EQ(m_reader->Start(started), AP4_SUCCESS);
++  for (int i = 0; i < CLUSTERS; ++i)
++  {
++    SCOPED_TRACE(i);
++    if (i > 0)
++      ASSERT_EQ(m_reader->ReadSample(), AP4_SUCCESS);
++    EXPECT_EQ(FrameIndex(), i);
++    EXPECT_EQ(m_reader->PTS(), FrameTime(i));
++    EXPECT_EQ(m_reader->GetPTSDiff(), SegmentDiff(i));
++  }
++  EXPECT_EQ(m_reader->ReadSample(), AP4_ERROR_EOS);
++}
+-- 
+2.47.3
+

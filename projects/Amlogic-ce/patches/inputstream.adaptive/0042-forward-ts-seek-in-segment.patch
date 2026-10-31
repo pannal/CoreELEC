@@ -1,0 +1,122 @@
+From ff7a6407d6e3c7f18bdb8d93611eaddcb3e1f594 Mon Sep 17 00:00:00 2001
+From: primez <mpincoski@gmail.com>
+Date: Sat, 31 Oct 2026 09:21:13 -0600
+Subject: [PATCH] [AdaptiveStream] Keep a forward TS video seek in the segment
+ of the seek time
+
+A forward video seek (not preceeding) after a segment start continued at
+the next segment, because seek_time assumed key frames only at segment
+starts. The TS reader finds the key frame at or after the seek time, also
+in the next segments, so a TS seek continued up to a segment late, and a
+seek in the last segment ended the playback. The other readers seek
+inside one segment and keep the skip to the next segment.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ inputstream.adaptive/changelog.txt |  1 +
+ src/common/AdaptiveStream.cpp      |  5 ++-
+ src/test/TestHLSTree.cpp           | 62 ++++++++++++++++++++++++++++++
+ 3 files changed, 67 insertions(+), 1 deletion(-)
+
+diff --git a/inputstream.adaptive/changelog.txt b/inputstream.adaptive/changelog.txt
+index c4d7b9c..ca70d69 100644
+--- a/inputstream.adaptive/changelog.txt
++++ b/inputstream.adaptive/changelog.txt
+@@ -32,6 +32,7 @@ v21.5.25-p3i.4 (2026-10-31)
+ - Fix the timing offset of a TS audio segment whose first PES has no PTS, which was off by the frames before the first PTS, and the timestamps of TS audio frames across the 33 bit PTS wrap before the first PTS and inside a PES
+ - Fix the segment times of HLS streams with EXTINF durations finer than 1 ms, which drifted from the media time (0.24 s after one hour of a YouTube stream), so a seek near a segment start could continue at the next segment
+ - Fix the period ends of a live DASH stream with more than one period and a SegmentList, or a SegmentTimeline with a presentationTimeOffset, which waited for segments after a complete period, or continued at the next period before the period was complete
++- Fix a forward seek in a TS video stream, which continued at the next segment instead of at the next key frame, and ended the playback in the last segment
+ 
+ v21.5.25-p3i.3 (2026-10-30)
+ - Fix a seek in a live HLS stream that ended the audio when the next audio segment was not available yet
+diff --git a/src/common/AdaptiveStream.cpp b/src/common/AdaptiveStream.cpp
+index b8d8146..96d3d0a 100644
+--- a/src/common/AdaptiveStream.cpp
++++ b/src/common/AdaptiveStream.cpp
+@@ -1265,8 +1265,11 @@ bool AdaptiveStream::seek_time(double seek_seconds, bool preceeding, bool& needR
+   if (choosen_seg < current_rep_->expired_segments_)
+     choosen_seg = current_rep_->expired_segments_;
+ 
++  // The TS reader finds the key frame at or after the seek time, also in the next
++  // segments. The other readers seek inside one segment.
+   if (!preceeding && sec_in_ts > current_rep_->Timeline().Get(choosen_seg)->startPTS_ &&
+-      current_adp_->GetStreamType() == StreamType::VIDEO)
++      current_adp_->GetStreamType() == StreamType::VIDEO &&
++      current_rep_->GetContainerType() != ContainerType::TS)
+   {
+     //Assume that we have I-Frames only at segment start
+     ++choosen_seg;
+diff --git a/src/test/TestHLSTree.cpp b/src/test/TestHLSTree.cpp
+index 8326707..67d8ae8 100644
+--- a/src/test/TestHLSTree.cpp
++++ b/src/test/TestHLSTree.cpp
+@@ -501,3 +501,65 @@ TEST_F(HLSTreeTest, LastSegmentOfEachPeriod)
+     }
+   }
+ }
++
++TEST_F(HLSTreeTest, SeekSegmentOfAForwardVideoSeek)
++{
++  // Five segments of 6 s with key frames inside the segments. The TS reader
++  // finds the key frame at or after the seek time in the segment of the seek
++  // time, and in the segments after. Other readers seek inside one segment, so
++  // a forward seek after a segment start continues at the next segment.
++  for (const bool ts : {true, false})
++  {
++    SCOPED_TRACE(testing::Message() << "TS=" << ts);
++    CSrvBroker::GetInstance()->Init(m_kodiProps);
++    ChildManifestTree hls;
++    hls.Configure(m_reprChooser, {}, "");
++    ASSERT_TRUE(hls.Open("http://foo.bar/master.m3u8", {},
++                         "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,CODECS=\"avc1.4d401f\"\n"
++                         "video.m3u8\n"));
++    auto period = hls.m_periods[0].get();
++    // The master playlist adds an adaptation set for the audio in the variant
++    PLAYLIST::CAdaptationSet* adp{nullptr};
++    for (const auto& adpSet : period->GetAdaptationSets())
++    {
++      if (adpSet->GetStreamType() == PLAYLIST::StreamType::VIDEO)
++        adp = adpSet.get();
++    }
++    ASSERT_TRUE(adp);
++    auto rep = adp->GetRepresentations()[0].get();
++    std::string media{"#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:0\n"
++                      "#EXT-X-PLAYLIST-TYPE:VOD\n"};
++    if (!ts)
++      media += "#EXT-X-MAP:URI=\"init.mp4\"\n";
++    for (int segment = 0; segment < 5; ++segment)
++      media += "#EXTINF:6,\nseg" + std::to_string(segment) + (ts ? ".ts\n" : ".m4s\n");
++    media += "#EXT-X-ENDLIST\n";
++    ASSERT_EQ(hls.ParseChildManifest(media, "http://foo.bar/video.m3u8", period, adp, rep),
++              adaptive::CHLSTree::ParseStatus::SUCCESS);
++    ASSERT_EQ(rep->GetContainerType(), ts ? PLAYLIST::ContainerType::TS
++                                          : PLAYLIST::ContainerType::MP4);
++    TestAdaptiveStream stream{&hls, adp, rep};
++    ASSERT_TRUE(stream.start_stream());
++    for (const double seconds : {0.0, 3.0, 6.0, 11.9, 28.2})
++    {
++      for (const bool preceeding : {true, false})
++      {
++        SCOPED_TRACE(testing::Message() << "seek=" << seconds << " preceeding=" << preceeding);
++        // The segment of the seek time, or the segment after
++        const int segment{static_cast<int>(seconds / 6)};
++        const bool next{!ts && !preceeding && seconds > segment * 6};
++        bool reset{false};
++        if (next && segment == 4)
++        {
++          EXPECT_FALSE(stream.seek_time(seconds, preceeding, reset));
++          continue;
++        }
++        ASSERT_TRUE(stream.seek_time(seconds, preceeding, reset));
++        EXPECT_TRUE(reset);
++        EXPECT_EQ(rep->GetNextSegment(), rep->Timeline().Get(segment + (next ? 1 : 0)));
++      }
++    }
++    stream.Stop();
++    hls.Uninitialize();
++  }
++}
+-- 
+2.47.3
+

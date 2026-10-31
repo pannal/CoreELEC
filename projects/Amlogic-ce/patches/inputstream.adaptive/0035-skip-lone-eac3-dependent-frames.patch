@@ -1,0 +1,203 @@
+From 5b155744c93060cc2516d2b83383add7f2ec085c Mon Sep 17 00:00:00 2001
+From: primez <mpincoski@gmail.com>
+Date: Sat, 31 Oct 2026 07:58:46 -0600
+Subject: [PATCH 35/41] [TSReader] Skip every lone E-AC-3 dependent frame, and
+ keep the segments of held audio
+
+Round 10 findings (Sol):
+
+- After a dependent frame without the frame before, the parser returned
+  without a frame and parsed on only after the next data. At the end of
+  the stream, two or more such frames hid every frame after them. The
+  parser now skips each such frame and continues the search.
+- The reader kept the start PTS of the last 8 segments only. Audio held
+  for the next PTS (up to 1 s) across more short segments took no PTS
+  diff of the older segments. A new segment now drops only the segments
+  before the oldest segment of a held frame.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ lib/mpegts/mpegts/ES_AC3.cpp        | 26 ++++++++-------
+ src/demuxers/TSReader.cpp           |  5 +--
+ src/demuxers/TSReader.h             |  4 ++-
+ src/samplereader/TSSampleReader.cpp | 11 ++++--
+ src/test/TestTSReader.cpp           | 52 +++++++++++++++++++++++++++++
+ 5 files changed, 81 insertions(+), 17 deletions(-)
+
+diff --git a/lib/mpegts/mpegts/ES_AC3.cpp b/lib/mpegts/mpegts/ES_AC3.cpp
+index 7607b48..5bb197e 100644
+--- a/lib/mpegts/mpegts/ES_AC3.cpp
++++ b/lib/mpegts/mpegts/ES_AC3.cpp
+@@ -116,24 +116,26 @@ void ES_AC3::Parse(STREAM_PKT* pkt)
+ {
+   int p = es_parsed;
+   int l;
+-  while ((l = es_len - p) > 8)
++  while (true)
+   {
+-    if (FindHeaders(es_buf + p, l) < 0)
++    while ((l = es_len - p) > 8)
++    {
++      if (FindHeaders(es_buf + p, l) < 0)
++        break;
++      p++;
++    }
++    es_parsed = p;
++    // A dependent frame without the frame before, as at the start, is no
++    // frame. The search continues after that frame.
++    if (!es_found_frame || l < m_FrameSize || !m_Dependent)
+       break;
+-    p++;
++    p += m_FrameSize;
++    es_consumed = es_parsed = p;
++    es_found_frame = false;
+   }
+-  es_parsed = p;
+ 
+   if (es_found_frame && l >= m_FrameSize)
+   {
+-    // A dependent frame without the frame before, as at the start, is no frame
+-    if (m_Dependent)
+-    {
+-      es_consumed = p + m_FrameSize;
+-      es_parsed = es_consumed;
+-      es_found_frame = false;
+-      return;
+-    }
+     // The dependent frames after a frame extend the channels of that frame and
+     // belong to the frame, as in FFmpeg
+     int size = m_FrameSize;
+diff --git a/src/demuxers/TSReader.cpp b/src/demuxers/TSReader.cpp
+index f60d12c..53b008b 100644
+--- a/src/demuxers/TSReader.cpp
++++ b/src/demuxers/TSReader.cpp
+@@ -666,7 +666,7 @@ bool TSReader::HasVideo() const
+   return false;
+ }
+ 
+-void TSReader::MarkSegmentStart(uint64_t offset)
++void TSReader::MarkSegmentStart(uint64_t offset, std::optional<uint32_t> oldestUsed)
+ {
+   if (!m_segments.back().offset)
+   {
+@@ -674,7 +674,8 @@ void TSReader::MarkSegmentStart(uint64_t offset)
+     return;
+   }
+   m_segments.push_back({++m_segment, offset, {}});
+-  if (m_segments.size() > MAX_SEGMENTS)
++  while (m_segments.size() > MAX_SEGMENTS &&
++         (!oldestUsed || m_segments.front().number < *oldestUsed))
+     m_segments.pop_front();
+   // The PES packets that start from now on are in the new segment
+   if (m_AVContext)
+diff --git a/src/demuxers/TSReader.h b/src/demuxers/TSReader.h
+index 3eacaf7..299bf87 100644
+--- a/src/demuxers/TSReader.h
++++ b/src/demuxers/TSReader.h
+@@ -50,8 +50,10 @@ public:
+    *        offset of the first segment after Initialize() reads the stream
+    *        information, so the first offset is the offset of that segment.
+    * \param offset The PTS offset of the segment
++   * \param oldestUsed The oldest segment that a frame still needs, as a held
++   *        audio frame for the PTS diff of the frame
+    */
+-  void MarkSegmentStart(uint64_t offset);
++  void MarkSegmentStart(uint64_t offset, std::optional<uint32_t> oldestUsed);
+   struct SegmentStart
+   {
+     uint64_t pts; // PTS of the first frame of the segment, of the video if the video is enabled
+diff --git a/src/samplereader/TSSampleReader.cpp b/src/samplereader/TSSampleReader.cpp
+index 3012499..040df3e 100644
+--- a/src/samplereader/TSSampleReader.cpp
++++ b/src/samplereader/TSSampleReader.cpp
+@@ -198,8 +198,15 @@ void CTSSampleReader::SetPTSOffset(uint64_t offset)
+ {
+   // The demuxer emits a PES only when the next PES starts. So after a segment
+   // change, the next samples are still from the previous segment, and each
+-  // sample takes the diff of the segment of the sample.
+-  MarkSegmentStart(offset);
++  // sample takes the diff of the segment of the sample. The held frames take
++  // the diff when the next PTS comes.
++  std::optional<uint32_t> oldestHeld;
++  for (const Sample& sample : m_untimed)
++  {
++    if (sample.segment && (!oldestHeld || *sample.segment < *oldestHeld))
++      oldestHeld = sample.segment;
++  }
++  MarkSegmentStart(offset, oldestHeld);
+ }
+ 
+ void CTSSampleReader::Reset(bool bEOS)
+diff --git a/src/test/TestTSReader.cpp b/src/test/TestTSReader.cpp
+index f70f7b3..25d32cf 100644
+--- a/src/test/TestTSReader.cpp
++++ b/src/test/TestTSReader.cpp
+@@ -1217,6 +1217,31 @@ TEST(TSParserTest, EAc3FramesHaveTheDurationOfTheirBlocks)
+ // data after the frame, or with other data, comes at the end of the data: the
+ // end of the stream looks the same. Then a dependent frame in the next data
+ // has no frame before.
++// Dependent frames without the frame before, as at the start of the data,
++// are no frames, and the frames after them come
++TEST(TSParserTest, EAc3DependentFramesWithoutAFrameBeforeAreSkipped)
++{
++  for (const int orphans : {1, 2, 3})
++  {
++    std::vector<uint8_t> data;
++    for (int i = 0; i < orphans + 3; ++i)
++    {
++      const std::vector<uint8_t> frame{Eac3Frame(i < orphans ? 1 : 0)};
++      data.insert(data.end(), frame.begin(), frame.end());
++    }
++    for (const size_t chunk : {SIZE_MAX, size_t{128}, size_t{184}})
++    {
++      SCOPED_TRACE(testing::Message() << orphans << " dependent frames, parts of " << chunk
++                                      << " bytes");
++      TSDemux::ES_AC3 stream{AUDIO_PID};
++      EXPECT_EQ(ReadAudioFrames(stream, data, chunk),
++                (std::vector<AudioFrame>{{128, 90000, EAC3_TICKS},
++                                         {128, 90000 + EAC3_TICKS, EAC3_TICKS},
++                                         {128, 90000 + 2 * EAC3_TICKS, EAC3_TICKS}}));
++    }
++  }
++}
++
+ TEST(TSParserTest, AnEAc3AccessUnitWaitsForTheRestAtTheEndOfTheData)
+ {
+   for (const size_t split : {size_t{128}, size_t{129}, size_t{130}, size_t{134}, size_t{200}})
+@@ -2500,6 +2525,33 @@ TEST_F(TSSampleReaderTest, AudioWithoutAPtsForTooLongComesWithoutPts)
+   }
+ }
+ 
++// The held audio frames of short segments take the PTS diff of their segment,
++// also of a segment more than a few segments before the first PTS
++TEST_F(TSSampleReaderTest, HeldAudioOfShortSegmentsHasTheDiffOfItsSegment)
++{
++  TSWriter writer;
++  for (int s = 0; s < 12; ++s)
++  {
++    writer.WriteTables(false);
++    for (int a = 2 * s; a < 2 * s + 2; ++a)
++      writer.WriteAudioFrame(a, a == 20);
++    const uint64_t start{Time(AudioPts(2 * s)) - SegmentDiff(s)};
++    if (s == 0)
++      Open(writer.Take(), start, INPUTSTREAM_TYPE_AUDIO);
++    else
++      AppendSegment(writer.Take(), start);
++  }
++  std::vector<std::tuple<int, uint64_t, int64_t>> read;
++  bool started{false};
++  for (AP4_Result result{m_reader->Start(started)}; AP4_SUCCEEDED(result);
++       result = m_reader->ReadSample())
++    read.emplace_back(FrameIndex(), m_reader->PTS(), m_reader->GetPTSDiff());
++  std::vector<std::tuple<int, uint64_t, int64_t>> expected;
++  for (int a = 0; a < 24; ++a)
++    expected.emplace_back(a, Time(AudioPts(a)), SegmentDiff(a / 2));
++  EXPECT_EQ(read, expected);
++}
++
+ // A seek drops the audio frames that came with the first PTS and still wait
+ // to be read
+ TEST_F(TSSampleReaderTest, AudioReleasedBeforeASeekDoesNotComeAfterTheSeek)
+-- 
+2.47.3
+

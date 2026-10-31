@@ -1,0 +1,336 @@
+From c7b61b5f62e05e18864e6693b0bb2ad9ef9012a4 Mon Sep 17 00:00:00 2001
+From: primez <mpincoski@gmail.com>
+Date: Sat, 31 Oct 2026 06:24:22 -0600
+Subject: [PATCH] [HLSTree] Sum the exact EXTINF durations for the segment
+ times
+
+The parser truncated each EXTINF duration to whole ms at float precision
+and chained the next segment from the truncated end. With EXTINF values
+such as 4.5045 or 6.006, the segment times drifted from the media time,
+about 0.18 s after 44 minutes of a real stream. A seek 40 ms before a
+segment start then converted the seek time with the diff of the current
+segment and continued at the next segment.
+
+Each segment time is now the exact sum of the durations since the last
+EXT-X-PROGRAM-DATE-TIME, rounded to ms. FixMediaSequence and
+FixDiscSequence compute the same sums, so they still match the segment
+times.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ inputstream.adaptive/changelog.txt            |  1 +
+ src/parser/HLSTree.cpp                        | 55 +++++++++++--------
+ src/test/TestHLSTree.cpp                      | 42 +++++++++++++-
+ .../hls/ts_fractional_extinf_stream.m3u8      | 40 ++++++++++++++
+ .../manifests/hls/ts_live_pdt_stream.m3u8     | 13 +++++
+ .../ts_live_pdt_stream_wrong_sequence.m3u8    | 15 +++++
+ 6 files changed, 143 insertions(+), 23 deletions(-)
+ create mode 100644 src/test/manifests/hls/ts_fractional_extinf_stream.m3u8
+ create mode 100644 src/test/manifests/hls/ts_live_pdt_stream.m3u8
+ create mode 100644 src/test/manifests/hls/ts_live_pdt_stream_wrong_sequence.m3u8
+
+diff --git a/inputstream.adaptive/changelog.txt b/inputstream.adaptive/changelog.txt
+index 2bd17fc..069493e 100644
+--- a/inputstream.adaptive/changelog.txt
++++ b/inputstream.adaptive/changelog.txt
+@@ -24,6 +24,7 @@ v21.5.25-p3i.4 (2026-10-31)
+ - Fix the last frame of a TS segment or stream whose parameter sets came in a PES of their own, which was read as two frames
+ - Fix a seek in a TS stream to a key frame whose picture PES starts in the next segment, which returned that key frame twice
+ - Fix a live seek in a TS stream that waited more than once for the next segment, which lost the first audio frame of an audio PES across the two segments
++- Fix the segment times of HLS streams with EXTINF durations finer than 1 ms, which drifted from the media time (0.24 s after one hour of a YouTube stream), so a seek near a segment start could continue at the next segment
+ 
+ v21.5.25-p3i.3 (2026-10-30)
+ - Fix a seek in a live HLS stream that ended the audio when the next audio segment was not available yet
+diff --git a/src/parser/HLSTree.cpp b/src/parser/HLSTree.cpp
+index 19293b7..23ad39b 100644
+--- a/src/parser/HLSTree.cpp
++++ b/src/parser/HLSTree.cpp
+@@ -22,6 +22,7 @@
+ #include "utils/log.h"
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <optional>
+ #include <sstream>
+ 
+@@ -38,6 +39,19 @@ constexpr uint64_t TIMESCALE = 1000;
+ // reaching zero and stopping the update thread
+ constexpr uint64_t MIN_UPDATE_INTERVAL_MS = 500;
+ 
++// \brief Parse an EXTINF duration to ms. The value has more precision than ms,
++//        so the segment times sum the exact durations and round each sum.
++double ParseDurationMs(const std::string& tagValue)
++{
++  return STRING::ToDouble(tagValue) * 1000;
++}
++
++// \brief Round a sum of EXTINF durations to the ms of the segment times
++uint64_t RoundMs(double timeMs)
++{
++  return static_cast<uint64_t>(std::llround(timeMs));
++}
++
+ // \brief Parse a tag (e.g. #EXT-X-VERSION:1) to extract name and value
+ void ParseTagNameValue(const std::string& line, std::string& tagName, std::string& tagValue)
+ {
+@@ -238,7 +252,7 @@ void adaptive::CHLSTree::FixMediaSequence(std::stringstream& streamData,
+   uint64_t segNumber = lastSeg->m_number;
+ 
+   std::streampos streamInitPos = streamData.tellg();
+-  uint64_t dateTime{0};
++  double dateTime{0};
+   uint64_t totalSegs{0};
+   bool isSegFound{false};
+ 
+@@ -255,13 +269,13 @@ void adaptive::CHLSTree::FixMediaSequence(std::stringstream& streamData,
+     }
+     else if (tagName == "#EXTINF")
+     {
+-      if (dateTime >= segStartPts)
++      if (RoundMs(dateTime) >= segStartPts)
+       {
+         isSegFound = true;
+         break;
+       }
+ 
+-      dateTime += static_cast<uint64_t>(STRING::ToFloat(tagValue) * 1000);
++      dateTime += ParseDurationMs(tagValue);
+       ++totalSegs;
+     }
+   }
+@@ -291,7 +305,7 @@ void adaptive::CHLSTree::FixMediaSequence(std::stringstream& streamData,
+ void adaptive::CHLSTree::FixDiscSequence(std::stringstream& streamData, uint32_t& discSeqNumber)
+ {
+   std::streampos streamInitPos = streamData.tellg();
+-  uint64_t dateTime{0};
++  double dateTime{0};
+   uint32_t discSeqNumberFix = discSeqNumber;
+   bool isDiscFound{false};
+ 
+@@ -313,17 +327,17 @@ void adaptive::CHLSTree::FixDiscSequence(std::stringstream& streamData, uint32_t
+     else if (tagName == "#EXTINF")
+     {
+       if (periodsStartTime.empty())
+-        periodsStartTime.emplace_back(dateTime);
++        periodsStartTime.emplace_back(RoundMs(dateTime));
+ 
+-      dateTime += static_cast<uint64_t>(STRING::ToFloat(tagValue) * 1000);
++      dateTime += ParseDurationMs(tagValue);
+     }
+     else if (tagName == "#EXT-X-DISCONTINUITY")
+     {
+-      periodsEndTime.emplace_back(dateTime);
+-      periodsStartTime.emplace_back(dateTime);
++      periodsEndTime.emplace_back(RoundMs(dateTime));
++      periodsStartTime.emplace_back(RoundMs(dateTime));
+     }
+   }
+-  periodsEndTime.emplace_back(dateTime);
++  periodsEndTime.emplace_back(RoundMs(dateTime));
+ 
+   // Update with single period
+   if (periodsStartTime.size() == 1)
+@@ -478,6 +492,8 @@ bool adaptive::CHLSTree::ProcessChildManifest(PLAYLIST::CPeriod* period,
+ 
+   CSegContainer newSegments;
+   std::optional<CSegment> newSegment;
++  double newSegmentEnd{0}; // The exact end of newSegment, in ms
++  double newSegmentsEnd{0}; // The exact end of the last segment of newSegments, in ms
+ 
+   // Pssh set used between segments
+   uint16_t psshSetPos = PSSHSET_POS_DEFAULT;
+@@ -629,23 +645,17 @@ bool adaptive::CHLSTree::ProcessChildManifest(PLAYLIST::CPeriod* period,
+     }
+     else if (tagName == "#EXTINF" && !isSkipUntilDiscont)
+     {
+-      const uint64_t durMs = static_cast<uint64_t>(STRING::ToFloat(tagValue) * 1000);
+-      uint64_t startPts{0};
++      double start{0};
+       if (programDateTime != NO_VALUE && period->GetStart() != NO_VALUE)
+-      {
+-        startPts = programDateTime;
+-      }
+-      else
+-      {
+-        const CSegment* lastSeg = newSegments.GetBack();
+-        if (lastSeg)
+-          startPts = lastSeg->m_endPts;
+-      }
++        start = static_cast<double>(programDateTime);
++      else if (!newSegments.IsEmpty())
++        start = newSegmentsEnd;
++      newSegmentEnd = start + ParseDurationMs(tagValue);
+ 
+       // Make a new segment
+       newSegment = CSegment();
+-      newSegment->startPTS_ = startPts;
+-      newSegment->m_endPts = startPts + durMs;
++      newSegment->startPTS_ = RoundMs(start);
++      newSegment->m_endPts = RoundMs(newSegmentEnd);
+       newSegment->m_number = currentSegNumber++;
+ 
+       // Reset EXT-X-PROGRAM-DATE-TIME, some playlists do not have this tag on each segment
+@@ -734,6 +744,7 @@ bool adaptive::CHLSTree::ProcessChildManifest(PLAYLIST::CPeriod* period,
+       newSegment->pssh_set_ = psshSetPos;
+ 
+       newSegments.Add(*newSegment);
++      newSegmentsEnd = newSegmentEnd;
+       newSegment.reset();
+     }
+     else if (tagName == "#EXT-X-DISCONTINUITY-SEQUENCE")
+diff --git a/src/test/TestHLSTree.cpp b/src/test/TestHLSTree.cpp
+index e53d530..ee42bdb 100644
+--- a/src/test/TestHLSTree.cpp
++++ b/src/test/TestHLSTree.cpp
+@@ -49,7 +49,7 @@ protected:
+   {
+     testHelper::testFile = filePath;
+ 
+-    CSrvBroker::GetInstance()->Init({});
++    CSrvBroker::GetInstance()->Init(m_kodiProps);
+ 
+     // Download the manifest
+     UTILS::CURL::HTTPResponse resp;
+@@ -94,6 +94,7 @@ protected:
+ 
+   adaptive::CHLSTree* tree;
+   CHOOSER::IRepresentationChooser* m_reprChooser{nullptr};
++  std::map<std::string, std::string> m_kodiProps;
+ };
+ 
+ 
+@@ -203,6 +204,45 @@ TEST_F(HLSTreeTest, OpenVariant)
+   EXPECT_EQ(tree->base_url_, "https://foo.bar/");
+ }
+ 
++TEST_F(HLSTreeTest, SegmentTimesSumTheExactDurations)
++{
++  OpenTestFileMaster("hls/1a2v_master.m3u8", "https://foo.bar/master.m3u8");
++
++  ASSERT_TRUE(OpenTestFileVariant("hls/ts_fractional_extinf_stream.m3u8",
++                                  "https://foo.bar/stream_2.m3u8", tree->m_currentPeriod,
++                                  tree->m_currentAdpSet, tree->m_currentRepr));
++
++  // The EXTINF values have more precision than the ms of the segment times, so
++  // each segment ends at the exact sum of the durations, rounded to ms
++  const std::vector<uint64_t> ends{2005,  6509,  9512,  15518, 21024, 28031,
++                                   34170, 37540, 44046, 48551, 51554, 57560,
++                                   63065, 70072, 76212, 79582, 86088};
++  const PLAYLIST::CSegContainer& timeline{tree->m_currentRepr->Timeline()};
++  ASSERT_EQ(timeline.GetSize(), ends.size());
++  for (size_t i = 0; i < ends.size(); ++i)
++  {
++    EXPECT_EQ(timeline.Get(i)->startPTS_, i == 0 ? 0 : ends[i - 1]) << "segment " << i;
++    EXPECT_EQ(timeline.Get(i)->m_endPts, ends[i]) << "segment " << i;
++  }
++}
++
++TEST_F(HLSTreeTest, FixMediaSequenceFindsTheSegmentAfterFractionalDurations)
++{
++  m_kodiProps["inputstream.adaptive.manifest_config"] = R"({"hls_fix_mediasequence":true})";
++  OpenTestFileMaster("hls/1a2v_master.m3u8", "https://foo.bar/master.m3u8");
++  PLAYLIST::CRepresentation* rep{tree->m_currentRepr};
++
++  ASSERT_TRUE(OpenTestFileVariant("hls/ts_live_pdt_stream.m3u8", "https://foo.bar/stream_2.m3u8",
++                                  tree->m_currentPeriod, tree->m_currentAdpSet, rep));
++  ASSERT_EQ(rep->Timeline().GetBack()->m_number, 13);
++
++  // The update has the same segments and one more, with a wrong EXT-X-MEDIA-SEQUENCE
++  ASSERT_TRUE(OpenTestFileVariant("hls/ts_live_pdt_stream_wrong_sequence.m3u8", "",
++                                  tree->m_currentPeriod, tree->m_currentAdpSet, rep));
++  EXPECT_EQ(rep->GetStartNumber(), 10);
++  EXPECT_EQ(rep->Timeline().GetBack()->m_number, 14);
++}
++
+ TEST_F(HLSTreeTest, ParseKeyUriStartingWithSlash)
+ {
+   OpenTestFileMaster("hls/1v_master.m3u8", "https://foo.bar/hls/video/stream_name/master.m3u8");
+diff --git a/src/test/manifests/hls/ts_fractional_extinf_stream.m3u8 b/src/test/manifests/hls/ts_fractional_extinf_stream.m3u8
+new file mode 100644
+index 0000000..544e4ca
+--- /dev/null
++++ b/src/test/manifests/hls/ts_fractional_extinf_stream.m3u8
+@@ -0,0 +1,40 @@
++#EXTM3U
++#EXT-X-VERSION:3
++#EXT-X-PLAYLIST-TYPE:VOD
++#EXT-X-TARGETDURATION:8
++#EXT-X-MEDIA-SEQUENCE:0
++#EXTINF:2.0045,
++segment_0.ts
++#EXTINF:4.5045,
++segment_1.ts
++#EXTINF:3.003,
++segment_2.ts
++#EXTINF:6.006,
++segment_3.ts
++#EXTINF:5.5055,
++segment_4.ts
++#EXTINF:7.007,
++segment_5.ts
++#EXTINF:6.139466,
++segment_6.ts
++#EXTINF:3.370033,
++segment_7.ts
++#EXTINF:6.5065,
++segment_8.ts
++#EXTINF:4.5045,
++segment_9.ts
++#EXTINF:3.003,
++segment_10.ts
++#EXTINF:6.006,
++segment_11.ts
++#EXTINF:5.5055,
++segment_12.ts
++#EXTINF:7.007,
++segment_13.ts
++#EXTINF:6.139466,
++segment_14.ts
++#EXTINF:3.370033,
++segment_15.ts
++#EXTINF:6.5065,
++segment_16.ts
++#EXT-X-ENDLIST
+diff --git a/src/test/manifests/hls/ts_live_pdt_stream.m3u8 b/src/test/manifests/hls/ts_live_pdt_stream.m3u8
+new file mode 100644
+index 0000000..1ef923b
+--- /dev/null
++++ b/src/test/manifests/hls/ts_live_pdt_stream.m3u8
+@@ -0,0 +1,13 @@
++#EXTM3U
++#EXT-X-VERSION:3
++#EXT-X-TARGETDURATION:5
++#EXT-X-MEDIA-SEQUENCE:10
++#EXT-X-PROGRAM-DATE-TIME:2026-10-31T06:00:00.000Z
++#EXTINF:4.5045,
++segment_10.ts
++#EXTINF:4.5045,
++segment_11.ts
++#EXTINF:4.5045,
++segment_12.ts
++#EXTINF:4.5045,
++segment_13.ts
+diff --git a/src/test/manifests/hls/ts_live_pdt_stream_wrong_sequence.m3u8 b/src/test/manifests/hls/ts_live_pdt_stream_wrong_sequence.m3u8
+new file mode 100644
+index 0000000..58c8b52
+--- /dev/null
++++ b/src/test/manifests/hls/ts_live_pdt_stream_wrong_sequence.m3u8
+@@ -0,0 +1,15 @@
++#EXTM3U
++#EXT-X-VERSION:3
++#EXT-X-TARGETDURATION:5
++#EXT-X-MEDIA-SEQUENCE:5
++#EXT-X-PROGRAM-DATE-TIME:2026-10-31T06:00:00.000Z
++#EXTINF:4.5045,
++segment_10.ts
++#EXTINF:4.5045,
++segment_11.ts
++#EXTINF:4.5045,
++segment_12.ts
++#EXTINF:4.5045,
++segment_13.ts
++#EXTINF:4.5045,
++segment_14.ts
+-- 
+2.47.3
+
