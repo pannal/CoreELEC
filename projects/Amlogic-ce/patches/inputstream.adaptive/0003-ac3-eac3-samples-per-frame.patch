@@ -1,0 +1,128 @@
+From f1f4ee917f50187a525139ad0a6933802babc703 Mon Sep 17 00:00:00 2001
+From: primez <mpincoski@gmail.com>
+Date: Fri, 30 Oct 2026 20:01:58 -0600
+Subject: [PATCH 3/3] [ADTSReader] Count AC-3 and E-AC-3 samples per frame from
+ the blocks
+
+The reader counted 256 samples per channel for each AC-3 and E-AC-3
+frame. An AC-3 frame always holds 6 blocks of 256 samples, and an
+E-AC-3 frame holds 1, 2, 3 or 6 blocks (numblkscod). The count was
+right only for 6 channel audio with 6 blocks. For stereo AC-3, the
+timestamps inside a segment advanced at one third of the real rate,
+and a seek inside the segment went three times too far.
+---
+ inputstream.adaptive/changelog.txt |  1 +
+ src/demuxers/ADTSReader.cpp        |  7 +++-
+ src/test/TestADTSReader.cpp        | 63 ++++++++++++++++++++++++++++++
+ 3 files changed, 69 insertions(+), 2 deletions(-)
+
+diff --git a/inputstream.adaptive/changelog.txt b/inputstream.adaptive/changelog.txt
+index 33eac7c..1c3155a 100644
+--- a/inputstream.adaptive/changelog.txt
++++ b/inputstream.adaptive/changelog.txt
+@@ -1,5 +1,6 @@
+ v21.5.25-p3i.2 (2026-10-30)
+ - Fix HLS audio starting before video after a seek, which froze the picture on Amlogic
++- Fix the timestamps of stereo AC-3 and of E-AC-3 frames with fewer than 6 blocks in HLS audio
+ 
+ v21.5.25-p3i.1 (2026-10-10)
+ - Update to upstream Omega 21.5.25
+diff --git a/src/demuxers/ADTSReader.cpp b/src/demuxers/ADTSReader.cpp
+index 9d8f87b..f1c837c 100644
+--- a/src/demuxers/ADTSReader.cpp
++++ b/src/demuxers/ADTSReader.cpp
+@@ -249,7 +249,8 @@ bool ADTSFrame::ParseAc3Header(AP4_ByteStream* stream, ADTSFrameInfo& frameInfo)
+     return false;
+ 
+   frameInfo.m_frameSize = frame.m_Info.m_FrameSize;
+-  frameInfo.m_frameCount = 256u * frame.m_Info.m_ChannelCount;
++  // An AC-3 frame holds 6 audio blocks of 256 samples
++  frameInfo.m_frameCount = 1536;
+   frameInfo.m_sampleRate = frame.m_Info.m_SampleRate;
+   frameInfo.m_channels = frame.m_Info.m_ChannelCount;
+   return true;
+@@ -293,7 +294,9 @@ bool ADTSFrame::ParseEc3Header(AP4_ByteStream* stream, ADTSFrameInfo& frameInfo)
+     return false;
+ 
+   frameInfo.m_frameSize = frame.m_Info.m_FrameSize;
+-  frameInfo.m_frameCount = 256u * frame.m_Info.m_ChannelCount;
++  // numblkscod: 1, 2, 3 or 6 audio blocks of 256 samples (Check() rejects fscod 3)
++  const unsigned int numblkscod{(buffer.GetData()[4] >> 4) & 0x3u};
++  frameInfo.m_frameCount = 256u * (numblkscod == 3 ? 6 : numblkscod + 1);
+   frameInfo.m_sampleRate = frame.m_Info.m_SampleRate;
+   if (frame.m_Info.complexity_index_type_a > 0)
+   {
+diff --git a/src/test/TestADTSReader.cpp b/src/test/TestADTSReader.cpp
+index e291a1a..e3961c4 100644
+--- a/src/test/TestADTSReader.cpp
++++ b/src/test/TestADTSReader.cpp
+@@ -174,3 +174,66 @@ TEST_F(ADTSSampleReaderTest, SeekWithoutTimestampEnds)
+   EXPECT_EQ(m_reader->PTS(), FrameTime(0, 50, 1024, 44100));
+   EXPECT_FALSE(m_reader->TimeSeek(AacTime(0), false));
+ }
++
++namespace
++{
++std::vector<uint8_t> Frames(std::vector<uint8_t> header, size_t frameSize, int count)
++{
++  std::vector<uint8_t> data;
++  AppendID3Timestamp(data, BASE_PTS);
++  header.resize(frameSize, 0);
++  for (int i = 0; i < count; ++i)
++    data.insert(data.end(), header.begin(), header.end());
++  return data;
++}
++
++// AC-3, 48 kHz, 192 kb/s (768 byte frames), bsid 8; acmod 2 is stereo, 7 is 3/2
++std::vector<uint8_t> Ac3Frames(uint8_t acmodByte)
++{
++  return Frames({0x0B, 0x77, 0, 0, 0x14, 0x40, acmodByte}, 768, FRAMES);
++}
++
++// E-AC-3, 48 kHz, 256 byte frames, stereo, bsid 16
++std::vector<uint8_t> Eac3Frames(uint8_t numblkscod)
++{
++  return Frames({0x0B, 0x77, 0x00, 0x7F, static_cast<uint8_t>((numblkscod << 4) | 0x04), 0x80},
++                256, FRAMES);
++}
++} // namespace
++
++// An AC-3 frame always holds 6 blocks of 256 samples, for any channel count.
++TEST_F(ADTSSampleReaderTest, Ac3StereoFramesHold1536Samples)
++{
++  OpenSegment(Ac3Frames(0x40), AacTime(0));
++
++  ASSERT_TRUE(m_reader->TimeSeek(FrameTime(BASE_PTS, 100, 1536, 48000), false));
++  EXPECT_EQ(m_reader->PTS(), FrameTime(BASE_PTS, 100, 1536, 48000));
++}
++
++TEST_F(ADTSSampleReaderTest, Ac3SurroundFramesHold1536Samples)
++{
++  OpenSegment(Ac3Frames(0xE0), AacTime(0));
++
++  ASSERT_TRUE(m_reader->TimeSeek(FrameTime(BASE_PTS, 100, 1536, 48000), false));
++  EXPECT_EQ(m_reader->PTS(), FrameTime(BASE_PTS, 100, 1536, 48000));
++}
++
++// An E-AC-3 frame holds 1, 2, 3 or 6 blocks of 256 samples (numblkscod).
++TEST_F(ADTSSampleReaderTest, Eac3FramesHoldTheirBlockCount)
++{
++  const struct
++  {
++    uint8_t numblkscod;
++    uint64_t samples;
++  } cases[] = {{0, 256}, {1, 512}, {2, 768}, {3, 1536}};
++  for (const auto& c : cases)
++  {
++    SCOPED_TRACE(static_cast<int>(c.numblkscod));
++    OpenSegment(Eac3Frames(c.numblkscod), AacTime(0));
++
++    ASSERT_TRUE(m_reader->TimeSeek(FrameTime(BASE_PTS, 100, c.samples, 48000), false));
++    EXPECT_EQ(m_reader->PTS(), FrameTime(BASE_PTS, 100, c.samples, 48000));
++    TearDown();
++    m_stream = nullptr;
++  }
++}
+-- 
+2.47.3
+

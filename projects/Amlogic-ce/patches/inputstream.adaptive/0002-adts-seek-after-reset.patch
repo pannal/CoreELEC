@@ -1,0 +1,366 @@
+From 37815b0084143732013d393e2ba7f21710d867db Mon Sep 17 00:00:00 2001
+From: primez <mpincoski@gmail.com>
+Date: Fri, 30 Oct 2026 19:45:28 -0600
+Subject: [PATCH 2/3] [ADTSSampleReader] Seek to the target sample after a
+ reset
+
+A seek into another segment resets the reader, which sets the ADTS PTS
+to ADTS_PTS_UNSET. That value is above every target, so
+ADTSReader::SeekTime() read no packet and the stream continued at the
+segment start. With separate HLS audio and video segments, audio then
+started up to one segment before the video: "Seek time 1128.4 ...
+continues at 1121.3". Amlogic decoders output no picture until the
+clock reaches the video, which froze playback for several seconds.
+
+Backport the ADTS part of upstream e727bae22d ("[samplereader] Fix read
+sample on seek") and e15a188da0 ("[SampleReaders] Fix bad EOS return
+state"): read the first sample before the scan, so the segment's first
+packet sets the PTS diff, publish the sample the scan stops at, and
+return false at the end of the stream. Omega passes the seek time in
+the stream's own timestamps, so the upstream "pts += m_ptsDiff" is not
+needed here.
+
+Initialize the ID3 timestamp, which the reader read uninitialized for
+audio without ID3 tags.
+---
+ inputstream.adaptive/addon.xml.in     |   2 +-
+ inputstream.adaptive/changelog.txt    |   3 +
+ src/demuxers/ADTSReader.h             |   2 +-
+ src/samplereader/ADTSSampleReader.cpp |  38 ++++--
+ src/samplereader/ADTSSampleReader.h   |   2 +
+ src/test/CMakeLists.txt               |   9 ++
+ src/test/TestADTSReader.cpp           | 176 ++++++++++++++++++++++++++
+ 7 files changed, 217 insertions(+), 15 deletions(-)
+ create mode 100644 src/test/TestADTSReader.cpp
+
+diff --git a/inputstream.adaptive/addon.xml.in b/inputstream.adaptive/addon.xml.in
+index 0ec1337..5b07ee3 100644
+--- a/inputstream.adaptive/addon.xml.in
++++ b/inputstream.adaptive/addon.xml.in
+@@ -1,7 +1,7 @@
+ <?xml version="1.0" encoding="UTF-8"?>
+ <addon
+   id="inputstream.adaptive"
+-  version="21.5.25-p3i.1"
++  version="21.5.25-p3i.2"
+   name="InputStream Adaptive"
+   provider-name="peak3d, Team Kodi">
+   <requires>@ADDON_DEPENDS@</requires>
+diff --git a/inputstream.adaptive/changelog.txt b/inputstream.adaptive/changelog.txt
+index 8a92787..33eac7c 100644
+--- a/inputstream.adaptive/changelog.txt
++++ b/inputstream.adaptive/changelog.txt
+@@ -1,3 +1,6 @@
++v21.5.25-p3i.2 (2026-10-30)
++- Fix HLS audio starting before video after a seek, which froze the picture on Amlogic
++
+ v21.5.25-p3i.1 (2026-10-10)
+ - Update to upstream Omega 21.5.25
+ - Retain the p3i ClearKey CBCS backport for HLS SAMPLE-AES playback
+diff --git a/src/demuxers/ADTSReader.h b/src/demuxers/ADTSReader.h
+index 022f549..27366e3 100644
+--- a/src/demuxers/ADTSReader.h
++++ b/src/demuxers/ADTSReader.h
+@@ -44,7 +44,7 @@ private:
+   uint8_t m_majorVer;
+   uint8_t m_revisionVer;
+   uint8_t m_flags;
+-  uint64_t m_timestamp;
++  uint64_t m_timestamp{0};
+ };
+ 
+ 
+diff --git a/src/samplereader/ADTSSampleReader.cpp b/src/samplereader/ADTSSampleReader.cpp
+index b1ee5b5..bd65886 100644
+--- a/src/samplereader/ADTSSampleReader.cpp
++++ b/src/samplereader/ADTSSampleReader.cpp
+@@ -31,17 +31,7 @@ AP4_Result CADTSSampleReader::ReadSample()
+ {
+   if (ReadPacket())
+   {
+-    uint64_t pts{GetPts()};
+-    if (pts == ADTSReader::ADTS_PTS_UNSET)
+-      m_pts = STREAM_NOPTS_VALUE;
+-    else
+-      m_pts = (pts * 100) / 9;
+-
+-    if (~m_ptsOffs)
+-    {
+-      m_ptsDiff = m_pts - m_ptsOffs;
+-      m_ptsOffs = ~0ULL;
+-    }
++    UpdatePts();
+     return AP4_SUCCESS;
+   }
+   if (!m_adByteStream || !m_adByteStream->waitingForSegment())
+@@ -59,11 +49,33 @@ void CADTSSampleReader::Reset(bool bEOS)
+ 
+ bool CADTSSampleReader::TimeSeek(uint64_t pts, bool preceeding)
+ {
++  // ADTSReader::SeekTime needs a packet already read, and the first packet
++  // of a segment sets the PTS diff
++  if (AP4_FAILED(ReadSample()))
++    return false;
++
+   AP4_UI64 seekPos{(pts * 9) / 100};
+   if (ADTSReader::SeekTime(seekPos, preceeding))
+   {
+     m_started = true;
+-    return AP4_SUCCEEDED(ReadSample());
++    // ADTSReader::SeekTime may have read other packets
++    UpdatePts();
++    return true;
++  }
++  return false; // EOS
++}
++
++void CADTSSampleReader::UpdatePts()
++{
++  uint64_t pts{GetPts()};
++  if (pts == ADTSReader::ADTS_PTS_UNSET)
++    m_pts = STREAM_NOPTS_VALUE;
++  else
++    m_pts = (pts * 100) / 9;
++
++  if (~m_ptsOffs)
++  {
++    m_ptsDiff = m_pts - m_ptsOffs;
++    m_ptsOffs = ~0ULL;
+   }
+-  return AP4_ERROR_EOS;
+ }
+diff --git a/src/samplereader/ADTSSampleReader.h b/src/samplereader/ADTSSampleReader.h
+index 0b398a1..7305b60 100644
+--- a/src/samplereader/ADTSSampleReader.h
++++ b/src/samplereader/ADTSSampleReader.h
+@@ -39,6 +39,8 @@ public:
+   bool IsEncrypted() const override { return false; }
+ 
+ private:
++  void UpdatePts();
++
+   bool m_eos{false};
+   bool m_started{false};
+   AP4_UI32 m_streamId;
+diff --git a/src/test/CMakeLists.txt b/src/test/CMakeLists.txt
+index 693b4d0..2ca6145 100644
+--- a/src/test/CMakeLists.txt
++++ b/src/test/CMakeLists.txt
+@@ -6,12 +6,16 @@ add_definitions(-DINPUTSTREAM_TEST_BUILD)
+ 
+ add_executable(${BINARY}
+     TestMain.cpp
++    TestADTSReader.cpp
+     TestDASHTree.cpp
+     TestHLSTree.cpp
+     TestSmoothTree.cpp
+     TestHelper.cpp
+     TestUtils.cpp
+     ../decrypters/Helpers.cpp
++    ../demuxers/ADTSReader.cpp
++    ../samplereader/ADTSSampleReader.cpp
++    ../parser/CodecParser.cpp
+     ../parser/DASHTree.cpp
+     ../parser/HLSTree.cpp
+     ../parser/SmoothTree.cpp
+@@ -36,6 +40,7 @@ add_executable(${BINARY}
+     ../common/SegmentBase.cpp
+     ../common/SegmentList.cpp
+     ../common/SegTemplate.cpp
++    ../AdaptiveByteStream.cpp
+     ../oscompat.cpp
+     ../SrvBroker.cpp
+     ../CompSettings.cpp
+@@ -55,3 +60,7 @@ target_link_libraries(${BINARY} PRIVATE ${BENTO4_LIBRARIES} ${PUGIXML_LIBRARIES}
+ 
+ set(TEST_DATA_DIR "${CMAKE_SOURCE_DIR}/src/test/manifests")
+ add_test(NAME manifest_tests COMMAND ${BINARY} "${TEST_DATA_DIR}")
++
++# ADTSReader.h includes the Kodi headers, which conflict with the test stubs
++set_source_files_properties(TestADTSReader.cpp ../samplereader/ADTSSampleReader.cpp
++                            PROPERTIES COMPILE_OPTIONS "-UINPUTSTREAM_TEST_BUILD")
+diff --git a/src/test/TestADTSReader.cpp b/src/test/TestADTSReader.cpp
+new file mode 100644
+index 0000000..e291a1a
+--- /dev/null
++++ b/src/test/TestADTSReader.cpp
+@@ -0,0 +1,176 @@
++/*
++ *  Copyright (C) 2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "demuxers/ADTSReader.h"
++#include "samplereader/ADTSSampleReader.h"
++
++#include <cstdint>
++#include <memory>
++#include <vector>
++
++#include <bento4/Ap4ByteStream.h>
++#include <gtest/gtest.h>
++
++namespace
++{
++constexpr uint64_t BASE_PTS = 9000000; // 100 s in 90 kHz ticks
++constexpr int FRAMES = 200;
++// Real AAC frames are larger than the 64 bytes the reader peeks to find the codec
++constexpr unsigned int PAYLOAD_SIZE = 200;
++
++// PTS of a frame in the microseconds the session passes to TimeSeek()
++uint64_t FrameTime(uint64_t basePts, int frame, uint64_t samples, uint64_t rate)
++{
++  return (basePts + frame * samples * 90000 / rate) * 100 / 9;
++}
++
++uint64_t AacTime(int frame)
++{
++  return FrameTime(BASE_PTS, frame, 1024, 44100);
++}
++
++void AppendID3Timestamp(std::vector<uint8_t>& data, uint64_t pts)
++{
++  // ID3v2.4 tag with the HLS PRIV frame "com.apple.streaming.transportStreamTimestamp"
++  const char owner[] = "com.apple.streaming.transportStreamTimestamp";
++  const uint8_t header[] = {'I', 'D', '3', 4, 0, 0, 0, 0, 0, 63};
++  const uint8_t frame[] = {'P', 'R', 'I', 'V', 0, 0, 0, 53, 0, 0};
++  data.insert(data.end(), header, header + sizeof(header));
++  data.insert(data.end(), frame, frame + sizeof(frame));
++  data.insert(data.end(), owner, owner + sizeof(owner));
++  for (int shift = 56; shift >= 0; shift -= 8)
++    data.push_back(static_cast<uint8_t>(pts >> shift));
++}
++
++void AppendAacFrames(std::vector<uint8_t>& data, int count)
++{
++  // ADTS header: MPEG-4, no CRC, AAC LC, 44.1 kHz, 2 channels
++  const unsigned int length = 7 + PAYLOAD_SIZE;
++  for (int i = 0; i < count; ++i)
++  {
++    const uint8_t header[] = {0xFF,
++                              0xF1,
++                              0x50,
++                              static_cast<uint8_t>(0x80 | (length >> 11)),
++                              static_cast<uint8_t>(length >> 3),
++                              static_cast<uint8_t>(((length & 7) << 5) | 0x1F),
++                              0xFC};
++    data.insert(data.end(), header, header + sizeof(header));
++    data.insert(data.end(), PAYLOAD_SIZE, 0);
++  }
++}
++
++std::vector<uint8_t> AacSegment(bool withTimestamp)
++{
++  std::vector<uint8_t> data;
++  if (withTimestamp)
++    AppendID3Timestamp(data, BASE_PTS);
++  AppendAacFrames(data, FRAMES);
++  return data;
++}
++
++class ADTSSampleReaderTest : public ::testing::Test
++{
++protected:
++  // A new segment: the session resets the reader and sets the segment start time
++  void OpenSegment(const std::vector<uint8_t>& data, uint64_t segmentStart)
++  {
++    m_data = data;
++    m_stream = new AP4_MemoryByteStream(m_data.data(), static_cast<AP4_Size>(m_data.size()));
++    m_reader = std::make_unique<CADTSSampleReader>(m_stream, 1);
++    m_reader->Reset(false);
++    m_reader->SetPTSOffset(segmentStart);
++  }
++
++  void TearDown() override
++  {
++    m_reader.reset();
++    if (m_stream)
++      m_stream->Release();
++  }
++
++  std::vector<uint8_t> m_data;
++  AP4_MemoryByteStream* m_stream{nullptr};
++  std::unique_ptr<CADTSSampleReader> m_reader;
++};
++} // namespace
++
++// A seek into a new segment resets the reader. The reader must still advance
++// to the target; otherwise audio starts at the segment start, seconds before
++// the video.
++TEST_F(ADTSSampleReaderTest, SeekIntoNewSegmentReturnsTargetSample)
++{
++  OpenSegment(AacSegment(true), AacTime(0));
++
++  ASSERT_TRUE(m_reader->TimeSeek(AacTime(100), false));
++  EXPECT_EQ(m_reader->PTS(), AacTime(100));
++  EXPECT_FALSE(m_reader->EOS());
++}
++
++TEST_F(ADTSSampleReaderTest, SeekBetweenSamplesReturnsNextSample)
++{
++  OpenSegment(AacSegment(true), AacTime(0));
++
++  // One 90 kHz tick after a sample
++  const uint64_t target{(BASE_PTS + 100ULL * 1024 * 90000 / 44100 + 1) * 100 / 9 + 1};
++  ASSERT_TRUE(m_reader->TimeSeek(target, false));
++  EXPECT_EQ(m_reader->PTS(), AacTime(101));
++}
++
++TEST_F(ADTSSampleReaderTest, SeekToSegmentStartReturnsFirstSample)
++{
++  OpenSegment(AacSegment(true), AacTime(0));
++
++  ASSERT_TRUE(m_reader->TimeSeek(AacTime(0), false));
++  EXPECT_EQ(m_reader->PTS(), AacTime(0));
++}
++
++TEST_F(ADTSSampleReaderTest, SeekToLastSampleSucceeds)
++{
++  OpenSegment(AacSegment(true), AacTime(0));
++
++  ASSERT_TRUE(m_reader->TimeSeek(AacTime(FRAMES - 1), false));
++  EXPECT_EQ(m_reader->PTS(), AacTime(FRAMES - 1));
++  EXPECT_FALSE(m_reader->EOS());
++}
++
++TEST_F(ADTSSampleReaderTest, SeekPastSegmentEndFails)
++{
++  OpenSegment(AacSegment(true), AacTime(0));
++
++  EXPECT_FALSE(m_reader->TimeSeek(AacTime(FRAMES + 10), false));
++}
++
++// The PTS diff compares the segment start time with the first sample of the
++// segment, not with the sample the seek stops at.
++TEST_F(ADTSSampleReaderTest, SeekKeepsTheSegmentPtsDiff)
++{
++  OpenSegment(AacSegment(true), AacTime(0) - 5000);
++
++  ASSERT_TRUE(m_reader->TimeSeek(AacTime(100), false));
++  EXPECT_EQ(m_reader->GetPTSDiff(), 5000);
++}
++
++TEST_F(ADTSSampleReaderTest, SeekForwardInTheSameSegment)
++{
++  OpenSegment(AacSegment(true), AacTime(0));
++  ASSERT_TRUE(m_reader->TimeSeek(AacTime(10), false));
++
++  ASSERT_TRUE(m_reader->TimeSeek(AacTime(150), false));
++  EXPECT_EQ(m_reader->PTS(), AacTime(150));
++}
++
++// Without an ID3 timestamp the samples count from zero; the seek must still end.
++TEST_F(ADTSSampleReaderTest, SeekWithoutTimestampEnds)
++{
++  OpenSegment(AacSegment(false), 0);
++
++  ASSERT_TRUE(m_reader->TimeSeek(FrameTime(0, 50, 1024, 44100), false));
++  EXPECT_EQ(m_reader->PTS(), FrameTime(0, 50, 1024, 44100));
++  EXPECT_FALSE(m_reader->TimeSeek(AacTime(0), false));
++}
+-- 
+2.47.3
+
