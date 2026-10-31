@@ -1,0 +1,93 @@
+From 54cdf6772b069151ec006b9e36a0df5e9576d3f0 Mon Sep 17 00:00:00 2001
+From: primez <mpincoski@gmail.com>
+Date: Sat, 31 Oct 2026 06:03:21 -0600
+Subject: [PATCH] [TSReader] Keep the audio of a PES across repeated live seek
+ waits
+
+A live seek that waits for the next segment keeps the frames of the last
+PES of the other streams. A second read before the segment arrived ran
+the seek again, which found no frames and replaced the kept frames with
+none. So the first audio frame of a PES across the two segments was lost.
+
+A stream without frames since the last scan keeps the frames of its last
+PES.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ inputstream.adaptive/changelog.txt |  1 +
+ src/demuxers/TSReader.cpp          |  9 +++++++++
+ src/test/TestTSReader.cpp          | 13 +++++++++++--
+ 3 files changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/inputstream.adaptive/changelog.txt b/inputstream.adaptive/changelog.txt
+index a03fd8b..2bd17fc 100644
+--- a/inputstream.adaptive/changelog.txt
++++ b/inputstream.adaptive/changelog.txt
+@@ -23,6 +23,7 @@ v21.5.25-p3i.4 (2026-10-31)
+ - Fix the timestamps of TS video and audio frames that the parser read only after the next PES started, which took the PTS of the next frame, as with HEVC access unit delimiters or parameter sets in a PES of their own, or with an audio frame header across two PES
+ - Fix the last frame of a TS segment or stream whose parameter sets came in a PES of their own, which was read as two frames
+ - Fix a seek in a TS stream to a key frame whose picture PES starts in the next segment, which returned that key frame twice
++- Fix a live seek in a TS stream that waited more than once for the next segment, which lost the first audio frame of an audio PES across the two segments
+ 
+ v21.5.25-p3i.3 (2026-10-30)
+ - Fix a seek in a live HLS stream that ended the audio when the next audio segment was not available yet
+diff --git a/src/demuxers/TSReader.cpp b/src/demuxers/TSReader.cpp
+index ed4a3ba..e6b20d6 100644
+--- a/src/demuxers/TSReader.cpp
++++ b/src/demuxers/TSReader.cpp
+@@ -286,6 +286,15 @@ bool TSReader::SeekTime(uint64_t timeInTs, bool preceeding)
+       seekFrame = startFrame;
+       seekFrameIsCopy = false;
+       copies.clear();
++      // A stream without frames since then, as when a live seek waits again,
++      // keeps the frames of its last PES
++      for (FrameCopy& frame : previousPesFrames)
++      {
++        const uint16_t pid{frame.pkt.pid};
++        if (std::none_of(lastPesFrames.begin(), lastPesFrames.end(),
++                         [pid](const FrameCopy& last) { return last.pkt.pid == pid; }))
++          lastPesFrames.push_back(std::move(frame));
++      }
+       previousPesFrames = std::move(lastPesFrames);
+       lastPesFrames.clear();
+       continue;
+diff --git a/src/test/TestTSReader.cpp b/src/test/TestTSReader.cpp
+index 838ff27..eca2587 100644
+--- a/src/test/TestTSReader.cpp
++++ b/src/test/TestTSReader.cpp
+@@ -1739,14 +1739,18 @@ TEST_F(TSSampleReaderTest, SeekToAKeyFrameAcrossTwoSegmentsKeepsTheAudioAcrossTh
+   constexpr int SPLIT_FRAMES{4};
+   // The audio of the next segment comes before or after the video of a frame.
+   // With the video first, the rest of the audio PES comes after the next video PES.
+-  // A live seek waits for the next segment.
++  // A live seek waits for the next segment, also over more reads.
+   for (const bool live : {false, true})
++  for (const int waitReads : {0, 2})
+   for (const bool audioFirst : {true, false})
+   for (const bool preceeding : {true, false})
+   {
++    if (!live && waitReads)
++      continue;
+     SCOPED_TRACE(testing::Message() << (audioFirst ? "audio first" : "video first")
+                                     << (preceeding ? "" : ", not preceeding")
+-                                    << (live ? ", live" : ""));
++                                    << (live ? ", live" : "") << ", " << waitReads
++                                    << " wait reads");
+     TSWriter writer;
+     writer.WriteTables(true);
+     for (int v = 0; v < SPLIT_FRAME; ++v)
+@@ -1803,6 +1807,11 @@ TEST_F(TSSampleReaderTest, SeekToAKeyFrameAcrossTwoSegmentsKeepsTheAudioAcrossTh
+     if (live)
+     {
+       EXPECT_FALSE(m_reader->EOS());
++      for (int read = 0; read < waitReads; ++read)
++      {
++        EXPECT_EQ(m_reader->ReadSample(), AP4_ERROR_EOS);
++        EXPECT_FALSE(m_reader->EOS());
++      }
+       AppendSegment(second, Time(VideoPts(SEGMENT_VIDEO_FRAMES)) - SegmentDiff(1));
+       m_segments->m_waitingForSegment = false;
+       ASSERT_EQ(m_reader->ReadSample(), AP4_SUCCESS);
+-- 
+2.47.3
+
