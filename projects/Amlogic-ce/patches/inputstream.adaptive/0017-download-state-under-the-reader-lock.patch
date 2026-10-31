@@ -1,0 +1,137 @@
+From 4eaedc4d8a06494f79aa4fbf40e8bb1f5a1af40a Mon Sep 17 00:00:00 2001
+From: primez <mpincoski@gmail.com>
+Date: Sat, 31 Oct 2026 04:18:56 -0600
+Subject: [PATCH 17/19] [AdaptiveStream] Change the download state under the
+ lock of the readers
+
+A reader checks worker_processing_ under mutex_rw_ and then waits on
+signal_rw_. The worker cleared the flag and signalled without
+mutex_rw_, so a reader could miss the signal between the check and the
+wait. Without a next download, a read, a seek or a stop then waited
+forever. The worker now clears the flag under mutex_rw_ and also holds
+mutex_dl_ again, so WaitWorker() still returns only after the worker
+waits for the next download. mutex_rw_ comes first, as in read(), which
+locks mutex_dl_ in ensureSegment(). The old failure path locked the two
+mutexes in the other order.
+
+A failed download preparation now also signals signal_dl_, because
+ensureSegment() can wait for the download start while the reader holds
+mutex_rw_.
+
+StopWorker() sets the state under mutex_dl_. The worker checks the state
+under mutex_dl_ before a download starts, so a stop cannot pass between
+that check and the start of the download. A stop now waits while
+ensureSegment() holds mutex_dl_, which includes a manifest update of a
+live stream. The state is atomic, because the threads read the state
+without a lock.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ inputstream.adaptive/changelog.txt |  1 +
+ src/common/AdaptiveStream.cpp      | 41 ++++++++++++++++++++----------
+ src/common/AdaptiveStream.h        |  3 ++-
+ 3 files changed, 31 insertions(+), 14 deletions(-)
+
+diff --git a/inputstream.adaptive/changelog.txt b/inputstream.adaptive/changelog.txt
+index 57c5b43..716ef6b 100644
+--- a/inputstream.adaptive/changelog.txt
++++ b/inputstream.adaptive/changelog.txt
+@@ -12,6 +12,7 @@ v21.5.25-p3i.4 (2026-10-31)
+ - Fix a seek in an HEVC or MPEG-2 TS stream, which continued at the segment start instead of at the key frame of the seek time
+ - Fix the end of an HEVC TS stream after a PES without data, which did not play the last frame
+ - Fix the timing offset of a TS segment whose first PES header starts in the segment before
++- Fix a seek, a stop or a read that could wait forever after the end of a download, because the reader did not get the signal of the download end
+ 
+ v21.5.25-p3i.3 (2026-10-30)
+ - Fix a seek in a live HLS stream that ended the audio when the next audio segment was not available yet
+diff --git a/src/common/AdaptiveStream.cpp b/src/common/AdaptiveStream.cpp
+index 2dcbcea..5bafd12 100644
+--- a/src/common/AdaptiveStream.cpp
++++ b/src/common/AdaptiveStream.cpp
+@@ -317,7 +317,12 @@ void AdaptiveStream::ResetActiveBuffer(bool oneValid)
+ bool AdaptiveStream::StopWorker(STATE state)
+ {
+   // stop downloading chunks
+-  state_ = state;
++  // The worker checks the state under mutex_dl_ before a download starts, so a download
++  // that starts after this change sees the new state and this wait sees the download
++  {
++    std::lock_guard<std::mutex> lckdl(thread_data_->mutex_dl_);
++    state_ = state;
++  }
+   // wait until last reading operation stopped
+   // make sure download section in worker thread is done.
+   std::unique_lock<std::mutex> lckrw(thread_data_->mutex_rw_);
+@@ -351,6 +356,23 @@ void adaptive::AdaptiveStream::WaitWorker()
+ void AdaptiveStream::worker()
+ {
+   std::unique_lock<std::mutex> lckdl(thread_data_->mutex_dl_);
++
++  // The readers check worker_processing_ under mutex_rw_ before they wait on signal_rw_,
++  // so the flag changes under mutex_rw_, else a reader can miss the signal and wait forever.
++  // The worker also holds mutex_dl_ again before the flag changes, so WaitWorker returns
++  // only after the worker waits for the next download. mutex_rw_ comes first, as in read().
++  const auto endProcessing = [this, &lckdl](bool isFailed)
++  {
++    std::unique_lock<std::mutex> lckrw(thread_data_->mutex_rw_);
++    lckdl.lock();
++    // Download cancelled or cannot download the file
++    if (isFailed)
++      state_ = STOPPED;
++    worker_processing_ = false;
++    lckrw.unlock();
++    thread_data_->signal_rw_.notify_all();
++  };
++
+   worker_processing_ = false;
+   thread_data_->signal_dl_.notify_one();
+   do
+@@ -368,7 +390,10 @@ void AdaptiveStream::worker()
+       DownloadInfo downloadInfo;
+       if (!PrepareNextDownload(downloadInfo))
+       {
+-        worker_processing_ = false;
++        // ensureSegment can wait for the download start while the reader holds mutex_rw_
++        thread_data_->signal_dl_.notify_one();
++        lckdl.unlock();
++        endProcessing(false);
+         continue;
+       }
+ 
+@@ -405,18 +430,8 @@ void AdaptiveStream::worker()
+         LOG::Log(LOGWARNING, "[AS-%u] Segment download failed, attempt %zu...", clsId, downloadAttempts);
+       }
+ 
+-      lckdl.lock();
+-
+-      if (!isSegmentDownloaded)
+-      {
+-        std::lock_guard<std::mutex> lckrw(thread_data_->mutex_rw_);
+-        // Download cancelled or cannot download the file
+-        state_ = STOPPED;
+-      }
+-
+       // Signal finished download
+-      worker_processing_ = false;
+-      thread_data_->signal_rw_.notify_all();
++      endProcessing(!isSegmentDownloaded);
+     }
+   } while (!thread_data_->thread_stop_);
+ 
+diff --git a/src/common/AdaptiveStream.h b/src/common/AdaptiveStream.h
+index 82aa062..0321538 100644
+--- a/src/common/AdaptiveStream.h
++++ b/src/common/AdaptiveStream.h
+@@ -154,7 +154,8 @@ enum class EVENT_TYPE
+       RUNNING,
+       STOPPED,
+       PAUSED
+-    } state_;
++    };
++    std::atomic<STATE> state_;
+ 
+     // Segment download section
+ 
+-- 
+2.47.3
+
