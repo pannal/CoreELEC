@@ -1,0 +1,213 @@
+From 6b7f7cb290459b6002277c5ada77660bb10f0fb7 Mon Sep 17 00:00:00 2001
+From: primez <mpincoski@gmail.com>
+Date: Sat, 31 Oct 2026 01:54:40 -0600
+Subject: [PATCH 9/9] [TSSampleReader] Continue a seek after a wait for a live
+ segment
+
+TimeSeek() returned AP4_ERROR_EOS when TSReader::SeekTime() failed,
+which converts to true. After a seek past the end of a stream, the
+session continued with the PTS from before the seek. A seek past the
+last frame of a live stream also kept the PTS from before the seek,
+and for video the session then aligned the other streams to that PTS.
+The reader then continued with the last frames of the previous segment.
+
+A failed seek now ends the stream. While the seek waits for a live
+segment, PTS() returns the seek time, and ReadSample() continues the
+seek from the start of the next segment. This matches the ADTS reader.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ inputstream.adaptive/changelog.txt  |  1 +
+ src/samplereader/TSSampleReader.cpp | 44 +++++++++++++++++++---
+ src/samplereader/TSSampleReader.h   |  7 ++++
+ src/test/TestTSReader.cpp           | 57 +++++++++++++++++++++++++++++
+ 4 files changed, 104 insertions(+), 5 deletions(-)
+
+diff --git a/inputstream.adaptive/changelog.txt b/inputstream.adaptive/changelog.txt
+index 8b9c53d..75b1aae 100644
+--- a/inputstream.adaptive/changelog.txt
++++ b/inputstream.adaptive/changelog.txt
+@@ -1,5 +1,6 @@
+ v21.5.25-p3i.4 (2026-10-31)
+ - Fix the timing offset of HLS audio, TS video and WebM streams after each segment change, which was one or more frames wrong until the next seek
++- Fix a seek in a live TS stream that aligned the other streams to the time before the seek when the next segment was not available yet, and end a TS stream after a seek past the end
+ 
+ v21.5.25-p3i.3 (2026-10-30)
+ - Fix a seek in a live HLS stream that ended the audio when the next audio segment was not available yet
+diff --git a/src/samplereader/TSSampleReader.cpp b/src/samplereader/TSSampleReader.cpp
+index b26226f..79dba74 100644
+--- a/src/samplereader/TSSampleReader.cpp
++++ b/src/samplereader/TSSampleReader.cpp
+@@ -67,6 +67,14 @@ AP4_Result CTSSampleReader::Start(bool& bStarted)
+ 
+ AP4_Result CTSSampleReader::ReadSample()
+ {
++  if (m_seekTime)
++  {
++    // The seek continues from the start of the next segment
++    TSReader::Reset();
++    if (!Seek(*m_seekTime))
++      return EndOfData();
++  }
++
+   if (ReadPacket())
+   {
+     //! @todo: there is something wrong on pts calculation,
+@@ -91,8 +99,21 @@ AP4_Result CTSSampleReader::ReadSample()
+     }
+     return AP4_SUCCESS;
+   }
+-  if (!m_adByteStream || !m_adByteStream->waitingForSegment())
++  return EndOfData();
++}
++
++AP4_Result CTSSampleReader::EndOfData()
++{
++  if (m_adByteStream && m_adByteStream->waitingForSegment())
++  {
++    // The session aligns the other streams to the PTS of a video seek
++    if (m_seekTime)
++      m_pts = *m_seekTime;
++  }
++  else
++  {
+     m_eos = true;
++  }
+   return AP4_ERROR_EOS;
+ }
+ 
+@@ -109,6 +130,7 @@ void CTSSampleReader::Reset(bool bEOS)
+ {
+   TSReader::Reset();
+   m_eos = bEOS;
++  m_seekTime.reset();
+ }
+ 
+ bool CTSSampleReader::TimeSeek(uint64_t pts, bool preceeding)
+@@ -116,11 +138,23 @@ bool CTSSampleReader::TimeSeek(uint64_t pts, bool preceeding)
+   if (!StartStreaming(m_typeMask))
+     return false;
+ 
+-  AP4_UI64 seekPos((pts * 9) / 100);
+-  if (TSReader::SeekTime(seekPos, preceeding))
++  m_seekPreceeding = preceeding;
++  if (AP4_SUCCEEDED(Seek(pts) ? ReadSample() : EndOfData()))
+   {
+     m_started = true;
+-    return AP4_SUCCEEDED(ReadSample());
++    return true;
+   }
+-  return AP4_ERROR_EOS;
++  // Without EOS, the seek waits for a live segment and ReadSample continues the seek
++  return !m_eos;
++}
++
++bool CTSSampleReader::Seek(uint64_t pts)
++{
++  if (TSReader::SeekTime((pts * 9) / 100, m_seekPreceeding))
++  {
++    m_seekTime.reset();
++    return true;
++  }
++  m_seekTime = pts;
++  return false;
+ }
+diff --git a/src/samplereader/TSSampleReader.h b/src/samplereader/TSSampleReader.h
+index 8f1a374..3b96a3e 100644
+--- a/src/samplereader/TSSampleReader.h
++++ b/src/samplereader/TSSampleReader.h
+@@ -9,6 +9,8 @@
+ #include "SampleReader.h"
+ #include "demuxers/TSReader.h"
+ 
++#include <optional>
++
+ // forwards
+ class CAdaptiveByteStream;
+ 
+@@ -46,6 +48,9 @@ public:
+   bool IsEncrypted() const override { return false; }
+ 
+ private:
++  bool Seek(uint64_t pts);
++  AP4_Result EndOfData();
++
+   uint32_t m_typeMask; //Bit representation of INPUTSTREAM_TYPES
+   uint32_t m_typeMap[16];
+   uint64_t m_pts{0};
+@@ -54,5 +59,7 @@ private:
+   int64_t m_ptsDiff{0};
+   bool m_eos{false};
+   bool m_started{false};
++  std::optional<uint64_t> m_seekTime; // A seek that waits for a live segment
++  bool m_seekPreceeding{false};
+   CAdaptiveByteStream* m_adByteStream;
+ };
+diff --git a/src/test/TestTSReader.cpp b/src/test/TestTSReader.cpp
+index b9fee35..a8ae272 100644
+--- a/src/test/TestTSReader.cpp
++++ b/src/test/TestTSReader.cpp
+@@ -361,3 +361,60 @@ TEST_F(TSSampleReaderTest, PtsDiffFollowsTheVideoOfMuxedSegments)
+   EXPECT_EQ(video, SEGMENTS * SEGMENT_VIDEO_FRAMES - 2);
+   EXPECT_EQ(audio, SEGMENTS * SEGMENT_FRAMES - 3);
+ }
++
++// A seek to the last frame of the stream lands on that frame. A seek past the
++// end of the stream fails, so the session ends the stream.
++TEST_F(TSSampleReaderTest, SeekPastTheEndFails)
++{
++  TSWriter writer;
++  writer.WriteTables(false);
++  writer.WriteAudio(AudioPts(0), 0, SEGMENT_FRAMES, 1, false);
++  Open(writer.Take(), Time(AudioPts(0)) - DIFF, INPUTSTREAM_TYPE_AUDIO);
++  bool started{false};
++  ASSERT_EQ(m_reader->Start(started), AP4_SUCCESS);
++
++  ASSERT_TRUE(m_reader->TimeSeek(Time(AudioPts(10)), true));
++  EXPECT_EQ(FrameIndex(), 10);
++  EXPECT_EQ(m_reader->PTS(), Time(AudioPts(10)));
++  EXPECT_FALSE(m_reader->TimeSeek(Time(AudioPts(SEGMENT_FRAMES)), true));
++  EXPECT_TRUE(m_reader->EOS());
++}
++
++// A seek past the last frame of a live stream waits for the next segment. The
++// session aligns the other streams to the PTS of the seek, and the seek
++// continues in the next segment.
++TEST_F(TSSampleReaderTest, SeekWaitsForTheNextLiveSegment)
++{
++  TSWriter writer;
++  std::vector<uint8_t> segments[2];
++  for (int s = 0; s < 2; ++s)
++  {
++    writer.WriteTables(false);
++    writer.WriteAudio(AudioPts(s * SEGMENT_FRAMES), s * SEGMENT_FRAMES, SEGMENT_FRAMES, 1,
++                      false);
++    segments[s] = writer.Take();
++  }
++  Open(segments[0], Time(AudioPts(0)) - DIFF, INPUTSTREAM_TYPE_AUDIO);
++  m_segments->m_waitingForSegment = true;
++  bool started{false};
++  ASSERT_EQ(m_reader->Start(started), AP4_SUCCESS);
++
++  const uint64_t target{Time(AudioPts(SEGMENT_FRAMES)) - 1};
++  ASSERT_TRUE(m_reader->TimeSeek(target, true));
++  EXPECT_FALSE(m_reader->EOS());
++  EXPECT_EQ(m_reader->PTS(), target);
++  EXPECT_EQ(m_reader->ReadSample(), AP4_ERROR_EOS);
++  EXPECT_FALSE(m_reader->EOS());
++  EXPECT_EQ(m_reader->PTS(), target);
++
++  AppendSegment(segments[1], Time(AudioPts(SEGMENT_FRAMES)) - DIFF);
++  m_segments->m_waitingForSegment = false;
++  for (int i = SEGMENT_FRAMES; i < SEGMENT_FRAMES + 3; ++i)
++  {
++    SCOPED_TRACE(i);
++    ASSERT_EQ(m_reader->ReadSample(), AP4_SUCCESS);
++    EXPECT_EQ(FrameIndex(), i);
++    EXPECT_EQ(m_reader->PTS(), Time(AudioPts(i)));
++    EXPECT_EQ(m_reader->GetPTSDiff(), DIFF);
++  }
++}
+-- 
+2.47.3
+
