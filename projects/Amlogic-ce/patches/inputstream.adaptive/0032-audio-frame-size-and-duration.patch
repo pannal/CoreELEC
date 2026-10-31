@@ -1,0 +1,663 @@
+From a8a188a3806e372a0986d5ad9ccc635f957e115d Mon Sep 17 00:00:00 2001
+From: primez <mpincoski@gmail.com>
+Date: Sat, 31 Oct 2026 07:36:13 -0600
+Subject: [PATCH 32/41] [mpegts] Read the size and duration of each audio frame
+ from the frame header
+
+The TS audio parsers advance the frame clock by a fixed frame duration,
+and some read a wrong frame size:
+
+- MPEG-2 and MPEG-2.5 Layer III frames hold 576 samples, and the frame
+  size uses 72 instead of 144. The parser joined each two frames into
+  one sample with the wrong timestamps. Layer I frames hold 384 samples.
+  A mono stream had 2 channels (channel_mode 3 was compared with 11).
+- An E-AC-3 frame holds 1, 2, 3 or 6 blocks of 256 samples. A dependent
+  frame (7.1 channels) extends the frame before at the same time, so
+  the dependent frame now joins the frame before in one sample, as in
+  FFmpeg and the packed audio reader. A dependent frame without the frame before is dropped.
+- An ADTS frame holds 1 to 4 raw data blocks, and a LATM frame 1 to 64
+  sub frames, each of 1024 samples. The packed audio reader also used
+  1024 samples for each ADTS frame.
+- An ADTS frame length equal to the header, or a LATM length of 0,
+  gave an empty frame that moved the audio clock. An ADTS header with
+  the sample rate index 13 to 15, as a sync word in the frame data, is
+  no header.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ inputstream.adaptive/changelog.txt |   5 +-
+ lib/mpegts/mpegts/ES_AAC.cpp       |  29 +++-
+ lib/mpegts/mpegts/ES_AAC.h         |   2 +
+ lib/mpegts/mpegts/ES_AC3.cpp       |  52 ++++++-
+ lib/mpegts/mpegts/ES_AC3.h         |   4 +
+ lib/mpegts/mpegts/ES_MPEGAudio.cpp |  21 ++-
+ lib/mpegts/mpegts/ES_MPEGAudio.h   |   1 +
+ src/demuxers/ADTSReader.cpp        |   3 +-
+ src/test/TestADTSReader.cpp        |  16 ++
+ src/test/TestTSReader.cpp          | 236 ++++++++++++++++++++++++++++-
+ 10 files changed, 348 insertions(+), 21 deletions(-)
+
+diff --git a/inputstream.adaptive/changelog.txt b/inputstream.adaptive/changelog.txt
+index 60b607e..095f9fd 100644
+--- a/inputstream.adaptive/changelog.txt
++++ b/inputstream.adaptive/changelog.txt
+@@ -25,7 +25,10 @@ v21.5.25-p3i.4 (2026-10-31)
+ - Fix a seek in a TS stream to a key frame whose picture PES starts in the next segment, which returned that key frame twice
+ - Fix a live seek in a TS stream that waited more than once for the next segment, which lost audio frames of an audio PES across the two segments
+ - Fix TS audio in PES packets without a PTS at the start and after a seek, which had no PTS up to the next PES with a PTS, also in the next segment, and could not be the target of a seek, and a key frame in a PES without a PTS after a seek, which took the PTS of a later frame
+-- Fix a TS AAC stream with a corrupt ADTS header whose frame length is shorter than the header, which stopped the playback in an endless loop or sent a corrupt frame
++- Fix a TS AAC stream with a corrupt ADTS or LATM header whose frame length leaves no frame data, which stopped the playback in an endless loop or sent an empty frame that moved the audio clock, and an ADTS sync word in the data with no valid sample rate, which could hide the next frames
++- Fix MPEG-2 and MPEG-2.5 Layer III TS audio (MP3 at 24 kHz or less), which joined each two frames into one sample with the wrong timestamps, the timestamps of Layer I TS audio, and the channel count of mono MPEG TS audio
++- Fix the timestamps of TS E-AC-3 frames with fewer than 6 blocks, and of 7.1 channel TS E-AC-3, and send both substreams of a frame as one sample
++- Fix the timestamps of AAC frames with more than one raw data block in TS and HLS packed audio, and of LATM frames with more than one sub frame
+ - Fix the segment times of HLS streams with EXTINF durations finer than 1 ms, which drifted from the media time (0.24 s after one hour of a YouTube stream), so a seek near a segment start could continue at the next segment
+ 
+ v21.5.25-p3i.3 (2026-10-30)
+diff --git a/lib/mpegts/mpegts/ES_AAC.cpp b/lib/mpegts/mpegts/ES_AAC.cpp
+index 17717e0..0f05ca3 100644
+--- a/lib/mpegts/mpegts/ES_AAC.cpp
++++ b/lib/mpegts/mpegts/ES_AAC.cpp
+@@ -27,6 +27,8 @@ ES_AAC::ES_AAC(uint16_t pes_pid)
+   m_PTS                         = 0;
+   m_DTS                         = 0;
+   m_FrameSize                   = 0;
++  m_FrameDuration               = 0;
++  m_SubFrames                   = 1;
+   m_codecProfile = PROFILE_NONE;
+   m_SampleRate                  = 0;
+   m_Channels                    = 0;
+@@ -58,7 +60,7 @@ void ES_AAC::Parse(STREAM_PKT* pkt)
+     pkt->pid            = pid;
+     pkt->data           = &es_buf[p];
+     pkt->size           = m_FrameSize;
+-    pkt->duration       = 1024 * 90000 / (!m_SampleRate ? aac_sample_rates[4] : m_SampleRate);
++    pkt->duration       = m_FrameDuration;
+     pkt->dts            = m_DTS;
+     pkt->pts            = m_PTS;
+     pkt->streamChange   = streamChange;
+@@ -96,11 +98,16 @@ int ES_AAC::FindHeaders(uint8_t *buf, int buf_size)
+       CBitstream bs(buf_ptr, 16 * 8);
+       bs.skipBits(11);
+       m_FrameSize = bs.readBits(13) + 3;
++      // The frame holds an AudioMuxElement after the 3 header bytes
++      if (m_FrameSize <= 3)
++        return 0;
+       if (!ParseLATMAudioMuxElement(&bs))
+         return 0;
+ 
+       es_found_frame = true;
+-      m_DTS = m_PTS = AudioFramePts(buf_ptr - es_buf, 90000 * 1024 / (!m_SampleRate ? aac_sample_rates[4] : m_SampleRate));
++      // Each sub frame holds 1024 samples
++      m_FrameDuration = static_cast<int>(m_SubFrames * 90000LL * 1024 / (!m_SampleRate ? aac_sample_rates[4] : m_SampleRate));
++      m_DTS = m_PTS = AudioFramePts(buf_ptr - es_buf, m_FrameDuration);
+       return -1;
+     }
+   }
+@@ -142,18 +149,26 @@ int ES_AAC::FindHeaders(uint8_t *buf, int buf_size)
+       }
+ 
+       int SampleRateIndex = bs.readBits(4);
++      // The indexes 13 to 15 have no sample rate, as in a false sync word
++      if (!aac_sample_rates[SampleRateIndex])
++        return 0;
+       bs.skipBits(1); // private
+       m_Channels = bs.readBits(3);
+       bs.skipBits(4);
+ 
+       m_FrameSize = bs.readBits(13);
+-      // The frame length includes the header, a shorter length is corrupt
+-      if (m_FrameSize < (noCrc ? 7 : 9))
++      // The frame length includes the header, and a frame holds at least one
++      // raw data block after the header
++      if (m_FrameSize <= (noCrc ? 7 : 9))
+         return 0;
+-      m_SampleRate    = aac_sample_rates[SampleRateIndex & 0x0F];
++      m_SampleRate    = aac_sample_rates[SampleRateIndex];
++      bs.skipBits(11); // buffer fullness
++      // Each raw data block holds 1024 samples
++      const int rawDataBlocks = bs.readBits(2) + 1;
++      m_FrameDuration = static_cast<int>(rawDataBlocks * 90000LL * 1024 / m_SampleRate);
+ 
+       es_found_frame = true;
+-      m_DTS = m_PTS = AudioFramePts(buf_ptr - es_buf, 90000 * 1024 / (!m_SampleRate ? aac_sample_rates[4] : m_SampleRate));
++      m_DTS = m_PTS = AudioFramePts(buf_ptr - es_buf, m_FrameDuration);
+       return -1;
+     }
+   }
+@@ -185,7 +200,7 @@ void ES_AAC::ReadStreamMuxConfig(CBitstream *bs)
+     LATMGetValue(bs);                      // taraFullness
+ 
+   bs->skipBits(1);                         // allStreamSameTimeFraming = 1
+-  bs->skipBits(6);                         // numSubFrames = 0
++  m_SubFrames = bs->readBits(6) + 1;       // numSubFrames
+   bs->skipBits(4);                         // numPrograms = 0
+ 
+   // for each program (which there is only on in DVB)
+diff --git a/lib/mpegts/mpegts/ES_AAC.h b/lib/mpegts/mpegts/ES_AAC.h
+index f195d70..83f8bb1 100644
+--- a/lib/mpegts/mpegts/ES_AAC.h
++++ b/lib/mpegts/mpegts/ES_AAC.h
+@@ -22,6 +22,8 @@ namespace TSDemux
+     int         m_Channels;
+     int         m_BitRate;
+     int         m_FrameSize;
++    int         m_FrameDuration;      /* 90 kHz ticks */
++    int         m_SubFrames;          /* LATM: frames in an AudioMuxElement */
+ 
+     int64_t     m_PTS;                /* pts of the current frame */
+     int64_t     m_DTS;                /* dts of the current frame */
+diff --git a/lib/mpegts/mpegts/ES_AC3.cpp b/lib/mpegts/mpegts/ES_AC3.cpp
+index 297b7d3..ea3b85f 100644
+--- a/lib/mpegts/mpegts/ES_AC3.cpp
++++ b/lib/mpegts/mpegts/ES_AC3.cpp
+@@ -14,6 +14,7 @@
+ using namespace TSDemux;
+ 
+ #define AC3_HEADER_SIZE 7
++#define EAC3_DEPENDENT_HEADER_SIZE 6 // Up to bsid
+ 
+ /** Channel mode (audio coding mode) */
+ typedef enum
+@@ -99,6 +100,8 @@ ES_AC3::ES_AC3(uint16_t pid)
+   m_PTS                       = 0;
+   m_DTS                       = 0;
+   m_FrameSize                 = 0;
++  m_FrameDuration             = 0;
++  m_Dependent                 = false;
+   m_SampleRate                = 0;
+   m_Channels                  = 0;
+   m_BitRate                   = 0;
+@@ -123,21 +126,57 @@ void ES_AC3::Parse(STREAM_PKT* pkt)
+ 
+   if (es_found_frame && l >= m_FrameSize)
+   {
++    // A dependent frame without the frame before, as at the start, is no frame
++    if (m_Dependent)
++    {
++      es_consumed = p + m_FrameSize;
++      es_parsed = es_consumed;
++      es_found_frame = false;
++      return;
++    }
++    // The dependent frames after a frame extend the channels of that frame and
++    // belong to the frame, as in FFmpeg
++    int size = m_FrameSize;
++    while (true)
++    {
++      const int dependent = l - size >= EAC3_DEPENDENT_HEADER_SIZE
++                                ? DependentFrameSize(es_buf + p + size)
++                                : -1;
++      if (dependent > 0 && l - size >= dependent)
++        size += dependent;
++      else if (dependent && !es_end_of_data)
++        return; // The data of the next header or of the dependent frame follows
++      else
++        break;
++    }
+     bool streamChange = SetAudioInformation(m_Channels, m_SampleRate, m_BitRate, 0, 0);
+     pkt->pid            = pid;
+     pkt->data           = &es_buf[p];
+-    pkt->size           = m_FrameSize;
+-    pkt->duration       = 90000 * 1536 / m_SampleRate;
++    pkt->size           = size;
++    pkt->duration       = m_FrameDuration;
+     pkt->dts            = m_DTS;
+     pkt->pts            = m_PTS;
+     pkt->streamChange   = streamChange;
+ 
+-    es_consumed = p + m_FrameSize;
++    es_consumed = p + size;
+     es_parsed = es_consumed;
+     es_found_frame = false;
+   }
+ }
+ 
++int ES_AC3::DependentFrameSize(const uint8_t* buf)
++{
++  // The sync word, the frame type, the frame size, and bsid 11 to 16 of E-AC-3
++  if (buf[0] != 0x0b || buf[1] != 0x77)
++    return 0;
++  CBitstream bs(const_cast<uint8_t*>(buf) + 2, (EAC3_DEPENDENT_HEADER_SIZE - 2) * 8);
++  const int bsid = bs.showBits(29) & 0x1F;
++  if (bsid <= 10 || bsid > 16 || bs.readBits(2) != EAC3_FRAME_TYPE_DEPENDENT)
++    return 0;
++  bs.skipBits(3); // substreamid
++  return (bs.readBits(11) + 1) << 1;
++}
++
+ int ES_AC3::FindHeaders(uint8_t *buf, int buf_size)
+ {
+   if (es_found_frame)
+@@ -188,6 +227,8 @@ int ES_AC3::FindHeaders(uint8_t *buf, int buf_size)
+       m_BitRate     = (AC3BitrateTable[frmsizecod>>1] * 1000) >> srShift;
+       m_Channels    = AC3ChannelsTable[acmod] + lfeon;
+       m_FrameSize   = AC3FrameSizeTable[frmsizecod][fscod] * 2;
++      m_FrameDuration = 90000 * 1536 / m_SampleRate;
++      m_Dependent = false;
+     }
+     else
+     {
+@@ -222,9 +263,12 @@ int ES_AC3::FindHeaders(uint8_t *buf, int buf_size)
+ 
+       m_BitRate  = (uint32_t)(8.0 * m_FrameSize * m_SampleRate / (numBlocks * 256.0));
+       m_Channels = AC3ChannelsTable[channelMode] + lfeon;
++      m_FrameDuration = 90000 * numBlocks * 256 / m_SampleRate;
++      m_Dependent = frametype == EAC3_FRAME_TYPE_DEPENDENT;
+     }
+     es_found_frame = true;
+-    m_DTS = m_PTS = AudioFramePts(buf - es_buf, 90000 * 1536 / m_SampleRate);
++    if (!m_Dependent)
++      m_DTS = m_PTS = AudioFramePts(buf - es_buf, m_FrameDuration);
+     return -1;
+   }
+   return 0;
+diff --git a/lib/mpegts/mpegts/ES_AC3.h b/lib/mpegts/mpegts/ES_AC3.h
+index 51e18b7..fc3237b 100644
+--- a/lib/mpegts/mpegts/ES_AC3.h
++++ b/lib/mpegts/mpegts/ES_AC3.h
+@@ -20,11 +20,15 @@ namespace TSDemux
+     int         m_Channels;
+     int         m_BitRate;
+     int         m_FrameSize;
++    int         m_FrameDuration;      /* 90 kHz ticks */
++    bool        m_Dependent;          /* E-AC-3 dependent frame */
+ 
+     int64_t     m_PTS;                /* pts of the current frame */
+     int64_t     m_DTS;                /* dts of the current frame */
+ 
+     int FindHeaders(uint8_t *buf, int buf_size);
++    /* The size of the E-AC-3 dependent frame at buf, or 0 */
++    static int DependentFrameSize(const uint8_t* buf);
+ 
+   public:
+     ES_AC3(uint16_t pid);
+diff --git a/lib/mpegts/mpegts/ES_MPEGAudio.cpp b/lib/mpegts/mpegts/ES_MPEGAudio.cpp
+index c20f260..52fecc2 100644
+--- a/lib/mpegts/mpegts/ES_MPEGAudio.cpp
++++ b/lib/mpegts/mpegts/ES_MPEGAudio.cpp
+@@ -32,6 +32,7 @@ ES_MPEG2Audio::ES_MPEG2Audio(uint16_t pid)
+   m_PTS                       = 0;
+   m_DTS                       = 0;
+   m_FrameSize                 = 0;
++  m_FrameDuration             = 0;
+   m_SampleRate                = 0;
+   m_Channels                  = 0;
+   m_BitRate                   = 0;
+@@ -60,7 +61,7 @@ void ES_MPEG2Audio::Parse(STREAM_PKT* pkt)
+     pkt->pid            = pid;
+     pkt->data           = &es_buf[p];
+     pkt->size           = m_FrameSize;
+-    pkt->duration       = 90000 * 1152 / m_SampleRate;
++    pkt->duration       = m_FrameDuration;
+     pkt->dts            = m_DTS;
+     pkt->pts            = m_PTS;
+     pkt->streamChange   = streamChange;
+@@ -112,18 +113,32 @@ int ES_MPEG2Audio::FindHeaders(uint8_t *buf, int buf_size)
+     bs.skipBits(1); // private bit
+     int channel_mode = bs.readBits(2);
+ 
+-    if (channel_mode == 11)
++    if (channel_mode == 3)
+       m_Channels = 1;
+     else
+       m_Channels = 2;
+ 
++    // An MPEG-2 or MPEG-2.5 Layer III frame holds half the samples
++    int samples;
+     if (layer == 1)
++    {
+       m_FrameSize = (12 * m_BitRate / m_SampleRate + padding) * 4;
++      samples = 384;
++    }
++    else if (layer == 3 && mpeg2)
++    {
++      m_FrameSize = 72 * m_BitRate / m_SampleRate + padding;
++      samples = 576;
++    }
+     else
++    {
+       m_FrameSize = 144 * m_BitRate / m_SampleRate + padding;
++      samples = 1152;
++    }
++    m_FrameDuration = 90000 * samples / m_SampleRate;
+ 
+     es_found_frame = true;
+-    m_DTS = m_PTS = AudioFramePts(buf - es_buf, 90000 * 1152 / m_SampleRate);
++    m_DTS = m_PTS = AudioFramePts(buf - es_buf, m_FrameDuration);
+     return -1;
+   }
+   return 0;
+diff --git a/lib/mpegts/mpegts/ES_MPEGAudio.h b/lib/mpegts/mpegts/ES_MPEGAudio.h
+index fad63d6..3fb7d18 100644
+--- a/lib/mpegts/mpegts/ES_MPEGAudio.h
++++ b/lib/mpegts/mpegts/ES_MPEGAudio.h
+@@ -20,6 +20,7 @@ namespace TSDemux
+     int         m_Channels;
+     int         m_BitRate;
+     int         m_FrameSize;
++    int         m_FrameDuration;      /* 90 kHz ticks */
+ 
+     int64_t     m_PTS;
+     int64_t     m_DTS;
+diff --git a/src/demuxers/ADTSReader.cpp b/src/demuxers/ADTSReader.cpp
+index 98f97f4..89da111 100644
+--- a/src/demuxers/ADTSReader.cpp
++++ b/src/demuxers/ADTSReader.cpp
+@@ -208,7 +208,8 @@ bool ADTSFrame::ParseAacHeader(AP4_ByteStream* stream, ADTSFrameInfo& frameInfo)
+ 
+   frameInfo.m_codecProfile = frame.m_Info.m_Profile;
+   frameInfo.m_frameSize = frame.m_Info.m_FrameLength + AP4_ADTS_HEADER_SIZE;
+-  frameInfo.m_frameCount = 1024;
++  // number_of_raw_data_blocks_in_frame: 1 to 4 raw data blocks of 1024 samples
++  frameInfo.m_frameCount = 1024u * ((buffer.GetData()[6] & 0x3u) + 1);
+   frameInfo.m_sampleRate = frame.m_Info.m_SamplingFrequency;
+   frameInfo.m_channels = frame.m_Info.m_ChannelConfiguration;
+   return true;
+diff --git a/src/test/TestADTSReader.cpp b/src/test/TestADTSReader.cpp
+index e63864c..6b7209b 100644
+--- a/src/test/TestADTSReader.cpp
++++ b/src/test/TestADTSReader.cpp
+@@ -250,6 +250,22 @@ TEST_F(ADTSSampleReaderTest, SeekWithoutTimestampEnds)
+ }
+ 
+ // An AC-3 frame always holds 6 blocks of 256 samples, for any channel count.
++// An ADTS frame holds 1 to 4 raw data blocks of 1024 samples
++TEST_F(ADTSSampleReaderTest, AacFramesHoldTheirRawDataBlocks)
++{
++  for (const uint8_t blocks : {1, 2, 4})
++  {
++    SCOPED_TRACE(static_cast<int>(blocks));
++    std::vector<uint8_t> frame{AacFrame()};
++    frame[6] = static_cast<uint8_t>(0xFC | (blocks - 1));
++    OpenSegment(Segment(frame, BASE_PTS), AacTime(0));
++
++    ASSERT_TRUE(m_reader->TimeSeek(FrameTime(BASE_PTS, 100, blocks * 1024, 44100), false));
++    EXPECT_EQ(m_reader->PTS(), FrameTime(BASE_PTS, 100, blocks * 1024, 44100));
++    EXPECT_EQ(FrameIndex(), 100);
++  }
++}
++
+ TEST_F(ADTSSampleReaderTest, Ac3StereoFramesHold1536Samples)
+ {
+   OpenSegment(Segment(Ac3Frame(0x40), BASE_PTS), AacTime(0));
+diff --git a/src/test/TestTSReader.cpp b/src/test/TestTSReader.cpp
+index ab37c3e..774c6f4 100644
+--- a/src/test/TestTSReader.cpp
++++ b/src/test/TestTSReader.cpp
+@@ -9,6 +9,8 @@
+ #include "AdaptiveByteStream.h"
+ #include "TestAdaptiveStream.h"
+ #include "mpegts/ES_AAC.h"
++#include "mpegts/ES_AC3.h"
++#include "mpegts/ES_MPEGAudio.h"
+ #include "mpegts/ES_MPEGVideo.h"
+ #include "mpegts/ES_h264.h"
+ #include "mpegts/ES_hevc.h"
+@@ -16,6 +18,7 @@
+ 
+ #include <algorithm>
+ #include <cstdint>
++#include <cstddef>
+ #include <map>
+ #include <memory>
+ #include <optional>
+@@ -888,13 +891,15 @@ TEST(TSParserTest, TheRestOfACopiedLastFrameIsDropped)
+   }
+ }
+ 
+-// A corrupt ADTS header can give a frame length shorter than the header. The
+-// parser skips that header and finds the next frames.
+-TEST(TSParserTest, AnAdtsFrameShorterThanItsHeaderIsSkipped)
++// A corrupt ADTS header can give a frame length of the header or less. A frame
++// holds at least one raw data block after the header. The parser skips that
++// header and finds the next frames.
++TEST(TSParserTest, AnAdtsFrameWithoutDataIsSkipped)
+ {
+   // The length of a header without a CRC, and of a header with a CRC
+   for (const auto& [protectionAbsent, length] :
+-       {std::pair{true, 0U}, std::pair{true, 6U}, std::pair{false, 8U}})
++       {std::pair{true, 0U}, std::pair{true, 6U}, std::pair{true, 7U}, std::pair{false, 8U},
++        std::pair{false, 9U}})
+   {
+     SCOPED_TRACE(testing::Message() << "length " << length << (protectionAbsent ? "" : ", CRC"));
+     std::vector<uint8_t> data{AacFrame(0)};
+@@ -903,7 +908,8 @@ TEST(TSParserTest, AnAdtsFrameShorterThanItsHeaderIsSkipped)
+     corrupt[3] = static_cast<uint8_t>(0x80 | (length >> 11));
+     corrupt[4] = static_cast<uint8_t>(length >> 3);
+     corrupt[5] = static_cast<uint8_t>(((length & 7) << 5) | 0x1F);
+-    corrupt.resize(9);
++    corrupt[6] = 0; // Else 0xFF of length 7 and this byte are a sync word
++    corrupt.resize(std::max(length, 9U));
+     data.insert(data.end(), corrupt.begin(), corrupt.end());
+     for (int i = 2; i < 4; ++i)
+     {
+@@ -924,6 +930,226 @@ TEST(TSParserTest, AnAdtsFrameShorterThanItsHeaderIsSkipped)
+   }
+ }
+ 
++// A LATM frame of 3 + 120 bytes with the StreamMuxConfig of AAC LC at 48 kHz
++// with 2 channels and 1 or 2 sub frames. The last two bytes hold the frame index.
++std::vector<uint8_t> LatmFrame(int index, unsigned int length = 120, int subFrames = 1)
++{
++  std::vector<uint8_t> frame{0x56, static_cast<uint8_t>(0xE0 | (length >> 8)),
++                             static_cast<uint8_t>(length),
++                             // useSameStreamMux 0, audioMuxVersion 0, allStreamsSameTimeFraming 1,
++                             // no sub frames, programs or layers, AOT 2, rate index 3,
++                             // channels 2, frameLengthType 0, buffer fullness 0xFF
++                             0x20, static_cast<uint8_t>((subFrames - 1) << 7), 0x11, 0x90,
++                             0x1F, 0xE0};
++  frame.resize(3 + 120, 0);
++  frame[frame.size() - 2] = static_cast<uint8_t>(index >> 8);
++  frame[frame.size() - 1] = static_cast<uint8_t>(index);
++  return frame;
++}
++
++// A LATM frame holds an AudioMuxElement after the 3 header bytes. The parser
++// skips a header with a length of 0 and finds the next frames.
++TEST(TSParserTest, ALatmFrameWithoutDataIsSkipped)
++{
++  std::vector<uint8_t> data;
++  for (int i = 0; i < 4; ++i)
++  {
++    const std::vector<uint8_t> frame{LatmFrame(i, i == 1 ? 0 : 120)};
++    data.insert(data.end(), frame.begin(), frame.end());
++  }
++  TSDemux::ES_AAC stream{AUDIO_PID};
++  stream.stream_type = TSDemux::STREAM_TYPE_AUDIO_AAC;
++  stream.c_pts = stream.c_dts = 90000;
++  stream.StartPes(0, 0);
++  stream.Append(data.data(), data.size(), true);
++  std::vector<std::pair<int, int64_t>> read;
++  TSDemux::STREAM_PKT pkt;
++  while (read.size() < 10 && (stream.GetStreamPacket(&pkt) || stream.GetEndPacket(&pkt)))
++    read.emplace_back(pkt.size == 123 ? (pkt.data[121] << 8) | pkt.data[122] : -1, pkt.pts);
++  EXPECT_EQ(read, (std::vector<std::pair<int, int64_t>>{
++                      {0, 90000}, {2, 90000 + AUDIO_TICKS}, {3, 90000 + 2 * AUDIO_TICKS}}));
++}
++
++struct AudioFrame
++{
++  unsigned int size;
++  int64_t pts;
++  int64_t duration;
++  bool operator==(const AudioFrame& other) const
++  {
++    return size == other.size && pts == other.pts && duration == other.duration;
++  }
++};
++
++std::ostream& operator<<(std::ostream& os, const AudioFrame& frame)
++{
++  return os << "{" << frame.size << ", " << frame.pts << ", " << frame.duration << "}";
++}
++
++// The frames of one PES with the PTS 90000. The data comes in parts of the
++// chunk size, as in TS packets.
++std::vector<AudioFrame> ReadAudioFrames(TSDemux::ElementaryStream& stream,
++                                        const std::vector<uint8_t>& data,
++                                        size_t chunk = SIZE_MAX)
++{
++  stream.c_pts = stream.c_dts = 90000;
++  stream.StartPes(0, 0);
++  std::vector<AudioFrame> read;
++  TSDemux::STREAM_PKT pkt;
++  for (size_t pos = 0; pos < data.size(); pos += chunk)
++  {
++    stream.Append(data.data() + pos, std::min(chunk, data.size() - pos), pos == 0);
++    while (read.size() < 10 && stream.GetStreamPacket(&pkt))
++      read.push_back({static_cast<unsigned int>(pkt.size), pkt.pts, pkt.duration});
++  }
++  while (read.size() < 10 && stream.GetEndPacket(&pkt))
++    read.push_back({static_cast<unsigned int>(pkt.size), pkt.pts, pkt.duration});
++  return read;
++}
++
++// An ADTS frame holds 1 to 4 raw data blocks of 1024 samples, and a LATM
++// frame 1 to 64 sub frames of 1024 samples. An ADTS header without a sample
++// rate, as a false sync word in the data, is no header.
++TEST(TSParserTest, AacFramesHaveTheDurationOfTheirBlocks)
++{
++  for (const int blocks : {1, 2, 4})
++  {
++    SCOPED_TRACE(testing::Message() << "ADTS, " << blocks << " raw data blocks");
++    std::vector<uint8_t> data;
++    for (int i = 0; i < 3; ++i)
++    {
++      std::vector<uint8_t> frame{AacFrame(i)};
++      frame[6] = static_cast<uint8_t>(0xFC | (blocks - 1));
++      data.insert(data.end(), frame.begin(), frame.end());
++      if (i == 0)
++      {
++        // Rate index 13. A buffer fullness of 0 gives no other sync word.
++        frame[2] = 0x74;
++        frame[5] &= 0xE0;
++        frame[6] &= 0x03;
++        data.insert(data.end(), frame.begin(), frame.begin() + 7);
++      }
++    }
++    TSDemux::ES_AAC stream{AUDIO_PID};
++    stream.stream_type = TSDemux::STREAM_TYPE_AUDIO_AAC;
++    const int64_t duration{blocks * static_cast<int64_t>(AUDIO_TICKS)};
++    EXPECT_EQ(ReadAudioFrames(stream, data),
++              (std::vector<AudioFrame>{{127, 90000, duration},
++                                       {127, 90000 + duration, duration},
++                                       {127, 90000 + 2 * duration, duration}}));
++  }
++  for (const int subFrames : {1, 2})
++  {
++    SCOPED_TRACE(testing::Message() << "LATM, " << subFrames << " sub frames");
++    std::vector<uint8_t> data;
++    for (int i = 0; i < 3; ++i)
++    {
++      const std::vector<uint8_t> frame{LatmFrame(i, 120, subFrames)};
++      data.insert(data.end(), frame.begin(), frame.end());
++    }
++    TSDemux::ES_AAC stream{AUDIO_PID};
++    stream.stream_type = TSDemux::STREAM_TYPE_AUDIO_AAC;
++    const int64_t duration{subFrames * static_cast<int64_t>(AUDIO_TICKS)};
++    EXPECT_EQ(ReadAudioFrames(stream, data),
++              (std::vector<AudioFrame>{{123, 90000, duration},
++                                       {123, 90000 + duration, duration},
++                                       {123, 90000 + 2 * duration, duration}}));
++  }
++}
++
++// The header gives the size, the duration and the channels of an MPEG audio
++// frame. A Layer I frame holds 384 samples, an MPEG-2 or MPEG-2.5 Layer III
++// frame 576 samples and the other frames 1152 samples.
++TEST(TSParserTest, MpegAudioFramesHaveTheSizeAndDurationOfTheirHeader)
++{
++  struct Format
++  {
++    const char* name;
++    uint8_t version; // 3 MPEG-1, 2 MPEG-2, 0 MPEG-2.5
++    uint8_t layer; // 3 Layer I, 2 Layer II, 1 Layer III
++    uint8_t bitrateIndex;
++    uint8_t sampleRateIndex;
++    unsigned int size;
++    int64_t duration;
++  };
++  for (const Format& format : {
++           // 128 kbit/s at 48 kHz
++           Format{"MPEG-1 Layer I", 3, 3, 4, 1, 128, 720},
++           Format{"MPEG-1 Layer II", 3, 2, 8, 1, 384, 2160},
++           Format{"MPEG-1 Layer III", 3, 1, 9, 1, 384, 2160},
++           // 64 kbit/s at 24 kHz, and at 12 kHz
++           Format{"MPEG-2 Layer II", 2, 2, 8, 1, 384, 4320},
++           Format{"MPEG-2 Layer III", 2, 1, 8, 1, 192, 2160},
++           Format{"MPEG-2.5 Layer III", 0, 1, 8, 1, 384, 4320},
++       })
++  for (const int channels : {1, 2})
++  {
++    SCOPED_TRACE(testing::Message() << format.name << ", " << channels << " channels");
++    std::vector<uint8_t> frame{0xFF,
++                               static_cast<uint8_t>(0xE1 | (format.version << 3) |
++                                                    (format.layer << 1)),
++                               static_cast<uint8_t>((format.bitrateIndex << 4) |
++                                                    (format.sampleRateIndex << 2)),
++                               static_cast<uint8_t>(channels == 1 ? 0xC0 : 0x00)};
++    frame.resize(format.size, 0x55);
++    std::vector<uint8_t> data;
++    for (int i = 0; i < 3; ++i)
++      data.insert(data.end(), frame.begin(), frame.end());
++    TSDemux::ES_MPEG2Audio stream{AUDIO_PID};
++    const unsigned int size{format.size};
++    const int64_t duration{format.duration};
++    EXPECT_EQ(ReadAudioFrames(stream, data),
++              (std::vector<AudioFrame>{{size, 90000, duration},
++                                       {size, 90000 + duration, duration},
++                                       {size, 90000 + 2 * duration, duration}}));
++    EXPECT_EQ(stream.stream_info.channels, channels);
++  }
++}
++
++// An E-AC-3 frame holds 1, 2, 3 or 6 blocks of 256 samples. A dependent frame
++// extends the channels of the frame before, at the same time, so the decoder
++// needs both frames in one packet.
++TEST(TSParserTest, EAc3FramesHaveTheDurationOfTheirBlocks)
++{
++  const auto eac3Frame = [](int frameType, int blocksCode)
++  {
++    // 128 bytes, 48 kHz, 2 channels, bsid 16
++    constexpr unsigned int words{64};
++    std::vector<uint8_t> frame{0x0B,
++                               0x77,
++                               static_cast<uint8_t>((frameType << 6) | ((words - 1) >> 8)),
++                               static_cast<uint8_t>(words - 1),
++                               static_cast<uint8_t>((blocksCode << 4) | 0x04),
++                               0x80};
++    frame.resize(2 * words, 0x55);
++    return frame;
++  };
++  constexpr int64_t BLOCK{480}; // 256 samples at 48 kHz
++  for (const auto& [blocksCode, blocks] : {std::pair{0, 1}, std::pair{1, 2}, std::pair{2, 3},
++                                           std::pair{3, 6}})
++  {
++    SCOPED_TRACE(testing::Message() << blocks << " blocks");
++    // The first dependent frame belongs to a frame before the data
++    std::vector<uint8_t> data;
++    for (const int frameType : {1, 0, 1, 0, 1, 0})
++    {
++      const std::vector<uint8_t> frame{eac3Frame(frameType, blocksCode)};
++      data.insert(data.end(), frame.begin(), frame.end());
++    }
++    const int64_t duration{blocks * BLOCK};
++    // The data of a frame, or of the header after the frame, can come later
++    for (const size_t chunk : {SIZE_MAX, size_t{130}, size_t{131}, size_t{184}})
++    {
++      SCOPED_TRACE(testing::Message() << "parts of " << chunk << " bytes");
++      TSDemux::ES_AC3 stream{AUDIO_PID};
++      EXPECT_EQ(ReadAudioFrames(stream, data, chunk),
++                (std::vector<AudioFrame>{{256, 90000, duration},
++                                         {256, 90000 + duration, duration},
++                                         {128, 90000 + 2 * duration, duration}}));
++    }
++  }
++}
++
+ TEST(TSParserTest, TheExtraDataHasTheParameterSetsAfter3ByteStartCodes)
+ {
+   const auto shortStartCodes = [](const std::vector<uint8_t>& au) {
+-- 
+2.47.3
+
