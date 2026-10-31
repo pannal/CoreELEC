@@ -1,0 +1,456 @@
+From 66b49c4a197bb34d1271923e066d8ab2081078f3 Mon Sep 17 00:00:00 2001
+From: primez <mpincoski@gmail.com>
+Date: Sat, 31 Oct 2026 06:44:59 -0600
+Subject: [PATCH] [TSReader] Resume the clock of each stream after a seek and
+ at the start
+
+An audio PES needs a PTS only every 0.7 s, and the frames of a PES without
+a PTS follow the frames before. A parser reset cleared that clock, so after
+a seek, or at the start, the audio frames up to the next PES with a PTS had
+no PTS. A video PES without a PTS takes the timestamps of the PES before,
+but after a seek the parser took the last PES header of the seek scan, so a
+key frame in such a PES came with the PTS of a later frame.
+
+The seek scan keeps the frames that the streams read. Each stream continues
+with the first frame of a PES at its resume position, and the reader reads
+on, up to the end of the segment, until the clock at that frame is known:
+from the frame, or from the next PTS less the durations of the frames
+between. After the reset, the stream takes the PES header timestamps and
+the audio clock of a read without the reset (ElementaryStream::Clock).
+The start of the reader finds the clocks the same way.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ inputstream.adaptive/changelog.txt     |   1 +
+ lib/mpegts/mpegts/elementaryStream.cpp |  12 +++
+ lib/mpegts/mpegts/elementaryStream.h   |   9 ++
+ src/demuxers/TSReader.cpp              | 109 ++++++++++++++++++++++++-
+ src/demuxers/TSReader.h                |  21 +++++
+ src/samplereader/TSSampleReader.cpp    |   1 +
+ src/test/TestTSReader.cpp              |  88 ++++++++++++++++++++
+ 7 files changed, 238 insertions(+), 3 deletions(-)
+
+diff --git a/inputstream.adaptive/changelog.txt b/inputstream.adaptive/changelog.txt
+index 49ea585..570f35e 100644
+--- a/inputstream.adaptive/changelog.txt
++++ b/inputstream.adaptive/changelog.txt
+@@ -24,6 +24,7 @@ v21.5.25-p3i.4 (2026-10-31)
+ - Fix the last frame of a TS segment or stream whose parameter sets came in a PES of their own, which was read as two frames
+ - Fix a seek in a TS stream to a key frame whose picture PES starts in the next segment, which returned that key frame twice
+ - Fix a live seek in a TS stream that waited more than once for the next segment, which lost audio frames of an audio PES across the two segments
++- Fix the timestamps of TS audio in PES packets without a PTS at the start and after a seek, which had no PTS up to the next PES with a PTS, and of a key frame in a PES without a PTS after a seek, which took the PTS of a later frame
+ - Fix a TS AAC stream with a corrupt ADTS header whose frame length is shorter than the header, which stopped the playback in an endless loop or sent a corrupt frame
+ - Fix the segment times of HLS streams with EXTINF durations finer than 1 ms, which drifted from the media time (0.24 s after one hour of a YouTube stream), so a seek near a segment start could continue at the next segment
+ 
+diff --git a/lib/mpegts/mpegts/elementaryStream.cpp b/lib/mpegts/mpegts/elementaryStream.cpp
+index 71cec40..d1c7b24 100644
+--- a/lib/mpegts/mpegts/elementaryStream.cpp
++++ b/lib/mpegts/mpegts/elementaryStream.cpp
+@@ -73,6 +73,13 @@ void ElementaryStream::Reset(void)
+   es_drop_pes = false;
+   es_pts_position = UINT64_MAX;
+   es_next_pts = PTS_UNSET;
++  // A PES without a PTS takes the timestamps of the PES before
++  if (const std::optional<Clock> clock{std::exchange(es_resume_clock, std::nullopt)})
++  {
++    c_pts = clock->pts;
++    c_dts = clock->dts;
++    es_next_pts = clock->nextPts;
++  }
+ }
+ 
+ void ElementaryStream::ClearBuffer()
+@@ -117,6 +124,11 @@ void ElementaryStream::ContinueAfterCopy(uint64_t nextFramePosition, bool keyFra
+   es_continue_decode = keyFrame;
+ }
+ 
++void ElementaryStream::ResumeClock(const Clock& clock)
++{
++  es_resume_clock = clock;
++}
++
+ const ElementaryStream::PesStart* ElementaryStream::StartPicture(size_t offset)
+ {
+   es_picture_start = offset - es_consumed;
+diff --git a/lib/mpegts/mpegts/elementaryStream.h b/lib/mpegts/mpegts/elementaryStream.h
+index d7a7699..fd45df4 100644
+--- a/lib/mpegts/mpegts/elementaryStream.h
++++ b/lib/mpegts/mpegts/elementaryStream.h
+@@ -11,6 +11,7 @@
+ 
+ #include <inttypes.h>
+ #include <cstddef>    // for size_t
++#include <optional>
+ #include <utility>
+ #include <vector>
+ 
+@@ -106,6 +107,13 @@ namespace TSDemux
+     bool GetEndPacket(STREAM_PKT* pkt); ///< Like GetStreamPacket(), but the buffer ends with the end of the last frame
+     uint64_t NextFramePosition() const; ///< After GetStreamPacket(), the stream position of the PES where the next frame starts. UINT64_MAX: the next PES with a PTS.
+     void ContinueAfterCopy(uint64_t nextFramePosition, bool keyFrame); ///< After the next reset, the data continues after a frame copy that the reader returned
++    struct Clock
++    {
++      int64_t pts;                ///< The PTS of the last PES header before the data
++      int64_t dts;                ///< The DTS of the last PES header before the data
++      int64_t nextPts;            ///< The PTS of the first audio frame of the data
++    };
++    void ResumeClock(const Clock& clock); ///< After the next reset, the data continues with the clock of a read without the reset
+     virtual void Parse(STREAM_PKT* pkt);
+ 
+     struct PesStart
+@@ -139,6 +147,7 @@ namespace TSDemux
+     uint64_t es_copy_next_position; ///< After the next reset, the PES before this position belong to a frame copy. UINT64_MAX: up to the next PES with a PTS.
+     uint64_t es_resume_position;  ///< The PES before this position belong to a frame copy
+     bool   es_drop_pes;           ///< The PES belongs to a frame copy
++    std::optional<Clock> es_resume_clock; ///< The clock after the next reset
+     bool TakeContinueDecode() { return std::exchange(es_continue_decode, false); } ///< Parser: In Reset(), the frames continue a decode
+     std::vector<PesStart> es_pes_starts; ///< The PES starts in buffer order, the first PES can start before the buffer
+     bool   es_pes_start_pending;
+diff --git a/src/demuxers/TSReader.cpp b/src/demuxers/TSReader.cpp
+index cd16a1b..c2d935b 100644
+--- a/src/demuxers/TSReader.cpp
++++ b/src/demuxers/TSReader.cpp
+@@ -243,6 +243,7 @@ bool TSReader::SeekTime(uint64_t timeInTs, bool preceeding)
+   std::deque<FrameCopy> previousPesFrames{std::move(m_seekPesFrames)};
+   m_seekPesFrames.clear();
+   m_frameCopies.clear();
++  std::vector<ClockFrame> frames; // The frames read in the segment of the seek position
+   const auto keepCopy = [&](const TSDemux::ElementaryStream& stream,
+                             const TSDemux::ElementaryStream::PesStart& pes)
+   {
+@@ -287,6 +288,7 @@ bool TSReader::SeekTime(uint64_t timeInTs, bool preceeding)
+       seekFrame = startFrame;
+       seekFrameIsCopy = false;
+       copies.clear();
++      frames.clear();
+       // A stream without frames since then, as when a live seek waits again,
+       // keeps the frames of its last PES
+       std::set<uint16_t> pidsWithFrames;
+@@ -309,6 +311,7 @@ bool TSReader::SeekTime(uint64_t timeInTs, bool preceeding)
+                                                          : nullptr};
+     if (!pes)
+       continue;
++    frames.push_back({m_pkt, *pes});
+     const bool isCopy{pes->position < readStart};
+     if (isCopy)
+       keepCopy(*stream, *pes);
+@@ -347,6 +350,7 @@ bool TSReader::SeekTime(uint64_t timeInTs, bool preceeding)
+     else if (preceeding && pts >= timeInTs)
+       break;
+   }
++  std::deque<FrameCopy> frameCopies;
+   if (lastRecovery == readStart)
+   {
+     // A stream emits the rest of a PES before readStart when the next PES of
+@@ -365,6 +369,7 @@ bool TSReader::SeekTime(uint64_t timeInTs, bool preceeding)
+                                                            : nullptr};
+       if (!pes)
+         continue;
++      frames.push_back({m_pkt, *pes});
+       if (pes->position < readStart)
+         keepCopy(*stream, *pes);
+       else
+@@ -376,21 +381,34 @@ bool TSReader::SeekTime(uint64_t timeInTs, bool preceeding)
+     for (FrameCopy& copy : copies)
+     {
+       if (seekFrameIsCopy || !seekFrame || copy.pkt.pid != seekFrame->pid)
+-        m_frameCopies.push_back(std::move(copy));
++        frameCopies.push_back(std::move(copy));
+     }
+   }
+-  m_AVContext->GoPosition(lastRecovery, true);
+   // The data of the last copied frame of a stream can continue after
+   // lastRecovery, also in a PES of its own. The parser does not see a copied
+   // key frame, so the frames after the copy continue the decode of that key frame.
+   std::map<uint16_t, uint64_t> nextPositions;
+-  for (const FrameCopy& copy : m_frameCopies)
++  for (const FrameCopy& copy : frameCopies)
+     nextPositions[copy.pkt.pid] = copy.nextPosition;
++  // Each stream continues with the first frame of a PES at its resume position
++  // or later. A PES with a PTS sets the clock of the stream.
++  std::map<uint16_t, uint64_t> resume;
++  for (const auto& tsInfo : m_streamInfos)
++  {
++    if (tsInfo.m_enabled)
++      resume[tsInfo.m_stream->pid] = lastRecovery;
++  }
++  for (const auto& [pid, position] : nextPositions)
++    resume[pid] = position;
++  const std::map<uint16_t, TSDemux::ElementaryStream::Clock> clocks{ReadClocks(frames, resume)};
++  m_frameCopies = std::move(frameCopies);
++  m_AVContext->GoPosition(lastRecovery, true);
+   for (const auto& [pid, position] : nextPositions)
+   {
+     if (TSDemux::ElementaryStream* stream{m_AVContext->GetStream(pid)})
+       stream->ContinueAfterCopy(position, seekFrameIsCopy && pid == seekFrame->pid);
+   }
++  ResumeClocks(clocks);
+   m_seekFrame = seekFrame;
+ 
+   return true;
+@@ -486,6 +504,91 @@ bool TSReader::ReadPacket(bool scanStreamInfo)
+   return true;
+ }
+ 
++void TSReader::StartClocks()
++{
++  // The first frames of a stream can come before the first PES with a PTS
++  const uint64_t position{m_AVContext->GetPosition()};
++  std::map<uint16_t, uint64_t> resume;
++  for (const auto& tsInfo : m_streamInfos)
++  {
++    if (tsInfo.m_enabled)
++      resume[tsInfo.m_stream->pid] = position;
++  }
++  std::vector<ClockFrame> frames;
++  const std::map<uint16_t, TSDemux::ElementaryStream::Clock> clocks{ReadClocks(frames, resume)};
++  m_AVContext->GoPosition(position, true);
++  ResumeClocks(clocks);
++}
++
++std::map<uint16_t, TSDemux::ElementaryStream::Clock> TSReader::ReadClocks(
++    std::vector<ClockFrame>& frames, const std::map<uint16_t, uint64_t>& resume)
++{
++  // The clock of a stream at the first frame of a PES at the resume position
++  // or later. The frames of a PES without a PTS follow the frames before, so
++  // without a clock at that frame, the next PTS gives the clock.
++  std::map<uint16_t, TSDemux::ElementaryStream::Clock> clocks;
++  const auto findClocks = [&]()
++  {
++    bool complete{true};
++    for (const auto& [pid, position] : resume)
++    {
++      if (position == 0 || position == UINT64_MAX || clocks.count(pid))
++        continue;
++      const auto first{std::find_if(frames.begin(), frames.end(),
++                                    [pid = pid, position = position](const ClockFrame& frame)
++                                    {
++                                      return frame.pkt.pid == pid &&
++                                             frame.pes.position >= position;
++                                    })};
++      if (first == frames.end())
++      {
++        complete = false;
++        continue;
++      }
++      if (first->pes.timestamped || first->pkt.pts != PTS_UNSET)
++      {
++        clocks[pid] = {first->pes.pts, first->pes.dts, first->pkt.pts};
++        continue;
++      }
++      int64_t duration{0};
++      bool found{false};
++      for (auto frame{first}; frame != frames.end(); ++frame)
++      {
++        if (frame->pkt.pid != pid)
++          continue;
++        if (frame->pkt.pts != PTS_UNSET)
++        {
++          clocks[pid] = {first->pes.pts, first->pes.dts, frame->pkt.pts - duration};
++          found = true;
++          break;
++        }
++        duration += frame->pkt.duration;
++      }
++      complete = complete && found;
++    }
++    return complete;
++  };
++  m_stopAtSegmentEnd = true;
++  while (!findClocks() && ReadPacket())
++  {
++    const TSDemux::ElementaryStream* stream{m_AVContext->GetStream(m_pkt.pid)};
++    if (const TSDemux::ElementaryStream::PesStart* pes{stream ? stream->GetPesStart(m_pkt.data)
++                                                              : nullptr})
++      frames.push_back({m_pkt, *pes});
++  }
++  m_stopAtSegmentEnd = false;
++  return clocks;
++}
++
++void TSReader::ResumeClocks(const std::map<uint16_t, TSDemux::ElementaryStream::Clock>& clocks)
++{
++  for (const auto& [pid, clock] : clocks)
++  {
++    if (TSDemux::ElementaryStream* stream{m_AVContext->GetStream(pid)})
++      stream->ResumeClock(clock);
++  }
++}
++
+ bool TSReader::ReadEndPacket()
+ {
+   for (auto& tsInfo : m_streamInfos)
+diff --git a/src/demuxers/TSReader.h b/src/demuxers/TSReader.h
+index 0d0d41e..427a88e 100644
+--- a/src/demuxers/TSReader.h
++++ b/src/demuxers/TSReader.h
+@@ -11,6 +11,7 @@
+ #include "mpegts/tsDemuxer.h"
+ 
+ #include <deque>
++#include <map>
+ #include <optional>
+ #include <stdint.h>
+ #include <utility>
+@@ -43,6 +44,11 @@ public:
+    *        a frame only when the next frame starts.
+    */
+   bool ReadEndPacket();
++  /*!
++   * \brief Before the first read, find the clock of each stream. The first
++   *        frames of a stream can come before the first PES with a PTS.
++   */
++  void StartClocks();
+ 
+   /*!
+    * \brief The data read from now on is a new segment. The session sets the
+@@ -95,6 +101,21 @@ protected:
+ 
+ private:
+   bool GetPacket();
++  // A frame and the PES where the frame starts
++  struct ClockFrame
++  {
++    TSDemux::STREAM_PKT pkt;
++    TSDemux::ElementaryStream::PesStart pes;
++  };
++  /*!
++   * \brief Reads on until the clock of each stream at its resume position is
++   *        known, or up to the end of the segment
++   * \param frames The frames read before, more frames are added
++   * \param resume The position where each stream continues
++   */
++  std::map<uint16_t, TSDemux::ElementaryStream::Clock> ReadClocks(
++      std::vector<ClockFrame>& frames, const std::map<uint16_t, uint64_t>& resume);
++  void ResumeClocks(const std::map<uint16_t, TSDemux::ElementaryStream::Clock>& clocks);
+   bool HasVideo() const;
+   void UpdateSegmentPts(TSDemux::ElementaryStream* stream);
+   bool HandleProgramChange();
+diff --git a/src/samplereader/TSSampleReader.cpp b/src/samplereader/TSSampleReader.cpp
+index 7c47d55..46c8fb7 100644
+--- a/src/samplereader/TSSampleReader.cpp
++++ b/src/samplereader/TSSampleReader.cpp
+@@ -60,6 +60,7 @@ AP4_Result CTSSampleReader::Start(bool& bStarted)
+     return AP4_ERROR_CANNOT_OPEN_FILE;
+   }
+ 
++  StartClocks();
+   m_started = true;
+   bStarted = true;
+   return ReadSample();
+diff --git a/src/test/TestTSReader.cpp b/src/test/TestTSReader.cpp
+index ca11b19..a61678f 100644
+--- a/src/test/TestTSReader.cpp
++++ b/src/test/TestTSReader.cpp
+@@ -310,6 +310,14 @@ public:
+     }
+   }
+ 
++  // One AAC frame in a PES with or without a PTS
++  void WriteAudioFrame(int frame, bool timestamped)
++  {
++    WritePes(AUDIO_PID, 0xC0,
++             timestamped ? std::optional<uint64_t>{AudioPts(frame)} : std::nullopt,
++             AacFrame(frame), false);
++  }
++
+   // Audio frames in PES packets of pesSize bytes, which can end inside a frame
+   // or a frame header. A PES has the PTS of the first frame that starts in it.
+   void WriteAudioInPesOfSize(int count, size_t pesSize)
+@@ -347,6 +355,11 @@ public:
+     WritePes(VIDEO_PID, 0xE0, VideoPts(frame), accessUnit, false, firstPacket);
+   }
+ 
++  void WriteVideoFrameWithoutPts(int frame, const std::vector<uint8_t>& accessUnit)
++  {
++    WritePes(VIDEO_PID, 0xE0, std::nullopt, accessUnit, false);
++  }
++
+   // A frame can span two PES packets, the second without a PTS
+   void WriteVideoFrameInTwoPes(int frame, const std::vector<uint8_t>& accessUnit)
+   {
+@@ -1964,6 +1977,81 @@ TEST_F(TSSampleReaderTest, AudioFramesAcrossPesPacketsTakeTheirPts)
+   }
+ }
+ 
++// An audio PES needs a PTS only every 0.7 s. The frames of a PES without a PTS
++// follow the frames before, also at the start and after a seek. The first
++// audio PES after the seek frame can come after the next video PES.
++TEST_F(TSSampleReaderTest, AudioOfPesWithoutPtsHasThePtsOfItsFrame)
++{
++  constexpr int VIDEO_FRAMES{30};
++  for (const int firstPts : {0, 3})
++  for (const int videoPerGroup : {1, 2})
++  for (const std::optional<int> target : {std::optional<int>{}, std::optional<int>{0},
++                                          std::optional<int>{10}})
++  {
++    SCOPED_TRACE(testing::Message() << "PTS in audio PES " << firstPts << " + 6n, "
++                                    << videoPerGroup << " video frames before the audio, "
++                                    << (target ? "seek to frame " + std::to_string(*target)
++                                               : std::string{"no seek"}));
++    TSWriter writer;
++    writer.WriteTables(true);
++    for (int v = 0; v < VIDEO_FRAMES; v += videoPerGroup)
++    {
++      writer.WriteVideo(v, videoPerGroup, 5);
++      for (int a = 2 * v; a < 2 * (v + videoPerGroup); ++a)
++        writer.WriteAudioFrame(a, a % 6 == firstPts);
++    }
++    Open(writer.Take(), Time(VideoPts(0)) - DIFF, INPUTSTREAM_TYPE_VIDEO);
++    m_reader->AddStreamType(INPUTSTREAM_TYPE_AUDIO, AUDIO_ID);
++    bool started{false};
++    ASSERT_EQ(m_reader->Start(started), AP4_SUCCESS);
++    if (target)
++    {
++      m_segments->m_absolutePosition -= m_segments->m_segmentReadPos;
++      m_segments->m_segmentReadPos = 0;
++      m_reader->Reset(false);
++      ASSERT_TRUE(m_reader->TimeSeek(Time(VideoPts(*target)), true));
++      ASSERT_EQ(m_reader->GetStreamId(), VIDEO_ID);
++      EXPECT_EQ(m_reader->PTS(), Time(VideoPts(*target)));
++    }
++    std::vector<std::pair<int, uint64_t>> read;
++    do
++    {
++      if (m_reader->GetStreamId() == AUDIO_ID)
++        read.emplace_back(FrameIndex(), m_reader->PTS());
++    } while (read.size() < 8 && AP4_SUCCEEDED(m_reader->ReadSample()));
++    std::vector<std::pair<int, uint64_t>> expected;
++    for (int a = 2 * target.value_or(0); a < 2 * target.value_or(0) + 8; ++a)
++      expected.emplace_back(a, Time(AudioPts(a)));
++    EXPECT_EQ(read, expected);
++  }
++}
++
++// A seek can land on a key frame whose PES has no PTS. The read after the
++// seek returns that frame with the PTS that the seek found, then the next frames.
++TEST_F(TSSampleReaderTest, ASeekToAKeyFrameInAPesWithoutPtsReturnsTheFrame)
++{
++  TSWriter writer;
++  writer.WriteTables(true);
++  writer.WriteVideo(0, 10, 5);
++  writer.WriteVideoFrameWithoutPts(10, H264.keyFrame);
++  writer.WriteVideo(11, 9, 5);
++  Open(writer.Take(), Time(VideoPts(0)) - DIFF, INPUTSTREAM_TYPE_VIDEO);
++  bool started{false};
++  ASSERT_EQ(m_reader->Start(started), AP4_SUCCESS);
++  m_segments->m_absolutePosition -= m_segments->m_segmentReadPos;
++  m_segments->m_segmentReadPos = 0;
++  m_reader->Reset(false);
++  ASSERT_TRUE(m_reader->TimeSeek(Time(VideoPts(10)), true));
++  // The key frame has the PTS of the PES before, as in the read without a seek
++  std::vector<uint64_t> pts{m_reader->PTS()};
++  const AP4_Size keyFrameSize{m_reader->GetSampleDataSize()};
++  while (pts.size() < 4 && AP4_SUCCEEDED(m_reader->ReadSample()))
++    pts.push_back(m_reader->PTS());
++  EXPECT_EQ(pts, (std::vector<uint64_t>{Time(VideoPts(9)), Time(VideoPts(11)),
++                                        Time(VideoPts(12)), Time(VideoPts(13))}));
++  EXPECT_GE(keyFrameSize, H264.keyFrame.size());
++}
++
+ // A PES of audio holds several frames. A seek lands on the frame of the seek
+ // time, not on the first frame of its PES.
+ TEST_F(TSSampleReaderTest, AudioSeekLandsOnTheFrameInsideThePes)
+-- 
+2.47.3
+
