@@ -1,0 +1,105 @@
+From 098a7be841a736eb188ac85d2fff9bce091e0fe1 Mon Sep 17 00:00:00 2001
+From: primez <mpincoski@gmail.com>
+Date: Sat, 31 Oct 2026 03:29:32 -0600
+Subject: [PATCH] [AdaptiveStream] Restart the current segment for every seek
+ in it
+
+A seek to a time in the current segment restarted the segment only for
+a seek that is not preceeding. A preceeding seek kept the read position
+and needed no reset, so the reader scanned on from the last read. A
+reader cannot seek back by itself: a TS seek to an earlier time in the
+segment landed at the segment start instead of the key frame, and a
+seek after the last frame of the segment ended the stream.
+
+The segment now restarts for every seek in it, and the session resets
+the reader, as for a seek that is not preceeding.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ inputstream.adaptive/changelog.txt |  1 +
+ src/common/AdaptiveStream.cpp      |  6 +++---
+ src/test/TestDASHTree.cpp          | 29 +++++++++++++++++++++++++++++
+ 3 files changed, 33 insertions(+), 3 deletions(-)
+
+diff --git a/inputstream.adaptive/changelog.txt b/inputstream.adaptive/changelog.txt
+index feb06c3..821c3bf 100644
+--- a/inputstream.adaptive/changelog.txt
++++ b/inputstream.adaptive/changelog.txt
+@@ -7,6 +7,7 @@ v21.5.25-p3i.4 (2026-10-31)
+ - Fix the timing offset of TS audio that follows the video of the next segment, of the first TS audio frames before the first video frame, and of TS and WebM segments with only one frame
+ - Fix a seek in a TS audio stream that continued at the first frame of the PES instead of at the frame of the seek time
+ - Fix a seek in a TS stream with video and audio that continued at the key frame before the key frame of the seek time
++- Fix a seek to an earlier time inside the current segment, which continued at the start of the segment instead of at the frame of the seek time
+ 
+ v21.5.25-p3i.3 (2026-10-30)
+ - Fix a seek in a live HLS stream that ended the audio when the next audio segment was not available yet
+diff --git a/src/common/AdaptiveStream.cpp b/src/common/AdaptiveStream.cpp
+index a53267c..2dcbcea 100644
+--- a/src/common/AdaptiveStream.cpp
++++ b/src/common/AdaptiveStream.cpp
+@@ -1268,7 +1268,7 @@ bool AdaptiveStream::seek_time(double seek_seconds, bool preceeding, bool& needR
+     {
+       ResetCurrentSegment(newSeg);
+     }
+-    else if (!preceeding)
++    else
+     {
+       // restart stream if it has 'finished', e.g in the case of subtitles
+       // where there may be a few or only one segment for the period and
+@@ -1277,11 +1277,11 @@ bool AdaptiveStream::seek_time(double seek_seconds, bool preceeding, bool& needR
+       {
+         ResetCurrentSegment(newSeg);
+       }
++      // The reader scans the segment from the start, also for a seek time
++      // before the last read
+       absolute_position_ -= segment_read_pos_;
+       segment_read_pos_ = 0;
+     }
+-    else
+-      needReset = false;
+     return true;
+   }
+   else
+diff --git a/src/test/TestDASHTree.cpp b/src/test/TestDASHTree.cpp
+index 7a3c951..fc33621 100644
+--- a/src/test/TestDASHTree.cpp
++++ b/src/test/TestDASHTree.cpp
+@@ -403,6 +403,35 @@ TEST_F(DASHTreeTest, CalculatePsshDefaultKid)
+   EXPECT_EQ(tree->m_periods[0]->GetPSSHSets()[2].defaultKID_.size(), 32);
+ }
+ 
++// A seek to a time in the current segment restarts the segment, also a seek
++// to a time before the last read. A reader cannot seek back by itself.
++TEST_F(DASHTreeAdaptiveStreamTest, SeekInTheCurrentSegmentRestartsTheSegment)
++{
++  OpenTestFile("mpd/segtpl.mpd", "https://foo.bar/mpd/test.mpd");
++  for (const bool preceeding : {true, false})
++  {
++    SCOPED_TRACE(preceeding ? "preceeding" : "not preceeding");
++    SetTestStream(NewStream(tree->m_periods[0]->GetAdaptationSets()[0].get()));
++    testStream->start_stream();
++    // The initialization segment, then a part of the first media segment
++    ASSERT_EQ(testStream->read(buf, 16), 16U);
++    ASSERT_EQ(testStream->read(buf, 4), 4U);
++    const uint64_t segmentStart{testStream->tell() - 4};
++    const PLAYLIST::CRepresentation* rep{testStream->getRepresentation()};
++    const PLAYLIST::CSegment* segment{rep->current_segment_};
++    ASSERT_NE(segment, nullptr);
++    // A video seek that is not preceeding takes the next segment after a segment start
++    const double seconds{static_cast<double>(segment->startPTS_) / rep->GetTimescale()};
++    bool needReset{false};
++    ASSERT_TRUE(testStream->seek_time(seconds, preceeding, needReset));
++    EXPECT_TRUE(needReset);
++    EXPECT_EQ(rep->current_segment_, segment);
++    EXPECT_EQ(testStream->tell(), segmentStart);
++    ASSERT_EQ(testStream->read(buf, 4), 4U);
++    EXPECT_EQ(std::string(reinterpret_cast<char*>(buf), 4), "Sixt");
++  }
++}
++
+ TEST_F(DASHTreeAdaptiveStreamTest, subtitles)
+ {
+   OpenTestFile("mpd/subtitles.mpd", "https://foo.bar/subtitles.mpd");
+-- 
+2.47.3
+
