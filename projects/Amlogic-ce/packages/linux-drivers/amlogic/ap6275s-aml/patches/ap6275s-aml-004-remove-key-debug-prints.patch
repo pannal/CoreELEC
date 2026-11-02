@@ -1,0 +1,55 @@
+Subject: [PATCH] wifi: Keep key material out of driver debug logs
+
+Preserve GTK transfer, roaming and private rekey handling while removing
+KCK, KEK and replay-counter dumps reintroduced by the donor update.
+Remove the always-true country delimiter pointer check without suppressing
+compiler address diagnostics.
+
+--- a/bcmdhd.101.10.591.x/wl_cfg80211.c
++++ b/bcmdhd.101.10.591.x/wl_cfg80211.c
+@@ -23617,7 +23617,6 @@
+ 		bzero(key, FBT_KEYLEN);
+ 		WL_ERR(("Failed to copy KCK and KEK \n"));
+ 	}
+-	prhex("KCK, KEK", (uchar *)key, FBT_KEYLEN);
+ end:
+ 	return bytes_written;
+ }
+@@ -24447,9 +24446,6 @@
+ 	}
+ 
+ exit:
+-	prhex("kck", (const u8 *) (data->kck), RSN_KCK_LENGTH);
+-	prhex("kek", (const u8 *) (data->kek), RSN_KEK_LENGTH);
+-	prhex("replay_ctr", (const u8 *) (data->replay_ctr), RSN_REPLAY_LEN);
+ 	WL_DBG(("Exit\n"));
+ 	return err;
+ }
+--- a/bcmdhd.101.10.591.x/wl_android_ext.c
++++ b/bcmdhd.101.10.591.x/wl_android_ext.c
+@@ -2293,11 +2293,6 @@
+ 	}
+ 
+ exit:
+-	if (data && android_msg_level & ANDROID_INFO_LEVEL) {
+-		prhex("kck", (uchar *)keyinfo.KCK, RSN_KCK_LENGTH);
+-		prhex("kek", (uchar *)keyinfo.KEK, RSN_KEK_LENGTH);
+-		prhex("replay_ctr", (uchar *)keyinfo.ReplayCounter, RSN_REPLAY_LEN);
+-	}
+     return err;
+ }
+ #endif /* USE_IW */
+--- a/bcmdhd.101.10.591.x/wl_android.c
++++ b/bcmdhd.101.10.591.x/wl_android.c
+@@ -8042,9 +8042,8 @@
+ #if defined(DHD_BLOB_EXISTENCE_CHECK)
+ 		dhd_pub_t *dhdp = wl_cfg80211_get_dhdp(net);
+ #endif /* DHD_BLOB_EXISTENCE_CHECK */
+-		if ((rev_info_delim) &&
+-			(strnicmp(rev_info_delim, CMD_COUNTRY_DELIMITER,
+-			strlen(CMD_COUNTRY_DELIMITER)) == 0)) {
++		if (strnicmp(rev_info_delim, CMD_COUNTRY_DELIMITER,
++			strlen(CMD_COUNTRY_DELIMITER)) == 0) {
+ 			revinfo  = bcm_atoi(rev_info_delim + 1);
+ 		} else {
+ 			revinfo = 0;

@@ -1,0 +1,70 @@
+Subject: [PATCH] wifi: Preserve CE SDIO build identity and target defines
+
+Build a real dhd_sdio composite with a distinct bus object. Retain the
+Linux target defines required by CE's aarch64-none-elf compiler and keep
+implicit-declaration diagnostics effective instead of disabling errors.
+
+--- a/bcmdhd.101.10.591.x/Makefile
++++ b/bcmdhd.101.10.591.x/Makefile
+@@ -99,7 +99,7 @@
+ 	KERNEL_SRC ?= $(KDIR)
+ 	LINUXDIR := $(KERNEL_SRC)
+ ifeq ($(CONFIG_BCMDHD_SDIO),y)
+-	MODULE_NAME := dhd
++	MODULE_NAME := dhd_sdio
+ else
+ ifeq ($(CONFIG_BCMDHD_USB),y)
+ 	MODULE_NAME := bcmdhd
+@@ -131,7 +131,7 @@
+ 
+ DHDCFLAGS = -Wall -Wstrict-prototypes -Wno-date-time
+ DHDCFLAGS += -Wmaybe-uninitialized
+-DHDCFLAGS += -Dlinux -DLINUX -DBCMDRIVER
++DHDCFLAGS += -D__linux=1 -D__linux__=1 -D__gnu_linux__=1 -Dlinux -DLINUX -DBCMDRIVER
+ DHDCFLAGS += -DUSE_NEW_RSPEC_DEFS -DBCMUTILS_ERR_CODES
+ DHDCFLAGS += -DBCMDONGLEHOST -DBCMFILEIMAGE -DDHD_DEBUG
+ DHDCFLAGS += -DDHDTHREAD -DSHOW_EVENTS -DWIFI_ACT_FRAME
+@@ -141,7 +141,7 @@
+ ifeq ($(CONFIG_BCMDHD_COMMON),y)
+ # Open/Stop
+ 	DHDCFLAGS += -DENABLE_INSMOD_NO_FW_LOAD
+-	DHDCFLAGS += -DPOWERUP_MAX_RETRY=1 -DWIFI_TURNOFF_DELAY=10
++	DHDCFLAGS += -DPOWERUP_MAX_RETRY=3 -DWIFI_TURNOFF_DELAY=10
+ 	DHDCFLAGS += -DIFACE_HANG_FORCE_DEV_CLOSE
+ # TPUT Enhancement
+ 	DHDCFLAGS += -DDHDTCPACK_SUPPRESS
+@@ -264,7 +264,7 @@
+ 	DHDCFLAGS += -DSDIO_ISR_THREAD
+ endif
+ 	DHDOFILES += bcmsdh.o bcmsdh_linux.o bcmsdh_sdmmc.o bcmsdh_sdmmc_linux.o
+-	DHDOFILES += dhd_sdio.o dhd_cdc.o dhd_wlfc.o
++	DHDOFILES += dhd_sdio_bus.o dhd_cdc.o dhd_wlfc.o
+ endif
+ 
+ # PCIe bus
+@@ -690,7 +690,7 @@
+ 
+ # Amlogic
+ ifeq ($(CONFIG_BCMDHD_AMLOGIC),y)
+-	DHDCFLAGS += -Wno-error -Wno-format-security
++	DHDCFLAGS += -Wno-format-security
+ 	DHDCFLAGS += -Wno-implicit-fallthrough -Wno-strict-prototypes
+ ifdef CONFIG_CC_IS_CLANG
+ 	DHDCFLAGS += -Wno-unknown-warning-option -Wno-sometimes-uninitialized
+@@ -710,8 +710,6 @@
+ 	DHDCFLAGS := $(filter-out -DWL_STATIC_IF,$(DHDCFLAGS))
+ endif
+ 
+-# disable gcc 12 compile error
+-DHDCFLAGS += -Wno-address
+ 
+ ARCH ?= arm64
+ M ?= $(CURDIR)
+@@ -745,6 +743,7 @@
+ bcmdhd_sdio:
+ 	$(warning "building SDIO bcmdhd on kernel $(KERNEL_VER) .....")
+ 	$(MAKE) -C $(LINUXDIR) M=$(M) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) modules CONFIG_BCMDHD=m CONFIG_BCMDHD_SDIO=y
++	$(CROSS_COMPILE)strip --strip-unneeded ${OUT_DIR}/$(M)/$(MODULE_NAME).ko
+ 
+ bcmdhd_usb:
+ 	$(warning "building USB bcmdhd on kernel $(KERNEL_VER) .....")

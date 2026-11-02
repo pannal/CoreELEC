@@ -1,0 +1,106 @@
+Subject: [PATCH] wifi: Register core events on legacy firmware
+
+Use the fixed event_msgs mask only when event_msgs_ext reports unsupported
+or a version mismatch. Preserve existing bits and program the same core
+events, with bounded I/O lengths and normal error propagation. Extended
+events remain available on firmware that supports the newer command.
+
+--- a/bcmdhd.101.10.591.x/dhd_linux.c
++++ b/bcmdhd.101.10.591.x/dhd_linux.c
+@@ -11722,6 +11722,51 @@
+ }
+ #endif /* DHD_PREINIT_OPTIMISATION */
+ 
++/* Older AM6B+ firmware may expose only the fixed 128-bit event_msgs mask. */
++static int
++dhd_p3i_read_event_mask(dhd_pub_t *dhd, eventmsgs_ext_t *message, int msglen,
++	char *buffer, int buflen, bool *legacy)
++{
++	int ret;
++
++	*legacy = FALSE;
++	if (msglen != EVENTMSGS_EXT_STRUCT_SIZE + WL_EVENTING_MASK_EXT_LEN ||
++		buflen < msglen || WL_EVENTING_MASK_LEN > WL_EVENTING_MASK_EXT_LEN)
++		return BCME_BADLEN;
++
++	memset(buffer, 0, buflen);
++	ret = dhd_iovar(dhd, 0, "event_msgs_ext", (char *)message, msglen,
++		buffer, buflen, FALSE);
++	if (ret == BCME_OK) {
++		memcpy(message, buffer, msglen);
++		return ret;
++	}
++	if (ret != BCME_UNSUPPORTED && ret != BCME_VERSION)
++		return ret;
++
++	*legacy = TRUE;
++	memset(message->mask, 0, WL_EVENTING_MASK_EXT_LEN);
++	return dhd_iovar(dhd, 0, "event_msgs", NULL, 0, (char *)message->mask,
++		WL_EVENTING_MASK_LEN, FALSE);
++}
++
++static int
++dhd_p3i_write_event_mask(dhd_pub_t *dhd, eventmsgs_ext_t *message, int msglen,
++	bool legacy)
++{
++	if (msglen != EVENTMSGS_EXT_STRUCT_SIZE + WL_EVENTING_MASK_EXT_LEN)
++		return BCME_BADLEN;
++	if (legacy)
++		return dhd_iovar(dhd, 0, "event_msgs", (char *)message->mask,
++			WL_EVENTING_MASK_LEN, NULL, 0, TRUE);
++
++	message->ver = EVENTMSGS_VER;
++	message->command = EVENTMSGS_SET_MASK;
++	message->len = WL_EVENTING_MASK_EXT_LEN;
++	return dhd_iovar(dhd, 0, "event_msgs_ext", (char *)message, msglen,
++		NULL, 0, TRUE);
++}
++
+ static int
+ dhd_legacy_preinit_ioctls(dhd_pub_t *dhd)
+ {
+@@ -11732,6 +11777,7 @@
+ 	uint32 buf_key_b4_m4 = 1;
+ 	uint8 msglen;
+ 	eventmsgs_ext_t *eventmask_msg = NULL;
++	bool legacy_events = FALSE;
+ 	uint32 event_log_max_sets = 0;
+ 	char* iov_buf = NULL;
+ 	/* XXX: Use ret2 for return check of IOVARS that might return BCME_UNSUPPORTED,
+@@ -12862,12 +12908,10 @@
+ 	eventmask_msg->len = ROUNDUP(WLC_E_LAST, NBBY)/NBBY;
+ 
+ 	/* Read event_msgs_ext mask */
+-	ret2 = dhd_iovar(dhd, 0, "event_msgs_ext", (char *)eventmask_msg, msglen, iov_buf,
+-			WLC_IOCTL_SMLEN, FALSE);
+-
+-	/* event_msgs_ext must be supported */
++	ret2 = dhd_p3i_read_event_mask(dhd, eventmask_msg, msglen, iov_buf,
++		WLC_IOCTL_SMLEN, &legacy_events);
++
+ 	if (ret2 == BCME_OK) {
+-		bcopy(iov_buf, eventmask_msg, msglen);
+ 		/* make up event mask ext message iovar for event larger than 128 */
+ 		mask = eventmask_msg->mask;
+ 
+@@ -13013,19 +13057,11 @@
+ 
+ 		setbit(mask, WLC_E_FIFO_CREDIT_MAP);
+ 		/* Write updated Event mask */
+-		eventmask_msg->ver = EVENTMSGS_VER;
+-		eventmask_msg->command = EVENTMSGS_SET_MASK;
+-		eventmask_msg->len = WL_EVENTING_MASK_EXT_LEN;
+-		ret = dhd_iovar(dhd, 0, "event_msgs_ext", (char *)eventmask_msg, msglen, NULL, 0,
+-				TRUE);
++		ret = dhd_p3i_write_event_mask(dhd, eventmask_msg, msglen, legacy_events);
+ 		if (ret < 0) {
+ 			DHD_ERROR(("%s write event mask ext failed %d\n", __FUNCTION__, ret));
+ 			goto done;
+ 		}
+-	} else if (ret2 == BCME_UNSUPPORTED || ret2 == BCME_VERSION) {
+-		/* Skip for BCME_UNSUPPORTED or BCME_VERSION */
+-		DHD_ERROR(("%s event_msgs_ext not support or version mismatch %d\n",
+-			__FUNCTION__, ret2));
+ 	} else {
+ 		DHD_ERROR(("%s read event mask ext failed %d\n", __FUNCTION__, ret2));
+ 		ret = ret2;

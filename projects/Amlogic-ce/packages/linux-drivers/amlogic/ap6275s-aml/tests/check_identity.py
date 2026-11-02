@@ -30,7 +30,8 @@ def kbuild_name(source, kernel, temporary):
     )
     subprocess.run(['make', '--no-print-directory', '-f', str(harness), 'inspect',
                     'CONFIG_BCMDHD_SDIO=y', 'CONFIG_CFG80211=y',
-                    'CONFIG_WIRELESS_EXT=y', 'src=' + str(source)], check=True)
+                    'CONFIG_WIRELESS_EXT=y', 'src=' + str(source),
+                    'KERNEL_SRC=' + str(kernel)], check=True)
     name = (temporary / 'module').read_text().strip()
     objects = (temporary / 'objects').read_text().split()
     components = (temporary / 'components').read_text().split()
@@ -140,10 +141,12 @@ def dispatch(source, rules):
     table = (source / 'bcmsdh_sdmmc_linux.c').read_text()
     table = table.split('static const struct sdio_device_id bcmsdh_sdmmc_ids[] = {', 1)[1].split('};', 1)[0]
     names = re.findall(r'SDIO_DEVICE\(SDIO_VENDOR_ID_BROADCOM, (\w+)\)', table)
-    header = (source / 'include/bcmdevs.h').read_text()
+    header = '\n'.join(path.read_text() for path in
+                       sorted((source / 'include').glob('bcmdevs*.h')))
     identifiers = {int(re.search(r'^#define\s+' + name + r'\s+(0x[0-9a-fA-F]+)',
                                 header, re.M)[1], 16) for name in names}
-    assert len(identifiers) == 10
+    assert identifiers == {0x4354, 0x4362, 0xaae7, 0xaae8, 0xa804,
+                           0xa806, 0x4495, 0x4496, 0x4497, 0xa9bf}
     # Retain legacy autoload for these IDs until hardware acceptance.
     legacy = {0x4354, 0xa9bf}
     assert legacy <= identifiers
@@ -187,7 +190,7 @@ def main():
     parser.add_argument('--metadata-command', type=Path)
     parser.add_argument('--compiler', type=Path)
     arguments = parser.parse_args()
-    source = arguments.source / 'bcmdhd.100.10.545.x'
+    source = arguments.source / 'bcmdhd.101.10.591.x'
     with tempfile.TemporaryDirectory(prefix='dhd-identity-') as temporary:
         temporary = Path(temporary)
         name = kbuild_name(source, arguments.kernel, temporary)

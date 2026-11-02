@@ -14,14 +14,16 @@ from check_source import function, run_c
 
 def readiness(linux):
     opening = function(linux, 'dhd_open')
-    start = opening.index('\tif (!dhd_download_fw_on_driverload) {')
-    end = opening.index('\n\tprintf("%s: Enter %s', start)
+    start = opening.index('\n\tif (!dhd_download_fw_on_driverload) {')
+    end = opening.index('\n\tWL_MSG(net->name, "Enter', start)
     guard = opening[start:end]
     assert end < opening.index('\tDHD_MUTEX_LOCK();')
     declarations = '\n'.join(re.findall(
         r'^\t(?:int retry = POWERUP_MAX_RETRY|unsigned long init_deadline);$', opening, re.M))
     assert 'retry = POWERUP_MAX_RETRY' in declarations
-    publisher = function(linux, 'dhd_module_init')
+    wrapper = function(linux, 'dhd_module_init')
+    assert 'err = _dhd_module_init();' in wrapper
+    publisher = function(linux, '_dhd_module_init')
     assert publisher.count('WRITE_ONCE(dhd_driver_init_done, TRUE);') == 1
     assert publisher.index('WRITE_ONCE(dhd_driver_init_done, TRUE);') > publisher.index(
         'dhd_create_to_notifier_skt();')
@@ -89,9 +91,10 @@ def ownership(sdio):
     for pm in (False, True):
         run_c('bound SDIO module ownership with PM ' + ('on' if pm else 'off'), r'''
 #include <assert.h>
+#define ADAPTER_IDX_STR ""
 #define KERNEL_VERSION(a,b,c) (((a) << 16) | ((b) << 8) | (c))
 #define LINUX_VERSION_CODE KERNEL_VERSION(4,9,269)
-''' + ('#define CONFIG_PM 1\n' if pm else '') + r'''
+''' + ('#define CONFIG_PM 1\n#define CONFIG_PM_SLEEP 1\n' if pm else '') + r'''
 static int owner, callback;
 #ifdef CONFIG_PM
 static int bcmsdh_sdmmc_pm_ops;
@@ -128,7 +131,7 @@ int main(void) {
 
 
 def main():
-    source = Path(sys.argv[1]) / 'bcmdhd.100.10.545.x'
+    source = Path(sys.argv[1]) / 'bcmdhd.101.10.591.x'
     readiness((source / 'dhd_linux.c').read_text())
     ownership((source / 'bcmsdh_sdmmc_linux.c').read_text())
 
