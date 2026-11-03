@@ -9,7 +9,7 @@ PKG_VERSION="1.26.1"
 PKG_SHA256="4a71608c0ef7df2931176989e6d32b445c0bdc1030a2376d929c8ca6e550ec4e"
 PKG_LICENSE="GPL"
 PKG_SITE="http://linuxtv.org/"
-PKG_URL="http://linuxtv.org/downloads/v4l-utils/${PKG_NAME}-${PKG_VERSION}.tar.xz"
+PKG_URL="https://archive.ubuntu.com/ubuntu/pool/main/v/v4l-utils/${PKG_NAME}_${PKG_VERSION}.orig.tar.xz"
 PKG_DEPENDS_TARGET="toolchain alsa-lib elfutils ir-bpf-decoders libbpf systemd zlib"
 PKG_LONGDESC="Linux V4L2 and DVB API utilities and v4l libraries (libv4l)."
 PKG_MESON_OPTS_TARGET="-Ddefault_library=static \
