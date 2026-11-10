@@ -3,7 +3,7 @@ From: pannal <1359593+pannal@users.noreply.github.com>
 Date: Fri, 15 May 2026 02:11:12 +0200
 Subject: [PATCH] [ClearKey] Backport CBCS support for HLS+ClearKey playback
 
-Rebased onto upstream 21.5.25-Omega (ddc857b58094ea8542416b792a9abe6176320065).
+Rebased onto upstream 21.5.26-Omega (23408503aa0330e5b731977f451bbacf32992e4f).
 The three ClearKey source preimages are unchanged from 21.5.18.
 
 Ports upstream master commit 37e01a06 ([ClearKey] Implemented CBCS support)
@@ -25,30 +25,30 @@ p3i-only; will not be sent upstream (Omega is in maintenance, the fix is
 already on master 22.x).
 ---
 diff --git a/inputstream.adaptive/addon.xml.in b/inputstream.adaptive/addon.xml.in
-index 6260418..0ec1337 100644
+index fc249f1..f268def 100644
 --- a/inputstream.adaptive/addon.xml.in
 +++ b/inputstream.adaptive/addon.xml.in
 @@ -1,7 +1,7 @@
  <?xml version="1.0" encoding="UTF-8"?>
  <addon
    id="inputstream.adaptive"
--  version="21.5.25"
-+  version="21.5.25-p3i.1"
+-  version="21.5.26"
++  version="21.5.26-p3i.1"
    name="InputStream Adaptive"
    provider-name="peak3d, Team Kodi">
    <requires>@ADDON_DEPENDS@</requires>
 diff --git a/inputstream.adaptive/changelog.txt b/inputstream.adaptive/changelog.txt
-index 7ab9764..8a92787 100644
+index 236ee15..adb4b1f 100644
 --- a/inputstream.adaptive/changelog.txt
 +++ b/inputstream.adaptive/changelog.txt
 @@ -1,3 +1,7 @@
-+v21.5.25-p3i.1 (2026-10-10)
-+- Update to upstream Omega 21.5.25
-+- Retain the p3i ClearKey CBCS backport for HLS SAMPLE-AES playback
++v21.5.26-p3i.1
++- Update to upstream Omega 21.5.26
++- Retain p3i ClearKey CBCS and playback fixes
 +
- v21.5.25 (2026-09-26)
- [Widevine] Removed ARM64 CDM workaround, official WV library is now available
- 
+ v21.5.26 (2026-11-01)
+ - Fix TTML subtitles problem caused by wrong parsing of cue timing
+ - [Dash] Ignore unsupported trick-mode streams
 diff --git a/src/decrypters/clearkey/ClearKeyCencSingleSampleDecrypter.cpp b/src/decrypters/clearkey/ClearKeyCencSingleSampleDecrypter.cpp
 index bb31e8d..612c67a 100644
 --- a/src/decrypters/clearkey/ClearKeyCencSingleSampleDecrypter.cpp

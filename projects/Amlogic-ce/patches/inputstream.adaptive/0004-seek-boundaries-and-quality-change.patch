@@ -1119,7 +1119,7 @@ index ace59ce..09d2a28 100644
                pts -= pto;
            }
 diff --git a/src/test/TestDASHTree.cpp b/src/test/TestDASHTree.cpp
-index 7ced85d..96a1b6b 100644
+index c7e5499..c7520b8 100644
 --- a/src/test/TestDASHTree.cpp
 +++ b/src/test/TestDASHTree.cpp
 @@ -403,6 +403,35 @@ TEST_F(DASHTreeTest, CalculatePsshDefaultKid)
@@ -1158,7 +1158,7 @@ index 7ced85d..96a1b6b 100644
  TEST_F(DASHTreeAdaptiveStreamTest, subtitles)
  {
    OpenTestFile("mpd/subtitles.mpd", "https://foo.bar/subtitles.mpd");
-@@ -756,54 +785,347 @@ TEST_F(DASHTreeTest, TSBAvailabilityStartTime)
+@@ -768,54 +797,347 @@ TEST_F(DASHTreeTest, SkipTrickModeAdaptationSet)
  
  TEST_F(DASHTreeTest, LastSegmentOfEachPeriod)
  {
