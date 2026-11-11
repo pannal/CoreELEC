@@ -5,18 +5,16 @@ Subject: [PATCH] platform.py: Set correct machine value when kernel is aarch64
  but userspace is aarch32.
 
 ---
- Lib/platform.py | 4 ++++
- 1 file changed, 4 insertions(+)
+ Lib/platform.py | 3 +++
+ 1 file changed, 3 insertions(+)
 
 diff --git a/Lib/platform.py b/Lib/platform.py
-index 994d892c5e..b8150a6070 100755
 --- a/Lib/platform.py
 +++ b/Lib/platform.py
-@@ -875,6 +875,10 @@ def uname():
-         system = 'Windows'
-         release = 'Vista'
+@@ -1056,6 +1056,9 @@
+     if sys.platform == 'ios':
+         system, release, _, _ = ios_ver()
  
-+
 +    if machine == 'aarch64' and sys.maxsize <= 2**32:
 +        machine = 'armv7l'
 +
