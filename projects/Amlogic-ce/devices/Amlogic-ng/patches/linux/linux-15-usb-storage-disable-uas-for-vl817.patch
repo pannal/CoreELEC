@@ -1,0 +1,28 @@
+usb-storage: Disable UAS for the VIA VL817 SATA bridge
+
+Backport upstream commits 5b67b315037250a61861119683e7fcb509deea25
+and 609865ab3d5d803556f628e221ecd3d06aed9f30 together. The bridge can
+stall and reset during writes with UAS. Match USB ID 2109:0715 for
+the full upstream firmware revision range.
+
+Put the quirk in unusual_uas.h so the 4.9 UAS driver sees it during
+both the boot eligibility check and normal probing. usb-storage
+can then bind the bridge using its standard Bulk-Only match.
+
+diff --git a/drivers/usb/storage/unusual_uas.h b/drivers/usb/storage/unusual_uas.h
+--- a/drivers/usb/storage/unusual_uas.h
++++ b/drivers/usb/storage/unusual_uas.h
+@@ -184,6 +184,13 @@
+ 		USB_SC_DEVICE, USB_PR_DEVICE, NULL,
+ 		US_FL_NO_ATA_1X),
+ 
++/* The VL817 can stall and reset under UAS. */
++UNUSUAL_DEV(0x2109, 0x0715, 0x0000, 0x9999,
++		"VIA Labs, Inc.",
++		"VL817 SATA Bridge",
++		USB_SC_DEVICE, USB_PR_DEVICE, NULL,
++		US_FL_IGNORE_UAS),
++
+ /* Reported-by: Icenowy Zheng <icenowy@aosc.io> */
+ UNUSUAL_DEV(0x2537, 0x1068, 0x0000, 0x9999,
+ 		"Norelsys",
