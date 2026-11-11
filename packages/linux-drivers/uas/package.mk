@@ -35,20 +35,8 @@ makeinstall_target() {
   mkdir -p ${INSTALL}/$(get_full_module_dir)/${PKG_NAME}
     cp ${PKG_BUILD}/uas.ko ${INSTALL}/$(get_full_module_dir)/${PKG_NAME}/
 
-  # Prevent udev from autoloading uas.ko when a UAS-capable device is
-  # plugged in. Explicit `modprobe uas` still works (blacklist only
-  # affects modalias-driven autoload). With CONFIG_USB_UAS unset in the
-  # kernel, usb-storage handles UAS-capable devices in BOT mode safely
-  # until the user opts in.
+  # Keep the built-in usb-storage driver as the default for UAS-capable devices.
+  # Blacklisting blocks modalias autoload and permits explicit modprobe.
   mkdir -p ${INSTALL}/usr/lib/modprobe.d
     echo "blacklist uas" > ${INSTALL}/usr/lib/modprobe.d/uas.conf
-
-  # Boot-time apply and hot-plug helpers.
-  mkdir -p ${INSTALL}/usr/lib/libreelec
-    cp ${PKG_DIR}/scripts/uas-rebind ${INSTALL}/usr/lib/libreelec/
-    cp ${PKG_DIR}/scripts/uas-boot   ${INSTALL}/usr/lib/libreelec/
-}
-
-post_install() {
-  enable_service uas-boot.service
 }
