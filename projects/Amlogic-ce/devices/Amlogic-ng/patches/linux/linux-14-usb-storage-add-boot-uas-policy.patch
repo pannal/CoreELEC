@@ -1,0 +1,282 @@
+USB: make built-in UAS an early-boot opt-in
+
+Keep BOT available until initramfs has mounted and protected the system
+disks. Once enabled, built-in UAS probes before usb-storage, which can
+bind if UAS declines the interface or fails to start.
+
+Expose UAS eligibility on BOT interfaces so initramfs can re-probe
+eligible, exclusively claimed disks before systemd starts automount.
+Preserve the existing bridge quirks from the out-of-tree package.
+
+diff --git a/drivers/usb/storage/uas.c b/drivers/usb/storage/uas.c
+--- a/drivers/usb/storage/uas.c
++++ b/drivers/usb/storage/uas.c
+@@ -934,6 +934,89 @@
+ 
+ #undef UNUSUAL_DEV
+ 
++#if IS_BUILTIN(CONFIG_USB_UAS)
++enum p3i_uas_state {
++	P3I_UAS_PENDING,
++	P3I_UAS_OFF,
++	P3I_UAS_ON,
++};
++
++static int p3i_uas_state;
++static DEFINE_MUTEX(p3i_policy_lock);
++/* Comma-separated USB port names and lowercase VID:PID pairs. */
++static char p3i_exclusions[4096];
++
++static ssize_t p3i_policy_show(struct device_driver *driver, char *buf)
++{
++	static const char * const states[] = { "pending", "off", "on" };
++
++	return sprintf(buf, "%s\n", states[smp_load_acquire(&p3i_uas_state)]);
++}
++
++static ssize_t p3i_policy_store(struct device_driver *driver, const char *buf,
++				size_t count)
++{
++	ssize_t ret = count;
++	size_t len;
++
++	mutex_lock(&p3i_policy_lock);
++	if (p3i_uas_state != P3I_UAS_PENDING) {
++		ret = -EBUSY;
++	} else if (sysfs_streq(buf, "off")) {
++		smp_store_release(&p3i_uas_state, P3I_UAS_OFF);
++	} else if (!strncmp(buf, "on ", 3)) {
++		len = strcspn(buf + 3, "\n");
++		if (len >= sizeof(p3i_exclusions)) {
++			ret = -E2BIG;
++		} else {
++			memcpy(p3i_exclusions, buf + 3, len);
++			p3i_exclusions[len] = '\0';
++			smp_store_release(&p3i_uas_state, P3I_UAS_ON);
++		}
++	} else {
++		ret = -EINVAL;
++	}
++	mutex_unlock(&p3i_policy_lock);
++	return ret;
++}
++static DRIVER_ATTR_RW(p3i_policy);
++
++static bool p3i_uas_allowed(struct usb_interface *intf)
++{
++	struct usb_device *udev = interface_to_usbdev(intf);
++	const char *port = dev_name(&udev->dev);
++	const char *entry = p3i_exclusions;
++	char id[10];
++	size_t len;
++
++	if (smp_load_acquire(&p3i_uas_state) != P3I_UAS_ON)
++		return true;
++
++	snprintf(id, sizeof(id), "%04x:%04x",
++		 le16_to_cpu(udev->descriptor.idVendor),
++		 le16_to_cpu(udev->descriptor.idProduct));
++
++	while (*entry) {
++		len = strcspn(entry, ",");
++		if ((len == strlen(port) && !strncmp(entry, port, len)) ||
++		    (len == sizeof(id) - 1 && !strncmp(entry, id, len)))
++			return false;
++		entry += len;
++		if (*entry)
++			entry++;
++	}
++	return true;
++}
++
++bool p3i_uas_eligible(struct usb_interface *intf)
++{
++	const struct usb_device_id *id = usb_match_id(intf, uas_usb_ids);
++
++	return id && p3i_uas_allowed(intf) &&
++		uas_use_uas_driver(intf, id, NULL);
++}
++#endif
++
+ static int uas_switch_interface(struct usb_device *udev,
+ 				struct usb_interface *intf)
+ {
+@@ -998,6 +1081,12 @@
+ 	struct uas_dev_info *devinfo;
+ 	struct usb_device *udev = interface_to_usbdev(intf);
+ 	unsigned long dev_flags;
++
++#if IS_BUILTIN(CONFIG_USB_UAS)
++	if (smp_load_acquire(&p3i_uas_state) != P3I_UAS_ON ||
++	    !p3i_uas_allowed(intf))
++		return -ENODEV;
++#endif
+ 
+ 	if (!uas_use_uas_driver(intf, id, &dev_flags))
+ 		return -ENODEV;
+@@ -1273,11 +1362,22 @@
+ 		return -ENOMEM;
+ 	}
+ 
++#if IS_BUILTIN(CONFIG_USB_UAS)
++	rv = driver_create_file(&uas_driver.drvwrap.driver, &driver_attr_p3i_policy);
++	if (rv) {
++		usb_deregister(&uas_driver);
++		destroy_workqueue(workqueue);
++		return rv;
++	}
++#endif
+ 	return 0;
+ }
+ 
+ static void __exit uas_exit(void)
+ {
++#if IS_BUILTIN(CONFIG_USB_UAS)
++	driver_remove_file(&uas_driver.drvwrap.driver, &driver_attr_p3i_policy);
++#endif
+ 	usb_deregister(&uas_driver);
+ 	destroy_workqueue(workqueue);
+ }
+diff --git a/drivers/usb/storage/usb.c b/drivers/usb/storage/usb.c
+--- a/drivers/usb/storage/usb.c
++++ b/drivers/usb/storage/usb.c
+@@ -73,7 +73,7 @@
+ #include "sierra_ms.h"
+ #include "option_ms.h"
+ 
+-#if IS_ENABLED(CONFIG_USB_UAS)
++#if IS_MODULE(CONFIG_USB_UAS)
+ #include "uas-detect.h"
+ #endif
+ 
+@@ -1113,6 +1113,15 @@
+ 
+ static struct scsi_host_template usb_stor_host_template;
+ 
++#if IS_BUILTIN(CONFIG_USB_UAS)
++static ssize_t p3i_uas_eligible_show(struct device *dev,
++				     struct device_attribute *attr, char *buf)
++{
++	return sprintf(buf, "%d\n", p3i_uas_eligible(to_usb_interface(dev)));
++}
++static DEVICE_ATTR_RO(p3i_uas_eligible);
++#endif
++
+ /* The main probe routine for standard devices */
+ static int storage_probe(struct usb_interface *intf,
+ 			 const struct usb_device_id *id)
+@@ -1122,8 +1131,8 @@
+ 	int result;
+ 	int size;
+ 
+-	/* If uas is enabled and this device can do uas then ignore it. */
+-#if IS_ENABLED(CONFIG_USB_UAS)
++	/* Built-in UAS probes first, so BOT can handle a declined probe. */
++#if IS_MODULE(CONFIG_USB_UAS)
+ 	if (uas_use_uas_driver(intf, id, NULL))
+ 		return -ENXIO;
+ #endif
+@@ -1161,13 +1170,25 @@
+ 	/* No special transport or protocol settings in the main module */
+ 
+ 	result = usb_stor_probe2(us);
++#if IS_BUILTIN(CONFIG_USB_UAS)
++	if (!result && device_create_file(&intf->dev, &dev_attr_p3i_uas_eligible))
++		dev_dbg(&intf->dev, "Unable to expose UAS eligibility\n");
++#endif
+ 	return result;
++}
++
++static void storage_disconnect(struct usb_interface *intf)
++{
++#if IS_BUILTIN(CONFIG_USB_UAS)
++	device_remove_file(&intf->dev, &dev_attr_p3i_uas_eligible);
++#endif
++	usb_stor_disconnect(intf);
+ }
+ 
+ static struct usb_driver usb_storage_driver = {
+ 	.name =		DRV_NAME,
+ 	.probe =	storage_probe,
+-	.disconnect =	usb_stor_disconnect,
++	.disconnect =	storage_disconnect,
+ 	.suspend =	usb_stor_suspend,
+ 	.resume =	usb_stor_resume,
+ 	.reset_resume =	usb_stor_reset_resume,
+diff --git a/drivers/usb/storage/usb.h b/drivers/usb/storage/usb.h
+--- a/drivers/usb/storage/usb.h
++++ b/drivers/usb/storage/usb.h
+@@ -184,6 +184,10 @@
+ #define scsi_unlock(host)	spin_unlock_irq(host->host_lock)
+ #define scsi_lock(host)		spin_lock_irq(host->host_lock)
+ 
++#if IS_BUILTIN(CONFIG_USB_UAS)
++extern bool p3i_uas_eligible(struct usb_interface *intf);
++#endif
++
+ /* General routines provided by the usb-storage standard core */
+ #ifdef CONFIG_PM
+ extern int usb_stor_suspend(struct usb_interface *iface, pm_message_t message);
+diff --git a/drivers/usb/storage/Makefile b/drivers/usb/storage/Makefile
+--- a/drivers/usb/storage/Makefile
++++ b/drivers/usb/storage/Makefile
+@@ -7,6 +7,7 @@
+ 
+ ccflags-y := -Idrivers/scsi
+ 
++# Probe built-in UAS before usb-storage, which provides the BOT fallback.
+ obj-$(CONFIG_USB_UAS)		+= uas.o
+ obj-$(CONFIG_USB_STORAGE)	+= usb-storage.o
+ 
+diff --git a/drivers/usb/storage/unusual_devs.h b/drivers/usb/storage/unusual_devs.h
+--- a/drivers/usb/storage/unusual_devs.h
++++ b/drivers/usb/storage/unusual_devs.h
+@@ -2404,8 +2404,8 @@
+ 		"Digital MP3 Audio Player",
+ 		USB_SC_DEVICE, USB_PR_DEVICE, NULL, US_FL_NOT_LOCKABLE ),
+ 
+-/* Unusual uas devices */
+-#if IS_ENABLED(CONFIG_USB_UAS)
++/* Keep the original BOT device table when UAS is built in. */
++#if IS_MODULE(CONFIG_USB_UAS)
+ #include "unusual_uas.h"
+ #endif
+ 
+diff --git a/drivers/usb/storage/unusual_uas.h b/drivers/usb/storage/unusual_uas.h
+--- a/drivers/usb/storage/unusual_uas.h
++++ b/drivers/usb/storage/unusual_uas.h
+@@ -223,3 +223,34 @@
+ 		"External HDD",
+ 		USB_SC_DEVICE, USB_PR_DEVICE, NULL,
+ 		US_FL_ALWAYS_SYNC),
++
++/* p3i quirks for UAS devices backported from Linux v6.6. */
++UNUSUAL_DEV(0x059f, 0x1061, 0x0000, 0x9999,
++		"LaCie",
++		"Rugged USB3-FW",
++		USB_SC_DEVICE, USB_PR_DEVICE, NULL,
++		US_FL_NO_REPORT_OPCODES),
++
++UNUSUAL_DEV(0x090c, 0x2000, 0x0000, 0x9999,
++		"Hiksemi",
++		"External HDD",
++		USB_SC_DEVICE, USB_PR_DEVICE, NULL,
++		US_FL_IGNORE_UAS),
++
++UNUSUAL_DEV(0x0b05, 0x1932, 0x0000, 0x9999,
++		"ASUS",
++		"External HDD",
++		USB_SC_DEVICE, USB_PR_DEVICE, NULL,
++		US_FL_IGNORE_UAS),
++
++UNUSUAL_DEV(0x152d, 0x0583, 0x0000, 0x9999,
++		"JMicron",
++		"JMS583Gen 2",
++		USB_SC_DEVICE, USB_PR_DEVICE, NULL,
++		US_FL_NO_REPORT_OPCODES),
++
++UNUSUAL_DEV(0x17ef, 0x3899, 0x0000, 0x9999,
++		"Thinkplus",
++		"External HDD",
++		USB_SC_DEVICE, USB_PR_DEVICE, NULL,
++		US_FL_IGNORE_UAS),

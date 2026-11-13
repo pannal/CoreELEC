@@ -3335,12 +3335,12 @@ index 0000000..b62e395
 +};
 +} // namespace adaptive
 diff --git a/src/test/TestDASHTree.cpp b/src/test/TestDASHTree.cpp
-index 7a3c951..7ced85d 100644
+index 6d19685..c7e5499 100644
 --- a/src/test/TestDASHTree.cpp
 +++ b/src/test/TestDASHTree.cpp
-@@ -753,3 +753,57 @@ TEST_F(DASHTreeTest, TSBAvailabilityStartTime)
-   EXPECT_EQ(tl.GetFront()->m_number, 129069);
-   EXPECT_EQ(tl.GetBack()->m_number, 130268);
+@@ -765,3 +765,57 @@ TEST_F(DASHTreeTest, SkipTrickModeAdaptationSet)
+   EXPECT_EQ(adpSets[0]->GetRepresentations()[0]->GetId(), "2");
+   EXPECT_EQ(adpSets[1]->GetId(), "3");
  }
 +
 +TEST_F(DASHTreeTest, LastSegmentOfEachPeriod)

@@ -15,6 +15,9 @@ ExecStop=/bin/kill -TERM $MAINPID
 ExecStopPost=-/usr/lib/kodi/kodi-safe-mode
 TimeoutStopSec=30
 Restart=always
+# The launcher returns these codes only after systemd accepts a power action.
+SuccessExitStatus=67 68
+RestartPreventExitStatus=67 68
 RestartSec=2
 StartLimitInterval=0
 LimitNOFILE=16384

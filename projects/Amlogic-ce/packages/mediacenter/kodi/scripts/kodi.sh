@@ -18,6 +18,7 @@
 # JAVA_HOME still comes from the addon; restart Kodi after installing it.
 [ ! -r /usr/lib/coreelec/bdj-runtime.sh ] || . /usr/lib/coreelec/bdj-runtime.sh
 
+KODI_STOPPING=0
 trap cleanup TERM
 
 KODI_ROOT=$HOME/.kodi
@@ -32,6 +33,7 @@ KODI_MAX_RESTARTS=@KODI_MAX_RESTARTS@
 KODI_MAX_SECONDS=@KODI_MAX_SECONDS@
 
 cleanup() {
+  KODI_STOPPING=1
   # make systemd happy by not exiting immediately but
   # wait for kodi to exit
   while killall -0 kodi.bin &>/dev/null; do
@@ -169,8 +171,26 @@ if [ -n "$KODI_AE_SINK" ]; then
   fi
 fi
 
-/usr/lib/kodi/kodi.bin $ENV_ARGS $SAVED_ARGS
+KODI_POWER_ACTION_FALLBACK=1 /usr/lib/kodi/kodi.bin $ENV_ARGS $SAVED_ARGS
 RET=$?
+
+# Match the fallback exit codes in Kodi's ApplicationEnums.h. They mean the
+# power request failed or the watchdog ended Kodi before it could finish.
+case "$RET" in
+  67) power_action=poweroff ;;
+  68) power_action=reboot ;;
+  *) power_action= ;;
+esac
+if [ -n "$power_action" ]; then
+  # An external systemd stop already owns the shutdown.
+  [ "$KODI_STOPPING" = 0 ] || exit 0
+  echo "Kodi requested system $power_action"
+  if systemctl --no-block --no-ask-password --check-inhibitors=yes "$power_action"; then
+    exit "$RET"
+  fi
+  echo "Failed to request system $power_action, restarting Kodi" >&2
+  exit 1
+fi
 
 if [ $(( ($RET >= 131 && $RET <= 136) || $RET == 139 )) = "1" ] ; then
   # Crashed with core dump

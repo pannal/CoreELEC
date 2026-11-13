@@ -3,11 +3,11 @@
 # Copyright (C) 2016-present Team LibreELEC (https://libreelec.tv)
 
 PKG_NAME="ntfs-3g_ntfsprogs"
-PKG_VERSION="2022.10.3"
-PKG_SHA256="f20e36ee68074b845e3629e6bced4706ad053804cbaf062fbae60738f854170c"
+PKG_VERSION="2026.9.28"
+PKG_SHA256="350d9415c59f7c3fa74e23985ad2d56423c6a168337368f672e2e362d8f295c8"
 PKG_LICENSE="GPL"
 PKG_SITE="https://github.com/tuxera/ntfs-3g"
-PKG_URL="https://tuxera.com/opensource/${PKG_NAME}-${PKG_VERSION}.tgz"
+PKG_URL="https://www.tuxera.com/opensource/${PKG_NAME}-${PKG_VERSION}.tgz"
 PKG_DEPENDS_TARGET="toolchain fuse libgcrypt"
 PKG_LONGDESC="A NTFS driver with read and write support."
 PKG_TOOLCHAIN="autotools"
