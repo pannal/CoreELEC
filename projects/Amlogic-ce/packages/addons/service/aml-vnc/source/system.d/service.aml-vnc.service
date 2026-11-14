@@ -5,7 +5,7 @@ Requires=kodi.service
 
 [Service]
 ExecStartPre=/bin/sleep 5
-ExecStart=/storage/.kodi/addons/service.aml-vnc/bin/aml-vnc.start
+ExecStart=/bin/sh /storage/.kodi/addons/service.aml-vnc/bin/aml-vnc.start
 SyslogIdentifier=aml-vnc
 TimeoutStopSec=1
 Restart=always

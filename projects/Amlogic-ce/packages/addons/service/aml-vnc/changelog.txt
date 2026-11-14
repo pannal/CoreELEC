@@ -1,3 +1,6 @@
+666.21.3.8-p3i.1
+- Use linear Kodi GUI scanout while an FBDEV viewer is connected.
+
 21.3.8
 - bump package to 1.4.0
 - change addon icon
