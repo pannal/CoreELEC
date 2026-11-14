@@ -1,0 +1,110 @@
+a2dp: Set aptX encoder frame size in PCM samples
+
+FFmpeg expects the frame size in samples per channel. Using the
+encoded byte count makes the first aptX HD input look like a short
+final frame and causes the next input to be rejected.
+
+Check the encoded payload and RTP header against the output capacity
+before reading PCM, and validate the packet size before writing it.
+--- a/src/modules/bluetooth/a2dp/a2dp_aptx.c
++++ b/src/modules/bluetooth/a2dp/a2dp_aptx.c
+@@ -222,8 +222,7 @@
+ pa_dual_encode(uint32_t timestamp, void *write_buf, size_t write_buf_size, size_t *_encoded, void *read_cb_data,
+                void **codec_data) {
+     struct rtp_header *header;
+-    size_t nbytes;
+-    void *d;
++    size_t nbytes = 0;
+     const void *p;
+     AVFrame *av_frame;
+     AVPacket *pkt;
+@@ -235,22 +234,15 @@
+     pa_assert(aptx_info->av_codec);
+     pa_assert(aptx_info->av_codec_ctx);
+ 
+-    pa_assert_fp(aptx_info->av_codec_ctx->frame_size <= write_buf_size);
++    const size_t rtp_size = aptx_info->is_hd ? sizeof(*header) : 0;
++    const size_t payload_size = aptx_info->aptx_frame_size * aptx_info->nb_samples / 4;
+ 
+-    aptx_info->read_pcm(&p, (size_t) aptx_info->block_size, read_cb_data);
++    *_encoded = 0;
++    if (PA_UNLIKELY(payload_size == 0 || write_buf_size < rtp_size ||
++                    payload_size > write_buf_size - rtp_size))
++        return 0;
+ 
+-    if (aptx_info->is_hd) {
+-        header = write_buf;
+-        memset(write_buf, 0, sizeof(*header));
+-        header->v = 2;
+-        header->pt = 96;
+-        header->sequence_number = htons(aptx_info->seq_num++);
+-        header->timestamp = htonl(timestamp);
+-        header->ssrc = htonl(1);
+-        d = (uint8_t *) write_buf + sizeof(*header);
+-    } else {
+-        d = (uint8_t *) write_buf;
+-    }
++    aptx_info->read_pcm(&p, aptx_info->block_size, read_cb_data);
+ 
+     av_frame = av_frame_alloc_func();
+     av_frame->nb_samples = aptx_info->nb_samples;
+@@ -267,13 +259,11 @@
+         memcpy(av_frame->data[0] + i, (uint8_t *) p + i * 2, sizeof(uint32_t));
+         memcpy(av_frame->data[1] + i, (uint8_t *) p + i * 2 + sizeof(uint32_t), sizeof(uint32_t));
+     }
+-    *_encoded = 0;
+ 
+     ret = avcodec_send_frame_func(aptx_info->av_codec_ctx, av_frame);
+ 
+     if (PA_UNLIKELY(ret < 0)) {
+         fprintf(stderr, "Error sending the frame to the encoder\n");
+-        nbytes = 0;
+         goto done;
+     }
+ 
+@@ -281,15 +271,27 @@
+ 
+     if (PA_UNLIKELY(ret != 0)) {
+         fprintf(stderr, "Error receiving the packet from the encoder\n");
+-        nbytes = 0;
+         goto done;
+     }
+ 
+-    memcpy(d, pkt->data, (size_t) pkt->size);
+-    d = (uint8_t *) d + pkt->size;
++    if (PA_UNLIKELY((size_t) pkt->size != payload_size)) {
++        pa_log_error("Unexpected aptX payload size: %d (expected %zu)", pkt->size, payload_size);
++        goto done;
++    }
++
++    if (aptx_info->is_hd) {
++        header = write_buf;
++        memset(header, 0, sizeof(*header));
++        header->v = 2;
++        header->pt = 96;
++        header->sequence_number = htons(aptx_info->seq_num++);
++        header->timestamp = htonl(timestamp);
++        header->ssrc = htonl(1);
++    }
+ 
+-    nbytes = (uint8_t *) d - (uint8_t *) write_buf;
+-    *_encoded += aptx_info->block_size;
++    memcpy((uint8_t *) write_buf + rtp_size, pkt->data, payload_size);
++    nbytes = rtp_size + payload_size;
++    *_encoded = aptx_info->block_size;
+ 
+ done:
+     av_frame_free_func(&av_frame);
+@@ -388,8 +390,11 @@
+ static void pa_dual_setup_stream(void **codec_data) {
+     aptx_info_t *aptx_info = *codec_data;
+     pa_assert(aptx_info);
++    if (aptx_info->is_a2dp_sink)
++        return;
++
+     aptx_info->nb_samples = (int) (aptx_info->block_size / (4 * 2));
+-    aptx_info->av_codec_ctx->frame_size = (int) (aptx_info->aptx_frame_size * aptx_info->nb_samples / 4);
++    aptx_info->av_codec_ctx->frame_size = aptx_info->nb_samples;
+ };
+ 
+ static void pa_dual_free(void **codec_data) {
