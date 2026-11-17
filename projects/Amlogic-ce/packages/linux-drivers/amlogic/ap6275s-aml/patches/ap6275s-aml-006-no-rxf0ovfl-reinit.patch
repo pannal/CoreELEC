@@ -1,0 +1,27 @@
+Subject: [PATCH] wifi: Do not reinit BCM43752 firmware on RX FIFO overflow
+
+The 101.10.591 driver enables FW_REINIT_RXF0OVFL for BCM43752. Under
+sustained receive load it then sends WLC_INIT about once per second. The
+CE firmware 18.35.387.11 traps after five reinits within 10000 s
+("Frequent re-inits leading to TRAP!"). The driver then raises HANG and
+powers WLAN off, and nothing on CE turns WLAN on again. The box stays
+offline until a power cycle, and playback over the network freezes.
+
+Without the reinit, the receive path keeps running at full rate under
+the same load. Keep the other BCM43752 workarounds.
+
+--- a/bcmdhd.101.10.591.x/dhd_config.c
++++ b/bcmdhd.101.10.591.x/dhd_config.c
+@@ -6187,8 +6187,10 @@
+ 	conf->in4way |= STA_REASSOC_RETRY;
+ #endif
+ 	if (conf->chip == BCM43752_CHIP_ID)
+-		conf->war = SET_CHAN_INCONN | FW_REINIT_INCSA | FW_REINIT_EMPTY_SCAN |
+-			FW_REINIT_RXF0OVFL;
++		/* No FW_REINIT_RXF0OVFL: the CE 18.35.387.11 firmware traps after five
++		 * host reinits within 10000 s, and nothing on CE restarts WLAN after a trap.
++		 */
++		conf->war = SET_CHAN_INCONN | FW_REINIT_INCSA | FW_REINIT_EMPTY_SCAN;
+ 	else if (conf->chip == BCM43711_CHIP_ID || conf->chip == BCM4612_CHIP_ID)
+ 		conf->war = SET_CHAN_INCONN;
+ 	else
