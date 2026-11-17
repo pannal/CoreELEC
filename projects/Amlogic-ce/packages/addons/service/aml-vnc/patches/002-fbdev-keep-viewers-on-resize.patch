@@ -1,0 +1,485 @@
+--- a/backend/fbdev.c
++++ b/backend/fbdev.c
+@@ -3,10 +3,60 @@
+ 
+ #include "fbdev.h"
+ 
+-int fbFd = -1;
+-size_t fbSize = 0;
+-void *fbBufferMap = MAP_FAILED;
+-struct fb_var_screeninfo varInfo;
++static int fbFd = -1;
++static size_t fbSize = 0;
++static void *fbBufferMap = MAP_FAILED;
++static struct fb_var_screeninfo varInfo;
++static unsigned long fbStart;
++
++static int sameLayout(const struct fb_var_screeninfo *a, const struct fb_var_screeninfo *b) {
++	return a->xres == b->xres && a->yres == b->yres &&
++	       a->xres_virtual == b->xres_virtual && a->yres_virtual == b->yres_virtual &&
++	       a->bits_per_pixel == b->bits_per_pixel &&
++	       !memcmp(&a->red, &b->red, sizeof(a->red)) &&
++	       !memcmp(&a->green, &b->green, sizeof(a->green)) &&
++	       !memcmp(&a->blue, &b->blue, sizeof(a->blue));
++}
++
++// The variable and fixed ioctls can briefly be out of step during a resize.
++static int refreshFbdev(void) {
++	struct fb_var_screeninfo before, var;
++	struct fb_fix_screeninfo fix;
++	if (ioctl(fbFd, FBIOGET_VSCREENINFO, &before) < 0 ||
++	    ioctl(fbFd, FBIOGET_FSCREENINFO, &fix) < 0 ||
++	    ioctl(fbFd, FBIOGET_VSCREENINFO, &var) < 0 || !sameLayout(&before, &var))
++		return -1;
++
++	const uint64_t size = (uint64_t)fix.line_length * var.yres_virtual;
++	if (var.bits_per_pixel != BPP || !var.xres || !var.yres ||
++	    var.xres > UINT16_MAX || var.yres > UINT16_MAX ||
++	    (uint64_t)var.xres * var.yres > INT_MAX / sizeof(uint32_t) ||
++	    (uint64_t)var.yoffset + var.yres > var.yres_virtual ||
++	    (uint64_t)var.xoffset + var.xres > var.xres_virtual ||
++	    (uint64_t)var.xres_virtual * sizeof(uint32_t) > fix.line_length ||
++	    fix.line_length % sizeof(uint32_t) || !size || size > fix.smem_len ||
++	    !var.red.length || var.red.length > 8 || var.red.offset > BPP - var.red.length ||
++	    !var.green.length || var.green.length > 8 || var.green.offset > BPP - var.green.length ||
++	    !var.blue.length || var.blue.length > 8 || var.blue.offset > BPP - var.blue.length)
++		return -1;
++
++	if (fbBufferMap == MAP_FAILED || fbSize != size || fbStart != fix.smem_start) {
++		void *mapping = mmap(NULL, (size_t)size, PROT_READ, MAP_SHARED, fbFd, 0);
++		if (mapping == MAP_FAILED)
++			return -1;
++		if (fbBufferMap != MAP_FAILED)
++			munmap(fbBufferMap, fbSize);
++		fbBufferMap = mapping;
++		fbSize = (size_t)size;
++		fbStart = fix.smem_start;
++	}
++	varInfo = var;
++	screenInfo.width = var.xres;
++	screenInfo.height = var.yres;
++	screenInfo.stride = fix.line_length;
++	screenInfo.start = var.yoffset;
++	return 0;
++}
+ 
+ int fbdev_initFrameBuffer(void) {
+ 	LOG("-- Initializing FBDEV framebuffer device --\n");
+@@ -14,81 +64,45 @@
+ 	fbFd = open(FB_DEVICE, O_RDONLY);
+ 	if (fbFd == -1) {
+ 		LOG(" Cannot open FBDEV framebuffer device '%s'.\n", FB_DEVICE);
+-		return -1; // Return to the selector
++		return -1;
+ 	}
+ 
+-	fbdev_updateFrameBufferInfo();
+-
+-	if (varInfo.bits_per_pixel != BPP) {
+-		LOG(" Unsupported BPP value: '%u', only %d bit mode supported.\n", varInfo.bits_per_pixel, BPP);
++	if (refreshFbdev() < 0) {
++		LOG(" Failed to map a supported FBDEV framebuffer.\n");
+ 		exit(EXIT_FAILURE);
+ 	}
+-
+-	fbSize = screenInfo.stride * varInfo.yres_virtual;
+-
+ 	fbdev_updateScreenFormat();
+ 
+-	// Framebuffer debug information
+-	LOG(" Virtual width: %u, virtual height: %u.\n",
+-		varInfo.xres_virtual, varInfo.yres_virtual);
+-	LOG(" X axis offset: %u, Y axis offset: %u.\n",
+-		varInfo.xoffset, varInfo.yoffset);
+-	LOG(" Stride: %u bytes, framebuffer size: %zu bytes.\n",
+-		screenInfo.stride, fbSize);
+-
+-	fbBufferMap = mmap(NULL, fbSize, PROT_READ, MAP_SHARED, fbFd, 0);
+-
+-	if (fbBufferMap == MAP_FAILED) {
+-		LOG(" Failed to map FBDEV framebuffer memory into userspace.\n");
+-		exit(EXIT_FAILURE);
+-	}
+-
++	LOG(" Virtual width: %u, virtual height: %u.\n", varInfo.xres_virtual, varInfo.yres_virtual);
++	LOG(" X axis offset: %u, Y axis offset: %u.\n", varInfo.xoffset, varInfo.yoffset);
++	LOG(" Stride: %u bytes, framebuffer size: %zu bytes.\n", screenInfo.stride, fbSize);
+ 	return 0;
+ }
+ 
+ void fbdev_closeFrameBuffer(void) {
+ 	if (fbBufferMap != MAP_FAILED)
+ 		munmap(fbBufferMap, fbSize);
+-
+ 	if (fbFd != -1)
+ 		close(fbFd);
+-
+-	// Reset all framebuffer values
+ 	fbFd = -1;
+ 	fbSize = 0;
+ 	fbBufferMap = MAP_FAILED;
+ }
+ 
+-void fbdev_updateFrameBufferInfo(void) {
+-	if (ioctl(fbFd, FBIOGET_VSCREENINFO, &varInfo) != 0) {
+-		LOG(" Failed to query framebuffer screen information.\n");
+-		exit(EXIT_FAILURE);
+-	}
+-
+-	screenInfo.width = varInfo.xres;
+-	screenInfo.height = varInfo.yres;
+-	screenInfo.stride = varInfo.xres_virtual * (varInfo.bits_per_pixel / CHAR_BIT);
+-	screenInfo.start = varInfo.yoffset;
+-}
+-
+ int fbdev_checkBufferStateChange(void) {
+-	// In the case of FBDEV, the only hard trigger event is the resolution change
+-	fbdev_updateFrameBufferInfo();
+-	if ((varInfo.xres != screenFormat.width) || (varInfo.yres != screenFormat.height)) {
+-		LOG(" Screen resolution changed from %ux%u to %ux%u.\n",
+-			screenFormat.width, screenFormat.height,
+-			varInfo.xres, varInfo.yres);
+-		return 1;
+-	} else {
+-		return 0;
+-	}
++	if (refreshFbdev() < 0)
++		return -1;
++	return varInfo.xres != screenFormat.width || varInfo.yres != screenFormat.height ||
++	       varInfo.red.offset != screenFormat.redShift || varInfo.red.length != screenFormat.redMax ||
++	       varInfo.green.offset != screenFormat.greenShift || varInfo.green.length != screenFormat.greenMax ||
++	       varInfo.blue.offset != screenFormat.blueShift || varInfo.blue.length != screenFormat.blueMax;
+ }
+ 
+ void fbdev_updateScreenFormat(void) {
+ 	screenFormat.width		= varInfo.xres;
+ 	screenFormat.height		= varInfo.yres;
+ 	screenFormat.bitsPerPixel	= varInfo.bits_per_pixel;
+-	screenFormat.size		= screenFormat.width * screenFormat.height * screenFormat.bitsPerPixel / CHAR_BIT;
++	screenFormat.size		= (size_t)screenFormat.width * screenFormat.height * sizeof(uint32_t);
+ 	screenFormat.redShift		= varInfo.red.offset;
+ 	screenFormat.redMax		= varInfo.red.length;
+ 	screenFormat.greenShift		= varInfo.green.offset;
+@@ -98,5 +112,5 @@
+ }
+ 
+ uint32_t *fbdev_readFrameBuffer(void) {
+-	return (uint32_t *)fbBufferMap;
++	return (uint32_t *)fbBufferMap + varInfo.xoffset;
+ }
+--- a/backend/fbdev.h
++++ b/backend/fbdev.h
+@@ -12,7 +12,6 @@
+ 
+ int fbdev_initFrameBuffer(void);
+ void fbdev_closeFrameBuffer(void);
+-void fbdev_updateFrameBufferInfo(void);
+ int fbdev_checkBufferStateChange(void);
+ void fbdev_updateScreenFormat(void);
+ uint32_t *fbdev_readFrameBuffer(void);
+--- a/server.c
++++ b/server.c
+@@ -7,6 +7,7 @@
+ #include "input.h"
+ #include "updatescreen.h"
+ 
++#include <rfb/rfbregion.h>
+ #include <stddef.h>
+ #include <netinet/tcp.h>
+ #include <sys/socket.h>
+@@ -40,11 +41,15 @@
+ // Keep one local connection open while any FBDEV viewer has finished the RFB
+ // handshake. Kodi replies after swapping a linear GUI frame.
+ static const char kodiGuiSocket[] = "\0kodi.aml-vnc.fb0.v1";
++static const char kodi1080GuiSocket[] = "\0kodi.aml-vnc.fb0.v2";
+ static int kodiGuiFd = -1;
+ static int kodiGuiReady = 0;
++static int kodiGuiRefresh = 0;
++static int kodiGuiResize = 0;
+ static uint64_t kodiGuiRetry = 0;
+ static uint64_t kodiGuiDeadline = 0;
+ static uint64_t kodiGuiReconnectDeadline = 0;
++static uint64_t viewerReconnectDeadline = 0;
+ 
+ static uint64_t monotonicUs(void) {
+ 	struct timespec now;
+@@ -57,15 +62,17 @@
+ 		close(kodiGuiFd);
+ 	kodiGuiFd = -1;
+ 	kodiGuiReady = 0;
++	kodiGuiRefresh = 0;
++	kodiGuiResize = 0;
+ }
+ 
+-static void connectKodiGui(uint64_t now) {
++static int openKodiGui(const char *name, size_t nameLength) {
+ 	struct sockaddr_un address = { .sun_family = AF_UNIX };
+-	memcpy(address.sun_path, kodiGuiSocket, sizeof(kodiGuiSocket));
+-	socklen_t length = offsetof(struct sockaddr_un, sun_path) + sizeof(kodiGuiSocket) - 1;
++	memcpy(address.sun_path, name, nameLength);
++	socklen_t length = offsetof(struct sockaddr_un, sun_path) + nameLength - 1;
+ 	int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+ 	if (fd < 0)
+-		return;
++		return -1;
+ 
+ 	struct ucred credentials;
+ 	socklen_t credentialLength = sizeof(credentials);
+@@ -73,15 +80,22 @@
+ 	    getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credentials, &credentialLength) < 0 ||
+ 	    credentials.uid != geteuid()) {
+ 		close(fd);
+-		return;
++		return -1;
+ 	}
++	return fd;
++}
+ 
+-	kodiGuiFd = fd;
++static void connectKodiGui(uint64_t now) {
++	kodiGuiFd = openKodiGui(kodi1080GuiSocket, sizeof(kodi1080GuiSocket));
++	kodiGuiResize = kodiGuiFd >= 0;
++	if (kodiGuiFd < 0)
++		kodiGuiFd = openKodiGui(kodiGuiSocket, sizeof(kodiGuiSocket));
+ 	kodiGuiDeadline = now + 2000000ULL;
+-	kodiGuiReconnectDeadline = 0;
++	if (kodiGuiFd >= 0)
++		kodiGuiReconnectDeadline = 0;
+ }
+ 
+-enum kodiGuiState { GUI_CAPTURE, GUI_WAIT, GUI_REFRESH };
++enum kodiGuiState { GUI_CAPTURE, GUI_WAIT };
+ 
+ static enum kodiGuiState pollKodiGui(uint64_t now) {
+ 	if (kodiGuiFd < 0 && now >= kodiGuiRetry) {
+@@ -95,15 +109,15 @@
+ 	ssize_t received = recv(kodiGuiFd, &reply, 1, 0);
+ 	if (received == 1 && reply == 'R' && !kodiGuiReady) {
+ 		kodiGuiReady = 1;
+-		return GUI_REFRESH;
++		kodiGuiRefresh = 1;
+ 	} else if (received >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+ 		closeKodiGui();
+ 		kodiGuiReconnectDeadline = now + 2000000ULL;
+ 		return GUI_WAIT;
+ 	}
+-	// Keep trying for a fresh frame, but allow ordinary FBDEV capture if the
+-	// GUI cannot render for an extended period (for example, in standby).
+-	return !kodiGuiReady && now < kodiGuiDeadline ? GUI_WAIT : GUI_CAPTURE;
++	// Keep processing input while Kodi applies the v2 resize. The legacy
++	// connection still allows ordinary FBDEV capture if Kodi cannot render.
++	return !kodiGuiReady && (kodiGuiResize || now < kodiGuiDeadline) ? GUI_WAIT : GUI_CAPTURE;
+ }
+ 
+ static void processFbdevInput(long usec) {
+@@ -127,6 +141,72 @@
+ 	return 0;
+ }
+ 
++static int viewerRequestedFrame(void) {
++	// SetEncodings normally precedes the first update request. Wait for that
++	// request before shrinking a desktop whose initial size was already sent.
++	for (rfbClientPtr client = vncScreen->clientHead; client; client = client->next) {
++		if (client->state == RFB_NORMAL && !client->onHold && !sraRgnEmpty(client->requestedRegion))
++			return 1;
++	}
++	return 0;
++}
++
++static void setServerPixelFormat(void) {
++	vncScreen->serverFormat.redShift = screenFormat.redShift;
++	vncScreen->serverFormat.greenShift = screenFormat.greenShift;
++	vncScreen->serverFormat.blueShift = screenFormat.blueShift;
++	vncScreen->serverFormat.redMax = (1 << screenFormat.redMax) - 1;
++	vncScreen->serverFormat.greenMax = (1 << screenFormat.greenMax) - 1;
++	vncScreen->serverFormat.blueMax = (1 << screenFormat.blueMax) - 1;
++	vncScreen->serverFormat.trueColour = TRUE;
++	vncScreen->serverFormat.bitsPerPixel = screenFormat.bitsPerPixel;
++}
++
++static int resizeFbdevDesktop(uint64_t now) {
++	uint32_t *pixels = calloc((size_t)screenInfo.width * screenInfo.height, sizeof(*pixels));
++	if (!pixels)
++		return -1;
++
++	const int changedSize = screenInfo.width != screenFormat.width || screenInfo.height != screenFormat.height;
++	int disconnected = 0;
++	for (rfbClientPtr client = vncScreen->clientHead, next; client; client = next) {
++		next = client->next;
++		if (client->state == RFB_NORMAL &&
++		    ((changedSize && !client->useNewFBSize) || client->scaledScreen != vncScreen)) {
++			if (!disablePointer && vncScreen->pointerClient == client)
++				releasePointerButtons();
++			rfbCloseClient(client);
++			rfbClientConnectionGone(client);
++			disconnected = 1;
++		}
++	}
++	if (disconnected && !hasFbdevViewer()) {
++		// Keep Kodi at the new size briefly so a legacy viewer can reconnect
++		// without repeating the 4K-to-1080p switch on every connection.
++		viewerReconnectDeadline = now + 10000000ULL;
++	}
++
++	LOG(" Updating the VNC desktop to %ux%u.\n", screenInfo.width, screenInfo.height);
++	fbdev_updateScreenFormat();
++	uint32_t *oldPixels = vncBuffer;
++	vncBuffer = pixels;
++	rfbNewFramebuffer(vncScreen, (char*)pixels, screenFormat.width, screenFormat.height, 8, 3, sizeof(*pixels));
++	// LibVNCServer initializes its default pixel format on a framebuffer change.
++	// Amlogic exposes the actual channel shifts via FBDEV.
++	setServerPixelFormat();
++	for (rfbClientPtr client = vncScreen->clientHead; client; client = client->next) {
++		if (client->state != RFB_NORMAL)
++			client->format = vncScreen->serverFormat;
++		if (!changedSize)
++			client->newFBSizePending = FALSE;
++		vncScreen->setTranslateFunction(client);
++	}
++	free(oldPixels);
++	updateScreenFull();
++	kodiGuiRefresh = 0;
++	return 0;
++}
++
+ void clientDisconnect(rfbClientPtr cl) {
+ 	if (!printVncDebug)
+ 		LOG(" [%d] Client disconnected.\n", (int)(intptr_t)cl->clientData);
+@@ -230,16 +310,7 @@
+ 		vncScreen->passwordCheck = checkPassword;
+ 	}
+ 
+-	vncScreen->serverFormat.redShift = screenFormat.redShift;
+-	vncScreen->serverFormat.greenShift = screenFormat.greenShift;
+-	vncScreen->serverFormat.blueShift = screenFormat.blueShift;
+-
+-	vncScreen->serverFormat.redMax = (( 1 << screenFormat.redMax) -1);
+-	vncScreen->serverFormat.greenMax = (( 1 << screenFormat.greenMax) -1);
+-	vncScreen->serverFormat.blueMax = (( 1 << screenFormat.blueMax) -1);
+-
+-	vncScreen->serverFormat.trueColour = TRUE;
+-	vncScreen->serverFormat.bitsPerPixel = screenFormat.bitsPerPixel;
++	setServerPixelFormat();
+ 
+ 	vncScreen->alwaysShared = TRUE;
+ 
+@@ -278,6 +349,7 @@
+ 		closeKodiGui();
+ 		kodiGuiRetry = 0;
+ 		kodiGuiReconnectDeadline = 0;
++		viewerReconnectDeadline = 0;
+ 		rfbShutdownServer(vncScreen, TRUE);
+ 		free(vncScreen->frameBuffer);
+ 		rfbScreenCleanup(vncScreen);
+@@ -418,19 +490,29 @@
+ 		enum kodiGuiState gui = GUI_CAPTURE;
+ 		int viewer = fbdev && hasFbdevViewer();
+ 		if (viewer) {
+-			gui = pollKodiGui(monotonicUs());
+-		} else if (fbdev) {
++			viewerReconnectDeadline = 0;
++			gui = kodiGuiFd >= 0 || viewerRequestedFrame() ? pollKodiGui(monotonicUs()) : GUI_WAIT;
++		} else if (fbdev && monotonicUs() >= viewerReconnectDeadline) {
+ 			closeKodiGui();
+ 			kodiGuiRetry = 0;
+ 			kodiGuiReconnectDeadline = 0;
+ 		}
+ 
++		if (fbdev && gui == GUI_WAIT)
++			continue;
+ 		// Refresh the FBDEV dimensions and visible page after any swap reply.
+-		if (!checkBufferStateChange()) {
+-			if (fbdev && (!viewer || gui == GUI_WAIT))
++		int changed = checkBufferStateChange();
++		if (fbdev) {
++			if (changed < 0 || (changed && resizeFbdevDesktop(monotonicUs()) < 0))
++				continue;
++			if (!viewer)
+ 				continue;
+-			if (gui == GUI_REFRESH)
++			if (kodiGuiRefresh) {
+ 				updateScreenFull();
++				kodiGuiRefresh = 0;
++			}
++		}
++		if (fbdev || !changed) {
+ 
+ 			if (vncScreen->clientHead != NULL) {
+ 				// Ignore events if they arrive before the next frame expected
+--- a/input.c
++++ b/input.c
+@@ -45,6 +45,8 @@
+ 	}
+ }
+ 
++static uint16_t pointerWidth, pointerHeight;
++
+ void initVirtualPointer(void) {
+ 	struct uinput_user_dev uinpDev;
+ 	int retcode;
+@@ -77,9 +79,11 @@
+ 	ioctl(virtPtr, UI_SET_ABSBIT, ABS_Y);
+ 
+ 	uinpDev.absmin[ABS_X] = 0;
+-	uinpDev.absmax[ABS_X] = screenFormat.width - 1;
++	pointerWidth = screenFormat.width;
++	pointerHeight = screenFormat.height;
++	uinpDev.absmax[ABS_X] = pointerWidth - 1;
+ 	uinpDev.absmin[ABS_Y] = 0;
+-	uinpDev.absmax[ABS_Y] = screenFormat.height - 1;
++	uinpDev.absmax[ABS_Y] = pointerHeight - 1;
+ 
+ 	write(virtPtr, &uinpDev, sizeof(uinpDev));
+ 
+@@ -114,6 +118,19 @@
+ 	write(udev, &event, sizeof(event));
+ }
+ 
++void releasePointerButtons(void) {
++	if (!mouseButton)
++		return;
++	if (mouseButton & BTN_LEFT_MASK)
++		writeEvent(virtPtr, EV_KEY, BTN_LEFT, 0);
++	if (mouseButton & BTN_MIDDLE_MASK)
++		writeEvent(virtPtr, EV_KEY, BTN_MIDDLE, 0);
++	if (mouseButton & BTN_RIGHT_MASK)
++		writeEvent(virtPtr, EV_KEY, BTN_RIGHT, 0);
++	writeEvent(virtPtr, EV_SYN, SYN_REPORT, 0);
++	mouseButton = 0;
++}
++
+ int keySym2Scancode(rfbKeySym key) {
+ 	// LOG(" DEBUG -> Keyboard keysym key: %04X.\n", key);
+ 
+@@ -295,7 +312,21 @@
+ 	}
+ }
+ 
++static int scalePointerAxis(int value, int size, int deviceSize) {
++	if (size <= 1 || value <= 0)
++		return 0;
++	if (value >= size - 1)
++		return deviceSize - 1;
++	return (int)((int64_t)value * (deviceSize - 1) / (size - 1));
++}
++
+ void addPointerEvent(int buttonMask, int x, int y, rfbClientPtr cl) {
++	if (activeBackend == BACKEND_FBDEV) {
++		// Keep the uinput device across a resize. Kodi scales its original
++		// absolute range to the current GUI dimensions.
++		x = scalePointerAxis(x, screenFormat.width, pointerWidth);
++		y = scalePointerAxis(y, screenFormat.height, pointerHeight);
++	}
+ 	// LOG(" DEBUG -> Last button mask: 0x%x, current button mask: 0x%x, cursor position: X=%d, Y=%d.\n", mouseButton, buttonMask, x, y);
+ 
+ 	// Reset synchronization request
+--- a/input.h
++++ b/input.h
+@@ -22,6 +22,7 @@
+ void initVirtualPointer(void);
+ void closeVirtualKeyboard(void);
+ void closeVirtualPointer(void);
++void releasePointerButtons(void);
+ void writeEvent(int udev, uint16_t type, uint16_t code, int value);
+ int keySym2Scancode(rfbKeySym key);
+ void addKeyboardEvent(rfbBool down, rfbKeySym key, rfbClientPtr cl);

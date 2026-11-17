@@ -1,3 +1,7 @@
+666.21.3.8-p3i.2
+- Use a 1080p Kodi GUI during FBDEV VNC sessions.
+- Keep viewers that support desktop resizing connected when the GUI changes size.
+
 666.21.3.8-p3i.1
 - Use linear Kodi GUI scanout while an FBDEV viewer is connected.
 
