@@ -40,6 +40,46 @@ def run_c(label, code):
     print(label + ": PASS")
 
 
+def workarounds(source, config):
+    # Compile the production defaults, including both conditional flags. Literal
+    # expected masks protect the other workarounds as well as the removed bit.
+    preinit = function(config, 'dhd_conf_preinit')
+    start = preinit.index('\tif (conf->chip == BCM43752_CHIP_ID)')
+    defaults = preinit[start:preinit.index('#ifdef PROPTX_MAXCOUNT', start)]
+    header = (source / 'dhd_config.h').read_text()
+    flags = re.search(r'enum war_flags\s*\{[^}]+\};', header).group()
+    chips = (source / 'include/bcmdevs.h').read_text()
+    names = ('BCM43752_CHIP_ID', 'BCM43711_CHIP_ID', 'BCM4612_CHIP_ID',
+             'BCM4375_CHIP_ID')
+    constants = '\n'.join(re.search(r'^#define\s+' + name + r'\s+[^\n]+',
+                                    chips, re.M).group() for name in names)
+    for eapol, p2p in ((False, False), (True, False), (False, True), (True, True)):
+        defines = '#define EAPOL_RESEND\n' if eapol else ''
+        defines += '#define P2P_AP_CONCURRENT\n' if p2p else ''
+        extra = (0x10 if eapol else 0) | (0x08 if p2p else 0)
+        run_c(f'workaround defaults (EAPOL={int(eapol)}, P2P={int(p2p)})',
+              '#include <assert.h>\n' + defines + constants + '\n' + flags + r'''
+struct dhd_conf { int chip, war; };
+static int default_war(int chip) {
+    struct dhd_conf state = {.chip = chip, .war = -1};
+    struct dhd_conf *conf = &state;
+''' + defaults + r'''
+    return conf->war;
+}
+int main(void) {
+''' + f'    const int extra = {extra};\n' + r'''
+    /* BCM43752 keeps channel, CSA and empty-scan handling, without RX reinit. */
+    assert(default_war(BCM43752_CHIP_ID) == (0x07 | extra));
+    assert((default_war(BCM43752_CHIP_ID) & FW_REINIT_RXF0OVFL) == 0);
+    assert(default_war(BCM43711_CHIP_ID) == (0x01 | extra));
+    assert(default_war(BCM4612_CHIP_ID) == (0x01 | extra));
+    assert(default_war(BCM4375_CHIP_ID) == extra);
+    assert(default_war(0) == extra);
+    return 0;
+}
+''')
+
+
 def profiles(source, config):
     helper = function(config, 'dhd_conf_set_tput_patch')
     override = function(config, 'dhd_conf_set_p3i_tput_profile')
@@ -280,6 +320,7 @@ int main(void) {
 }
 ''')
     profiles(source, config)
+    workarounds(source, config)
     # Also cover the related roaming/private-command key logging sites.
     for name in ("wl_cfg80211.c", "wl_android_ext.c"):
         assert not re.search(r'prhex\("(?:kck|kek|KCK|replay_ctr)',
