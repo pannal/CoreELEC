@@ -2,11 +2,12 @@
 # Copyright (C) 2026-present Team CoreELEC (https://coreelec.org)
 
 PKG_NAME="harletty-bridge"
-PKG_VERSION="06c8067da9c66ba968ea56ef45c3a454c4ac3085"
-PKG_SHA256="0fdb89c89733047805cba5074e784d25052052aae6af419493c7fc353da0349d"
-# The sources are Apache-2.0, but the library links bridge_api, spdif and sys
-# from Omniphony, which are GPL-3.0-or-later, so the built bridge is too - as
-# bridge/Cargo.toml states.
+PKG_VERSION="434420c0e2bd31d1bd230305fa21513b6ea35c78"
+PKG_SHA256="b4e59abee3ee638c6145fd5934089c091bc402696993dfb88f86adbe422e56ff"
+# The sources are Apache-2.0, apart from the DTS decoder (dca), which ports
+# FFmpeg's and is LGPL-2.1-or-later, but the library links bridge_api, spdif
+# and sys from Omniphony, which are GPL-3.0-or-later, so the built bridge is
+# too - as bridge/Cargo.toml states.
 PKG_LICENSE="GPL-3.0-or-later"
 PKG_SITE="https://github.com/harletty/harletty-bridge"
 # The fork rather than PKG_SITE. Its parent is the updated main branch, which

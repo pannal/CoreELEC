@@ -5,11 +5,11 @@ PKG_NAME="omniphony-bundle"
 # The bundle's own release number, not a source pin. It names the tarball the
 # aarch64 pass writes and the GitHub release the arm pass downloads, so a new
 # bundle takes a new number before it is built - see makeinstall_target.
-PKG_VERSION="5"
+PKG_VERSION="6"
 # The uploaded bundle's, which the aarch64 pass writes beside the tarball.
 # Emptied when PKG_VERSION moves on, until that bundle is uploaded: the arm
 # pass then refuses to build rather than download something unchecked.
-PKG_SHA256="52fcf2d52570e40270117e4e4e20dc2e91e17b5f827b56dc899ddc4087f6f15b"
+PKG_SHA256="65aa39e13b7c30308e6fb8ab7870145242b5a2b76f90063b4c62614cc5340133"
 PKG_LICENSE="GPL-3.0-or-later"
 PKG_SITE="https://github.com/v-lix/CoreELEC"
 PKG_LONGDESC="The 64-bit side of Kodi's binaural codec, built once: the Omniphony engine, its decoder bridges, the helper process and the 64-bit runtime they start with, packed for a 32-bit image."
