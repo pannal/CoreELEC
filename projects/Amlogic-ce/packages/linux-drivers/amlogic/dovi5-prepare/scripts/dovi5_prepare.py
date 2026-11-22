@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Fail-closed preparation and independent load validation; never insmod."""
 import argparse
+from contextlib import contextmanager
 import fcntl
 import json
 import os
@@ -101,45 +102,54 @@ def check_generation(ctx):
             'prepared generation differs from current canonical target')
 
 
+@contextmanager
+def open_marker_lock(run_dir):
+    safe_directory(run_dir)
+    fd = os.open(run_dir / 'dovi5-prepare.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        st = os.fstat(fd)
+        require(stat.S_ISREG(st.st_mode) and st.st_nlink == 1, 'unsafe preparation lock')
+        yield fd
+    finally:
+        os.close(fd)
+
+
 def validate_load(root=Path('/'), ref=None, versions=None, ksyms=None, release=None):
     """Caller must have loaded the original backend before using the returned path."""
     pathfile = root / 'run/dovi5-path'
-    safe_directory(pathfile.parent)
-    try:
-        ctx = context(root, ref, versions, ksyms, release)
-        require(read_regular(pathfile) == (str(ctx['output']) + '\n').encode('ascii'), 'wrong prepared generation marker')
-        check_generation(ctx)
-        require(enabled(root), 'new module disabled before load validation')
-        require(read_regular(ctx['source_path'], allow_links=True) == ctx['source'], 'source changed during load validation')
-        return ctx['output']
-    except (Rejected, OSError, ValueError, subprocess.SubprocessError):
-        unlink_path(pathfile)
-        raise
+    with open_marker_lock(pathfile.parent) as fd:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            ctx = context(root, ref, versions, ksyms, release)
+            require(read_regular(pathfile) == (str(ctx['output']) + '\n').encode('ascii'), 'wrong prepared generation marker')
+            check_generation(ctx)
+            require(enabled(root), 'new module disabled before load validation')
+            require(read_regular(ctx['source_path'], allow_links=True) == ctx['source'], 'source changed during load validation')
+            return ctx['output']
+        except (Rejected, OSError, ValueError, subprocess.SubprocessError):
+            unlink_path(pathfile)
+            raise
 
 
 def prepare(root=Path('/'), ref=None, versions=None, ksyms=None, release=None):
     pathfile = root / 'run/dovi5-path'
-    safe_directory(pathfile.parent)
-    unlink_path(pathfile)
-    if not enabled(root):
-        return 'disabled; original backend retained'
-    state = root / 'storage/.dovi5'
-    safe_directory(state.parent)
-    if not state.exists() and not state.is_symlink():
-        state.mkdir(mode=0o700)
-    safe_directory(state)
-    generations = state / 'generations'
-    if not generations.exists() and not generations.is_symlink():
-        generations.mkdir(mode=0o700)
-    safe_directory(generations)
-    fd = os.open(root / 'run/dovi5-prepare.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
-    try:
-        st = os.fstat(fd)
-        require(stat.S_ISREG(st.st_mode) and st.st_nlink == 1, 'unsafe preparation lock')
+    with open_marker_lock(pathfile.parent) as fd:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return 'preparation already running; original backend retained'
+        unlink_path(pathfile)
+        if not enabled(root):
+            return 'disabled; original backend retained'
+        state = root / 'storage/.dovi5'
+        safe_directory(state.parent)
+        if not state.exists() and not state.is_symlink():
+            state.mkdir(mode=0o700)
+        safe_directory(state)
+        generations = state / 'generations'
+        if not generations.exists() and not generations.is_symlink():
+            generations.mkdir(mode=0o700)
+        safe_directory(generations)
         try:
             ctx = context(root, ref, versions, ksyms, release)
         except Rejected as exc:
@@ -165,8 +175,6 @@ def prepare(root=Path('/'), ref=None, versions=None, ksyms=None, release=None):
         require(enabled(root), 'preparation disabled before publication')
         atomic_write(pathfile, (str(ctx['output']) + '\n').encode('ascii'))
         return 'validated prepared module available; loader still requires original backend'
-    finally:
-        os.close(fd)
 
 
 def main():

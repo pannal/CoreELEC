@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
 import argparse
+from concurrent.futures import ProcessPoolExecutor
 import copy
 import hashlib
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import shutil
@@ -190,6 +192,73 @@ class ELFValidation(unittest.TestCase):
 
 def digest_short(data):
     return p.digest(data)[:8]
+
+
+class MarkerLocking(unittest.TestCase):
+    def test_publication_contention_and_failed_validation_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'run').mkdir()
+            (root / 'storage').mkdir()
+            marker = root / 'run/dovi5-path'
+            source = root / 'storage/original'
+            source.write_bytes(b'fixture source')
+            generation = root / 'storage/.dovi5/generations/fixture'
+            output = generation / 'dovi5.ko'
+            ctx = dict(source_path=source, source=source.read_bytes(), generation=generation,
+                       output=output, stamp=generation / 'state.json',
+                       manifest=b'fixture manifest', result=b'fixture output')
+
+            # Fork the worker before taking a lock or installing the interleaving hooks.
+            # Only module construction is stubbed. Both processes use real file locks,
+            # generation checks, atomic publication and marker cleanup.
+            with patch.object(prep, 'context', return_value=ctx), ProcessPoolExecutor(
+                    max_workers=1, mp_context=multiprocessing.get_context('fork')) as worker:
+                def other_prepare():
+                    return worker.submit(prep.prepare, root).result(timeout=10)
+
+                self.assertIn('validated prepared module', other_prepare())
+                self.assertEqual(prep.validate_load(root), output)
+                write = prep.atomic_write
+                contention_points = []
+
+                def publish_then_contend(path, data, source=None):
+                    write(path, data, source)
+                    if path == marker:
+                        self.assertIn('already running', other_prepare())
+                        self.assertEqual(marker.read_bytes(), data)
+                        contention_points.append('published')
+
+                with patch.object(prep, 'atomic_write', publish_then_contend):
+                    prep.prepare(root)
+                self.assertEqual(prep.validate_load(root), output)
+
+                marker.write_bytes(b'stale\n')
+                read = prep.read_regular
+                unlink = prep.unlink_path
+
+                def contend_after_read(path, *args, **kwargs):
+                    data = read(path, *args, **kwargs)
+                    if path == marker:
+                        self.assertIn('already running', other_prepare())
+                        contention_points.append('read')
+                    return data
+
+                def contend_before_cleanup(path):
+                    self.assertEqual(path, marker)
+                    self.assertIn('already running', other_prepare())
+                    self.assertEqual(marker.read_bytes(), b'stale\n')
+                    unlink(path)
+                    contention_points.append('cleanup')
+
+                with patch.object(prep, 'read_regular', contend_after_read), \
+                     patch.object(prep, 'unlink_path', contend_before_cleanup):
+                    with self.assertRaisesRegex(p.Rejected, 'wrong prepared generation marker'):
+                        prep.validate_load(root)
+                self.assertEqual(contention_points, ['published', 'read', 'cleanup'])
+                self.assertFalse(marker.exists())
+                self.assertIn('validated prepared module', other_prepare())
+                self.assertEqual(prep.validate_load(root), output)
 
 
 @unittest.skipUnless(BLOB is not None, 'optional module fixture: set DOVI5_TEST_SOURCE or --fixture')
