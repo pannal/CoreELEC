@@ -6,5 +6,6 @@
     <setting id="AML_VNC_NAME" value="CoreELEC" />
     <setting id="AML_VNC_MOUSE" value="true" />
     <setting id="AML_VNC_DEBUG" value="false" />
+    <setting id="AML_VNC_VIDEO" value="false" />
 </settings>
 

@@ -1,3 +1,9 @@
+666.21.3.8-p3i.3
+- Add optional experimental decoded SDR video composition, disabled by default.
+- Bound short framebuffer writes without shortening client reads.
+- Refuse empty passwords when authentication is enabled.
+- Stop automatic restarts after unsupported video capture.
+
 666.21.3.8-p3i.2
 - Use a 1080p Kodi GUI during FBDEV VNC sessions.
 - Keep viewers that support desktop resizing connected when the GUI changes size.

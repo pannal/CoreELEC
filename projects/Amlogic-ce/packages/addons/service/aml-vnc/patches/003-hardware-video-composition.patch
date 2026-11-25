@@ -1,0 +1,834 @@
+diff -ruN baseline-source/Makefile source/Makefile
+--- baseline-source/Makefile	2026-06-30 12:57:45.000000000 -0700
++++ source/Makefile	2026-11-24 00:20:27.114801000 -0800
+@@ -7,7 +7,7 @@
+ CFLAGS += -Wall -I$(SOURCE_DIR) -I$(BACKEND_DIR)
+ LDFLAGS += -lvncserver -lpng -ljpeg -lpthread -lssl -lcrypto -lz -lresolv -lm
+ 
+-SOURCES := framebuffer.c updatescreen.c input.c server.c $(BACKEND_DIR)/fbdev.c
++SOURCES := framebuffer.c updatescreen.c input.c server.c $(BACKEND_DIR)/fbdev.c $(BACKEND_DIR)/video.c
+ 
+ HAVE_LIBDRM := $(shell $(PKG_CONFIG) --exists libdrm 2>/dev/null && echo 1 || echo 0)
+ 
+diff -ruN baseline-source/backend/fbdev.c source/backend/fbdev.c
+--- baseline-source/backend/fbdev.c	2026-11-24 00:13:31.372494869 -0800
++++ source/backend/fbdev.c	2026-11-24 00:43:31.960444700 -0800
+@@ -114,3 +114,41 @@
+ uint32_t *fbdev_readFrameBuffer(void) {
+ 	return (uint32_t *)fbBufferMap + varInfo.xoffset;
+ }
++
++int fbdev_snapshot(uint32_t *pixels, size_t capacity, struct fb_var_screeninfo *layout) {
++	struct fb_var_screeninfo before, after;
++	if (ioctl(fbFd, FBIOGET_VSCREENINFO, &before) < 0) {
++		LOG(" Video composition: cannot read GUI layout: %s.\n", strerror(errno));
++		return -1;
++	}
++	if (!sameLayout(&varInfo, &before))
++		return 1;
++	if ((size_t)before.xres * before.yres > capacity ||
++	    ((uint64_t)before.yoffset + before.yres) * screenInfo.stride > fbSize ||
++	    ((uint64_t)before.xoffset + before.xres) * sizeof(*pixels) > screenInfo.stride ||
++	    before.red.length != 8 || before.green.length != 8 ||
++	    before.blue.length != 8 || before.transp.length != 8 ||
++	    before.red.offset > 24 || before.green.offset > 24 ||
++	    before.blue.offset > 24 || before.transp.offset > 24 ||
++	    before.red.msb_right || before.green.msb_right ||
++	    before.blue.msb_right || before.transp.msb_right ||
++	    ((255u << before.red.offset) | (255u << before.green.offset) |
++	     (255u << before.blue.offset) | (255u << before.transp.offset)) != UINT32_MAX) {
++		LOG(" Video composition requires a supported premultiplied RGBA GUI.\n");
++		return -1;
++	}
++	for (size_t y = 0; y < before.yres; y++)
++		memcpy(pixels + y * before.xres,
++			(const unsigned char *)fbBufferMap + (y + before.yoffset) * screenInfo.stride +
++			before.xoffset * sizeof(*pixels), before.xres * sizeof(*pixels));
++	if (ioctl(fbFd, FBIOGET_VSCREENINFO, &after) < 0) {
++		LOG(" Video composition: cannot validate GUI snapshot: %s.\n", strerror(errno));
++		return -1;
++	}
++	if (!sameLayout(&before, &after) || before.xoffset != after.xoffset ||
++	    before.yoffset != after.yoffset ||
++	    memcmp(&before.transp, &after.transp, sizeof(before.transp)))
++		return 1;
++	*layout = before;
++	return 0;
++}
+diff -ruN baseline-source/backend/fbdev.h source/backend/fbdev.h
+--- baseline-source/backend/fbdev.h	2026-11-24 00:13:31.372838335 -0800
++++ source/backend/fbdev.h	2026-11-24 00:43:31.967488900 -0800
+@@ -15,5 +15,6 @@
+ int fbdev_checkBufferStateChange(void);
+ void fbdev_updateScreenFormat(void);
+ uint32_t *fbdev_readFrameBuffer(void);
++int fbdev_snapshot(uint32_t *pixels, size_t capacity, struct fb_var_screeninfo *layout);
+ 
+ #endif
+diff -ruN baseline-source/backend/video.c source/backend/video.c
+--- baseline-source/backend/video.c	1969-12-31 16:00:00.000000000 -0800
++++ source/backend/video.c	2026-11-24 00:43:31.971966600 -0800
+@@ -0,0 +1,227 @@
++// SPDX-License-Identifier: LGPL-3.0-or-later
++// Experimental pre-HDMI SDR composition; no compressed-primary readback.
++#include "video.h"
++#include "video_math.h"
++#include "framebuffer.h"
++#include <sys/file.h>
++#include <ctype.h>
++
++#define MAX_PIXELS (1920u * 1080u)
++
++int includeVideo = 0;
++static int videoFd = -1, lockFd = -1;
++static unsigned int captureWidth, captureHeight;
++static uint32_t *guiPixels, *outputPixels;
++static unsigned char *videoPixels;
++static size_t capacity;
++static int previousPresence = -1;
++static time_t unavailableSince;
++
++static int readState(const char *path, char *value, size_t size) {
++	FILE *file = fopen(path, "r");
++	if (!file) {
++		LOG(" Video composition: cannot open %s: %s.\n", path, strerror(errno));
++		return -1;
++	}
++	size_t count = fread(value, 1, size - 1, file);
++	int failed = ferror(file);
++	fclose(file);
++	value[count] = 0;
++	if (failed || !count) {
++		LOG(" Video composition: empty/unreadable state %s.\n", path);
++		return -1;
++	}
++	return 0;
++}
++
++static int setCapture(unsigned int command, unsigned long value) {
++	if (ioctl(videoFd, command, value) < 0) {
++		LOG(" Video composition: capture ioctl failed: %s.\n", strerror(errno));
++		return -1;
++	}
++	return 0;
++}
++
++static int configureCapture(unsigned int width, unsigned int height) {
++	if (videoFd >= 0 && captureWidth == width && captureHeight == height)
++		return 0;
++	if (videoFd < 0) {
++		videoFd = open("/dev/amvideocap0", O_RDWR | O_NONBLOCK | O_CLOEXEC);
++		if (videoFd < 0) {
++			LOG(" Video composition: open amvideocap0 failed: %s.\n", strerror(errno));
++			return -1;
++		}
++	}
++	if (setCapture(_IOW('V', 2, int), width) ||
++	    setCapture(_IOW('V', 3, int), height) ||
++	    setCapture(_IOW('V', 5, uint64_t), 100) ||
++	    setCapture(_IOW('V', 6, int), 0))
++		return -1;
++	captureWidth = width;
++	captureHeight = height;
++	return 0;
++}
++
++void video_close(void) {
++	if (videoFd >= 0)
++		close(videoFd);
++	if (lockFd >= 0)
++		close(lockFd);
++	videoFd = lockFd = -1;
++	captureWidth = captureHeight = 0;
++	free(guiPixels);
++	free(outputPixels);
++	free(videoPixels);
++	guiPixels = outputPixels = NULL;
++	videoPixels = NULL;
++	capacity = 0;
++	previousPresence = -1;
++	unavailableSince = 0;
++}
++
++int video_read_frame(const uint32_t **pixels) {
++	if (activeBackend != BACKEND_FBDEV) {
++		LOG(" Video composition requires the p3i FBDEV backend.\n");
++		return -1;
++	}
++	if (lockFd < 0) {
++		lockFd = open("/run/display-streaming-capture.lock",
++			O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
++		if (lockFd < 0 || flock(lockFd, LOCK_EX | LOCK_NB)) {
++			LOG(" Video composition: another display capture owns the device, or lock failed.\n");
++			return -1;
++		}
++		LOG(" Video composition enabled: independent linear GUI + decoded SDR video, before HDMI; not AFBC/HDR/scanout fidelity.\n");
++	}
++	const unsigned int width = screenInfo.width, height = screenInfo.height;
++	const unsigned int alignedWidth = (width + 31u) & ~31u;
++	if (!width || !height || width > 1920 || height > 1080 ||
++	    (uint64_t)alignedWidth * height > MAX_PIXELS) {
++		LOG(" Video composition: unsupported GUI size %ux%u (maximum 1920x1080).\n", width, height);
++		return -1;
++	}
++	size_t size = (size_t)alignedWidth * height;
++	if (size > capacity) {
++		uint32_t *gui = malloc(size * sizeof(*gui));
++		uint32_t *output = malloc(size * sizeof(*output));
++		unsigned char *video = malloc(size * 3);
++		if (!gui || !output || !video) {
++			free(gui); free(output); free(video);
++			LOG(" Video composition: bounded frame allocation failed.\n");
++			return -1;
++		}
++		free(guiPixels); free(outputPixels); free(videoPixels);
++		guiPixels = gui;
++		outputPixels = output;
++		videoPixels = video;
++		capacity = size;
++	}
++	char state[4096], *end;
++	if (readState("/sys/class/video/disable_video", state, sizeof(state)))
++		return -1;
++	errno = 0;
++	long disabled = strtol(state, &end, 10);
++	while (isspace((unsigned char)*end))
++		end++;
++	if (errno || end == state || *end || disabled < 0 || disabled > 2) {
++		LOG(" Video composition: invalid video visibility state.\n");
++		return -1;
++	}
++	int present = 0;
++	unsigned int left = 0, top = 0, videoWidth = width, videoHeight = height;
++	unsigned int readWidth = alignedWidth, readHeight = height;
++	if (!disabled) {
++		if (readState("/sys/class/video/frame_format", state, sizeof(state)))
++			return -1;
++		if (strstr(state, "Compressed")) {
++			LOG(" Video composition refused: compressed video has no qualified readback. Disable Include video; decoder settings were not changed.\n");
++			return -1;
++		}
++		if (!strcmp(state, "NA\n"))
++			goto noVideo;
++		if (readState("/sys/class/video/axis", state, sizeof(state)))
++			return -1;
++		int x, y, right, bottom;
++		if (sscanf(state, "%d %d %d %d", &x, &y, &right, &bottom) != 4 ||
++		    readState("/sys/class/display/vinfo", state, sizeof(state))) {
++			LOG(" Video composition: unavailable video/output geometry.\n");
++			return -1;
++		}
++		char *w = strstr(state, "width:"), *h = strstr(state, "height:");
++		unsigned int physicalWidth, physicalHeight;
++		if (!w || !h || sscanf(w, "width: %u", &physicalWidth) != 1 ||
++		    sscanf(h, "height: %u", &physicalHeight) != 1 ||
++		    physicalWidth > 8192 || physicalHeight > 8192 ||
++		    video_map_axis(x, y, right, bottom, physicalWidth, physicalHeight,
++			width, height, &left, &top, &videoWidth, &videoHeight)) {
++			LOG(" Video composition refused: unsupported physical video-axis geometry.\n");
++			return -1;
++		}
++		if (readState("/sys/class/video/crop", state, sizeof(state)))
++			return -1;
++		int a, b, c, d;
++		if (sscanf(state, "%d %d %d %d", &a, &b, &c, &d) != 4 || a || b || c || d ||
++		    readState("/sys/class/video/screen_mode", state, sizeof(state)) ||
++		    strncmp(state, "1:", 2) ||
++		    readState("/sys/class/video/global_offset", state, sizeof(state)) ||
++		    sscanf(state, "%d %d", &a, &b) != 2 || a || b) {
++			LOG(" Video composition refused: unsupported crop/aspect transform (only the video-axis/full-stretch path is qualified).\n");
++			return -1;
++		}
++		readWidth = (videoWidth + 31u) & ~31u;
++		readHeight = videoHeight;
++		if (configureCapture(readWidth, readHeight))
++			return -1;
++		size_t bytes = (size_t)readWidth * readHeight * 3;
++		ssize_t count = pread(videoFd, videoPixels, bytes, 0);
++		if (count == (ssize_t)bytes) {
++			present = 1;
++			unavailableSince = 0;
++		} else if (count < 0 && (errno == EAGAIN || errno == ENODATA)) {
++			struct timespec now;
++			if (clock_gettime(CLOCK_MONOTONIC, &now)) {
++				LOG(" Video composition: cannot obtain capture deadline clock.\n");
++				return -1;
++			}
++			if (!unavailableSince) {
++				unavailableSince = now.tv_sec;
++				LOG(" Video composition: frame unavailable during transition; skipping updates.\n");
++			} else if (now.tv_sec - unavailableSince >= 5) {
++				LOG(" Video composition stopped: no readable video frame for five seconds.\n");
++				return -1;
++			}
++			return 1;
++		} else {
++			LOG(" Video composition: short/failed video read (%zd/%zu): %s.\n",
++				count, bytes, count < 0 ? strerror(errno) : "short frame");
++			return -1;
++		}
++		if (readState("/sys/class/video/axis", state, sizeof(state)))
++			return -1;
++		int afterX, afterY, afterRight, afterBottom;
++		if (sscanf(state, "%d %d %d %d", &afterX, &afterY, &afterRight, &afterBottom) != 4) {
++			LOG(" Video composition: invalid post-capture video axis.\n");
++			return -1;
++		}
++		if (x != afterX || y != afterY || right != afterRight || bottom != afterBottom)
++			return 1;
++	} else {
++noVideo:
++		memset(videoPixels, 0, size * 3);
++		unavailableSince = 0;
++	}
++	struct fb_var_screeninfo layout;
++	int copied = fbdev_snapshot(guiPixels, capacity, &layout);
++	if (copied)
++		return copied;
++	video_blend_image(outputPixels, guiPixels, videoPixels, width, height,
++		readWidth, readHeight, left, top, videoWidth, videoHeight,
++		layout.red.offset, layout.green.offset, layout.blue.offset,
++		layout.transp.offset);
++	if (previousPresence != present) {
++		LOG(" Video composition: decoded video present=%d.\n", present);
++		previousPresence = present;
++	}
++	*pixels = outputPixels;
++	return 0;
++}
+diff -ruN baseline-source/backend/video.h source/backend/video.h
+--- baseline-source/backend/video.h	1969-12-31 16:00:00.000000000 -0800
++++ source/backend/video.h	2026-11-24 00:43:31.975682500 -0800
+@@ -0,0 +1,11 @@
++// SPDX-License-Identifier: LGPL-3.0-or-later
++#ifndef VIDEO_H
++#define VIDEO_H
++
++#include <stdint.h>
++
++extern int includeVideo;
++int video_read_frame(const uint32_t **pixels);
++void video_close(void);
++
++#endif
+diff -ruN baseline-source/backend/video_math.h source/backend/video_math.h
+--- baseline-source/backend/video_math.h	1969-12-31 16:00:00.000000000 -0800
++++ source/backend/video_math.h	2026-11-24 00:43:31.984874600 -0800
+@@ -0,0 +1,66 @@
++// SPDX-License-Identifier: LGPL-3.0-or-later
++#ifndef VIDEO_MATH_H
++#define VIDEO_MATH_H
++
++#include <stdint.h>
++#include <stddef.h>
++
++static inline int video_map_axis(int x, int y, int right, int bottom,
++		unsigned int physical_width, unsigned int physical_height,
++		unsigned int gui_width, unsigned int gui_height,
++		unsigned int *left, unsigned int *top,
++		unsigned int *width, unsigned int *height) {
++	if (!physical_width || !physical_height || !gui_width || !gui_height ||
++	    x < 0 || y < 0 || right < x || bottom < y ||
++	    (unsigned int)right >= physical_width || (unsigned int)bottom >= physical_height)
++		return -1;
++	*left = (uint64_t)x * gui_width / physical_width;
++	*top = (uint64_t)y * gui_height / physical_height;
++	unsigned int end_x = (((uint64_t)right + 1) * gui_width + physical_width - 1) / physical_width;
++	unsigned int end_y = (((uint64_t)bottom + 1) * gui_height + physical_height - 1) / physical_height;
++	*width = end_x - *left;
++	*height = end_y - *top;
++	return 0;
++}
++
++static inline uint32_t video_blend_pixel(uint32_t gui, const unsigned char *bgr,
++		unsigned int red, unsigned int green, unsigned int blue, unsigned int alpha) {
++	const unsigned int shifts[] = {red, green, blue};
++	const unsigned int a = (gui >> alpha) & 255;
++	if (a == 255)
++		return gui;
++	if (!a)
++		return (255u << alpha) | ((uint32_t)bgr[2] << red) |
++			((uint32_t)bgr[1] << green) | ((uint32_t)bgr[0] << blue);
++	uint32_t result = 255u << alpha;
++	for (unsigned int c = 0; c < 3; c++) {
++		unsigned int value = a ? (gui >> shifts[c]) & 255 : 0;
++		value += (bgr[2 - c] * (255 - a) + 127) / 255;
++		result |= (value > 255 ? 255 : value) << shifts[c];
++	}
++	return result;
++}
++
++static inline void video_blend_image(uint32_t *output, const uint32_t *gui,
++		const unsigned char *bgr, unsigned int width, unsigned int height,
++		unsigned int capture_width, unsigned int capture_height,
++		unsigned int left, unsigned int top, unsigned int video_width, unsigned int video_height,
++		unsigned int red, unsigned int green,
++		unsigned int blue, unsigned int alpha) {
++	const unsigned char black[3] = {0, 0, 0};
++	for (unsigned int y = 0; y < height; y++) {
++		for (unsigned int x = 0; x < width; x++) {
++			const unsigned char *background = black;
++			if (x >= left && x - left < video_width &&
++			    y >= top && y - top < video_height) {
++				size_t sx = (uint64_t)(x - left) * capture_width / video_width;
++				size_t sy = (uint64_t)(y - top) * capture_height / video_height;
++				background = bgr + (sy * capture_width + sx) * 3;
++			}
++			output[(size_t)y * width + x] = video_blend_pixel(
++				gui[(size_t)y * width + x], background, red, green, blue, alpha);
++		}
++	}
++}
++
++#endif
+diff -ruN baseline-source/framebuffer.c source/framebuffer.c
+--- baseline-source/framebuffer.c	2026-06-30 12:57:45.000000000 -0700
++++ source/framebuffer.c	2026-11-24 00:43:31.743694500 -0800
+@@ -2,6 +2,7 @@
+ // Framebuffer backend abstraction
+ 
+ #include "framebuffer.h"
++#include "backend/video.h"
+ 
+ screen_info_t screenInfo;
+ screen_format_t screenFormat;
+@@ -38,6 +39,7 @@
+ }
+ 
+ void closeFrameBuffer(void) {
++	video_close();
+ 	switch (activeBackend) {
+ 
+ #ifdef HAVE_LIBDRM
+diff -ruN baseline-source/server.c source/server.c
+--- baseline-source/server.c	2026-11-24 00:13:31.372941328 -0800
++++ source/server.c	2026-11-24 07:29:01.610649700 -0800
+@@ -6,6 +6,7 @@
+ #include "framebuffer.h"
+ #include "input.h"
+ #include "updatescreen.h"
++#include "backend/video.h"
+ 
+ #include <rfb/rfbregion.h>
+ #include <stddef.h>
+@@ -37,6 +38,7 @@
+ int forceFbdevBackend = 0;
+ #endif
+ int printVncDebug = 0;
++static int localhostOnly = 0;
+ 
+ // Keep one local connection open while any FBDEV viewer has finished the RFB
+ // handshake. Kodi replies after swapping a linear GUI frame.
+@@ -162,6 +164,14 @@
+ 	vncScreen->serverFormat.bitsPerPixel = screenFormat.bitsPerPixel;
+ }
+ 
++static void updateFbdevClient(rfbClientPtr client) {
++	const int savedWait = vncScreen->maxClientWait;
++	if (includeVideo)
++		vncScreen->maxClientWait = 1000;
++	rfbUpdateClient(client);
++	vncScreen->maxClientWait = savedWait;
++}
++
+ static int resizeFbdevDesktop(uint64_t now) {
+ 	uint32_t *pixels = calloc((size_t)screenInfo.width * screenInfo.height, sizeof(*pixels));
+ 	if (!pixels)
+@@ -202,8 +212,9 @@
+ 		vncScreen->setTranslateFunction(client);
+ 	}
+ 	free(oldPixels);
+-	updateScreenFull();
+-	kodiGuiRefresh = 0;
++	kodiGuiRefresh = 1;
++	if (!includeVideo || (kodiGuiReady && hasFbdevViewer()))
++		kodiGuiRefresh = !updateScreenFull();
+ 	return 0;
+ }
+ 
+@@ -295,6 +306,10 @@
+ 	vncScreen->frameBuffer = (char *)vncBuffer;
+ 	vncScreen->port = serverPort;
+ 	vncScreen->ipv6port = serverPort;
++	if (localhostOnly) {
++		vncScreen->listenInterface = htonl(INADDR_LOOPBACK);
++		vncScreen->listen6Interface = "::1";
++	}
+ 	vncScreen->kbdAddEvent = addKeyboardEvent;
+ 
+ 	if (!disablePointer)
+@@ -338,6 +353,8 @@
+ 		"-p <password>    - Password to access server\n"
+ 		"-R <host[:port]> - Host for reverse connection (default port: 5500)\n"
+ 		"-m               - Mouseless mode (disable virtual pointer)\n"
++		"-V               - Include decoded SDR video (experimental FBDEV composition)\n"
++		"-L               - Listen on loopback only (use an SSH tunnel)\n"
+ #ifdef HAVE_LIBDRM
+ 		"-F               - Force FBDEV backend (ignore DRM initialization)\n"
+ #endif
+@@ -396,6 +413,10 @@
+ #endif
+ 	if (getenv("VNC_DEBUGLOG") && !strcasecmp(getenv("VNC_DEBUGLOG"), "true"))
+ 		printVncDebug = 1;
++	if (getenv("VNC_VIDEO") && !strcasecmp(getenv("VNC_VIDEO"), "true"))
++		includeVideo = 1;
++	if (getenv("VNC_LOCALHOST") && !strcasecmp(getenv("VNC_LOCALHOST"), "true"))
++		localhostOnly = 1;
+ 
+ 	sprintf(header, "AML-VNC Server v%d.%d.%d", MAIN_VERSION_MAJOR, MAIN_VERSION_MINOR, MAIN_VERSION_PATCH);
+ 	if (MAIN_VERSION_BETA != 0)
+@@ -446,6 +467,12 @@
+ 			case 'm':
+ 				disablePointer = 1;
+ 				break;
++			case 'V':
++				includeVideo = 1;
++				break;
++			case 'L':
++				localhostOnly = 1;
++				break;
+ #ifdef HAVE_LIBDRM
+ 			case 'F':
+ 				forceFbdevBackend = 1;
+@@ -493,6 +520,7 @@
+ 			viewerReconnectDeadline = 0;
+ 			gui = kodiGuiFd >= 0 || viewerRequestedFrame() ? pollKodiGui(monotonicUs()) : GUI_WAIT;
+ 		} else if (fbdev && monotonicUs() >= viewerReconnectDeadline) {
++			video_close();
+ 			closeKodiGui();
+ 			kodiGuiRetry = 0;
+ 			kodiGuiReconnectDeadline = 0;
+@@ -500,15 +528,22 @@
+ 
+ 		if (fbdev && gui == GUI_WAIT)
+ 			continue;
++		if (includeVideo && viewer && !kodiGuiReady) {
++			LOG(" Video composition requires an acknowledged p3i linear GUI lease; refusing unqualified framebuffer capture.\n");
++			serverStateChange(SERVER_STOP);
++			return 66;
++		}
+ 		// Refresh the FBDEV dimensions and visible page after any swap reply.
+ 		int changed = checkBufferStateChange();
+ 		if (fbdev) {
+ 			if (changed < 0 || (changed && resizeFbdevDesktop(monotonicUs()) < 0))
+ 				continue;
++			viewer = hasFbdevViewer();
+ 			if (!viewer)
+ 				continue;
+ 			if (kodiGuiRefresh) {
+-				updateScreenFull();
++				if (!updateScreenFull())
++					continue;
+ 				kodiGuiRefresh = 0;
+ 			}
+ 		}
+@@ -532,8 +567,9 @@
+ 			}
+ 			if (fbdev) {
+ 				for (rfbClientPtr client = vncScreen->clientHead; client; client = client->next) {
+-					if (client->state == RFB_NORMAL)
+-						rfbUpdateClient(client);
++					if (client->state == RFB_NORMAL) {
++						updateFbdevClient(client);
++					}
+ 				}
+ 			}
+ 		} else {
+diff -ruN baseline-source/tests/test_server.c source/tests/test_server.c
+--- baseline-source/tests/test_server.c	1969-12-31 16:00:00.000000000 -0800
++++ source/tests/test_server.c	2026-11-24 07:29:38.888041400 -0800
+@@ -0,0 +1,82 @@
++// SPDX-License-Identifier: LGPL-3.0-or-later
++#define main aml_vnc_main
++#include "../server.c"
++#undef main
++
++screen_info_t screenInfo;
++screen_format_t screenFormat;
++uint32_t *vncBuffer;
++rfbScreenInfoPtr vncScreen;
++int includeVideo;
++static int captures;
++
++int updateScreenFull(void) {
++	captures++;
++	assert(!includeVideo || (kodiGuiReady && hasFbdevViewer()));
++	return 1;
++}
++
++void fbdev_updateScreenFormat(void) {
++	screenFormat.width = screenInfo.width;
++	screenFormat.height = screenInfo.height;
++	screenFormat.bitsPerPixel = 32;
++	screenFormat.redMax = screenFormat.greenMax = screenFormat.blueMax = 8;
++}
++
++void rfbNewFramebuffer(rfbScreenInfoPtr screen, char *pixels, int width, int height,
++		int bits, int samples, int bytes) {
++	screen->frameBuffer = pixels;
++}
++
++void rfbCloseClient(rfbClientPtr client) { client->sock = RFB_INVALID_SOCKET; }
++void rfbClientConnectionGone(rfbClientPtr client) { vncScreen->clientHead = client->next; }
++void releasePointerButtons(void) {}
++static rfbBool translate(rfbClientPtr client) { return TRUE; }
++rfbBool rfbUpdateClient(rfbClientPtr client) {
++	assert(vncScreen->maxClientWait == (includeVideo ? 1000 : 20000));
++	return TRUE;
++}
++
++int main(void) {
++	rfbScreenInfo screen = {0};
++	rfbClientRec client = {0};
++	vncScreen = &screen;
++	screen.setTranslateFunction = translate;
++	screen.maxClientWait = 20000;
++	includeVideo = 1;
++	updateFbdevClient(&client);
++	assert(screen.maxClientWait == 20000);
++	screenInfo.width = 3840;
++	screenInfo.height = 2160;
++	assert(!resizeFbdevDesktop(0));
++	assert(!captures && kodiGuiRefresh);
++	screenInfo.width = 1920;
++	screenInfo.height = 1080;
++	client.screen = client.scaledScreen = &screen;
++	client.state = RFB_NORMAL;
++	client.useNewFBSize = TRUE;
++	screen.clientHead = &client;
++	assert(!resizeFbdevDesktop(0));
++	assert(!captures && kodiGuiRefresh);
++	kodiGuiReady = 1;
++	assert(!resizeFbdevDesktop(0));
++	assert(captures == 1 && !kodiGuiRefresh);
++	client.useNewFBSize = FALSE;
++	screenInfo.width = 720;
++	screenInfo.height = 480;
++	assert(!resizeFbdevDesktop(0));
++	assert(!hasFbdevViewer() && captures == 1 && kodiGuiRefresh);
++	screen.clientHead = NULL;
++	kodiGuiReady = 0;
++	screenInfo.width = 3840;
++	screenInfo.height = 2160;
++	assert(!resizeFbdevDesktop(0));
++	assert(captures == 1 && kodiGuiRefresh);
++	includeVideo = 0;
++	updateFbdevClient(&client);
++	assert(screen.maxClientWait == 20000);
++	assert(!resizeFbdevDesktop(0));
++	assert(captures == 2 && !kodiGuiRefresh);
++	free(vncBuffer);
++	return 0;
++}
+diff -ruN baseline-source/tests/test_video.c source/tests/test_video.c
+--- baseline-source/tests/test_video.c	1969-12-31 16:00:00.000000000 -0800
++++ source/tests/test_video.c	2026-11-24 00:43:31.991942000 -0800
+@@ -0,0 +1,36 @@
++// SPDX-License-Identifier: LGPL-3.0-or-later
++#include <assert.h>
++#include "../backend/video_math.h"
++
++int main(void) {
++	const unsigned char red[] = {0, 0, 255};
++	assert(video_blend_pixel(0, red, 16, 8, 0, 24) == 0xffff0000);
++	assert(video_blend_pixel(0xff0000ff, red, 16, 8, 0, 24) == 0xff0000ff);
++	assert(video_blend_pixel(0x80000080, red, 16, 8, 0, 24) == 0xff7f0080);
++	assert(video_blend_pixel(0x00ffffff, red, 16, 8, 0, 24) == 0xffff0000);
++	assert(video_blend_pixel(0, red, 0, 8, 16, 24) == 0xff0000ff);
++	const unsigned char blue[] = {128, 0, 0};
++	assert(video_blend_pixel(0x80000080, blue, 16, 8, 0, 24) == 0xff0000c0);
++	const unsigned char capture[] = {0,0,255, 0,255,0, 255,0,0, 255,255,255,
++		255,255,255, 0,0,0, 0,0,255, 0,255,0};
++	uint32_t gui[4] = {0, 0, 0xff0000ff, 0};
++	uint32_t output[4];
++	video_blend_image(output, gui, capture, 2, 2, 4, 2, 0, 0, 2, 2, 16, 8, 0, 24);
++	assert(output[0] == 0xffff0000 && output[1] == 0xff0000ff);
++	assert(output[2] == 0xff0000ff && output[3] == 0xffff0000);
++	unsigned int left, top, width, height;
++	assert(!video_map_axis(0, 0, 3839, 2159, 3840, 2160, 1920, 1080,
++		&left, &top, &width, &height));
++	assert(!left && !top && width == 1920 && height == 1080);
++	assert(!video_map_axis(960, 540, 2879, 1619, 3840, 2160, 1920, 1080,
++		&left, &top, &width, &height));
++	assert(left == 480 && top == 270 && width == 960 && height == 540);
++	assert(video_map_axis(-1, 0, 719, 479, 720, 480, 720, 480,
++		&left, &top, &width, &height) == -1);
++	assert(video_map_axis(0, 0, 720, 479, 720, 480, 720, 480,
++		&left, &top, &width, &height) == -1);
++	video_blend_image(output, gui, red, 2, 2, 1, 1, 1, 1, 1, 1, 16, 8, 0, 24);
++	assert(output[0] == 0xff000000 && output[1] == 0xff000000);
++	assert(output[2] == 0xff0000ff && output[3] == 0xffff0000);
++	return 0;
++}
+diff -ruN baseline-source/tests/test_write.c source/tests/test_write.c
+--- baseline-source/tests/test_write.c	1969-12-31 16:00:00.000000000 -0800
++++ source/tests/test_write.c	2026-11-24 07:31:54.971628000 -0800
+@@ -0,0 +1,93 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++#include <rfb/rfb.h>
++#undef LIBVNCSERVER_WITH_WEBSOCKETS
++#undef LIBVNCSERVER_WITH_SYSTEMD
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wrestrict"
++#pragma GCC diagnostic ignored "-Wunused-result"
++#include "../../deps/source/src/libvncserver/sockets.c"
++#pragma GCC diagnostic pop
++#include <assert.h>
++#include <stdatomic.h>
++#include <pthread.h>
++
++static void ignore_log(const char *format, ...) {}
++rfbLogProc rfbLog = ignore_log, rfbErr = ignore_log;
++void rfbLogPerror(const char *text) {}
++
++typedef struct {
++	int fd, slow;
++	_Atomic int stop;
++	size_t bytes;
++} reader_t;
++
++static void *receive_bytes(void *opaque) {
++	reader_t *reader = opaque;
++	unsigned char bytes[65536];
++	while (!atomic_load(&reader->stop)) {
++		ssize_t count = read(reader->fd, bytes, reader->slow ? 256 : sizeof(bytes));
++		if (count > 0) {
++			for (ssize_t i = 0; i < count; i++)
++				assert(bytes[i] == 0x5a);
++			reader->bytes += count;
++		}
++		struct timespec pause = {0, reader->slow ? 20000000 : 100000};
++		nanosleep(&pause, NULL);
++	}
++	return NULL;
++}
++
++static double seconds(void) {
++	struct timespec now;
++	assert(!clock_gettime(CLOCK_MONOTONIC, &now));
++	return now.tv_sec + now.tv_nsec / 1e9;
++}
++
++static void check_write(int mode) {
++	int sockets[2], capacity = 4096;
++	assert(!socketpair(AF_UNIX, SOCK_STREAM, 0, sockets));
++	for (int i = 0; i < 2; i++)
++		assert(!fcntl(sockets[i], F_SETFL, O_NONBLOCK));
++	assert(!setsockopt(sockets[0], SOL_SOCKET, SO_SNDBUF, &capacity, sizeof(capacity)));
++	rfbScreenInfo screen = {0};
++	screen.maxClientWait = 1000;
++	rfbClientRec client = {0};
++	client.screen = &screen;
++	client.sock = sockets[0];
++	INIT_MUTEX(client.outputMutex);
++	reader_t reader = {.fd = sockets[1], .slow = mode == 1};
++	pthread_t thread;
++	if (mode)
++		assert(!pthread_create(&thread, NULL, receive_bytes, &reader));
++	size_t size = mode == 2 ? 262144 : 8388608;
++	char *data = malloc(size);
++	assert(data);
++	memset(data, 0x5a, size);
++	double start = seconds();
++	int result = rfbWriteExact(&client, data, size);
++	int error = errno;
++	double elapsed = seconds() - start;
++	if (mode == 2) {
++		assert(result == 1 && elapsed < 1.5);
++	} else {
++		assert(result == -1 && error == ETIMEDOUT);
++		assert(elapsed >= .8 && elapsed < 1.5);
++	}
++	if (mode) {
++		atomic_store(&reader.stop, 1);
++		assert(!pthread_join(thread, NULL));
++		assert(reader.bytes > 0);
++	}
++	printf("write mode=%d elapsed=%.3f result=%d\n", mode, elapsed, result);
++	free(data);
++	TINI_MUTEX(client.outputMutex);
++	close(sockets[0]);
++	close(sockets[1]);
++}
++
++int main(void) {
++	check_write(0);
++	check_write(1);
++	check_write(2);
++	return 0;
++}
+diff -ruN baseline-source/updatescreen.c source/updatescreen.c
+--- baseline-source/updatescreen.c	2026-11-24 00:13:31.371666834 -0800
++++ source/updatescreen.c	2026-11-24 00:43:31.770181400 -0800
+@@ -2,18 +2,28 @@
+ // Screen diff detection and update logic
+ 
+ #include "updatescreen.h"
++#include "backend/video.h"
+ 
+ uint32_t *vncBuffer;
+ rfbScreenInfoPtr vncScreen;
+ int blank;
+ 
+-void updateScreenFull(void) {
++int updateScreenFull(void) {
+ 	const uint32_t *fb = readFrameBuffer();
++	if (includeVideo) {
++		int captured = video_read_frame(&fb);
++		if (captured < 0)
++			exit(66);
++		if (captured > 0)
++			return 0;
++	}
+ 	for (size_t y = 0; y < screenInfo.height; y++) {
+-		const uint32_t *row = fb + (screenInfo.start + y) * (screenInfo.stride / sizeof(*fb));
++		const uint32_t *row = includeVideo ? fb + y * screenInfo.width :
++			fb + (screenInfo.start + y) * (screenInfo.stride / sizeof(*fb));
+ 		memcpy(vncBuffer + y * screenInfo.width, row, screenInfo.width * sizeof(*fb));
+ 	}
+ 	rfbMarkRectAsModified(vncScreen, 0, 0, screenInfo.width, screenInfo.height);
++	return 1;
+ }
+ 
+ void updateScreen(void) {
+@@ -36,6 +46,28 @@
+ 	// Create buffers
+ 	uint32_t* fb = readFrameBuffer();
+ 	uint32_t* vb = vncBuffer;
++	if (includeVideo) {
++		const uint32_t *composite;
++		int captured = video_read_frame(&composite);
++		if (captured < 0)
++			exit(66);
++		if (captured > 0)
++			return;
++		int first = -1, last = -1;
++		for (unsigned int row = 0; row < screenInfo.height; row++) {
++			const size_t offset = (size_t)row * screenInfo.width;
++			if (memcmp(vb + offset, composite + offset, screenInfo.width * sizeof(*composite))) {
++				memcpy(vb + offset, composite + offset, screenInfo.width * sizeof(*composite));
++				if (first < 0)
++					first = row;
++				last = row;
++				idle = 0;
++			}
++		}
++		if (first >= 0)
++			rfbMarkRectAsModified(vncScreen, 0, first, screenInfo.width, last + 1);
++		return;
++	}
+ 
+ 	// Set the pixel grid slip (depends on the resolution)
+ 	if (screenInfo.height < 540) {
+diff -ruN baseline-source/updatescreen.h source/updatescreen.h
+--- baseline-source/updatescreen.h	2026-11-24 00:13:31.371707657 -0800
++++ source/updatescreen.h	2026-11-24 00:43:31.770181400 -0800
+@@ -15,7 +15,7 @@
+ extern rfbScreenInfoPtr vncScreen;
+ 
+ void updateScreen(void);
+-void updateScreenFull(void);
++int updateScreenFull(void);
+ void clearScreen(void);
+ 
+ #endif

@@ -9,5 +9,7 @@
 		<setting id="AML_VNC_NAME" type="text" label="30005" default="CoreELEC" visible="eq(-1,true)" />
 		<setting id="AML_VNC_MOUSE" type="bool" label="30006" default="true" />
 		<setting id="AML_VNC_DEBUG" type="bool" label="30007" default="false" />
+		<setting id="AML_VNC_VIDEO" type="bool" label="30008" default="false" />
+		<setting type="lsep" label="30009" />
     </category>
 </settings>

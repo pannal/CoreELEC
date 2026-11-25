@@ -41,3 +41,11 @@ msgstr "Egérműveletek küldésének engedélyezése"
 msgctxt "#30007"
 msgid "Enable debug log from libvncserver"
 msgstr "Hibakeresési napló engedélyezése a libvncserverből"
+
+msgctxt "#30008"
+msgid "Include decoded video (experimental)"
+msgstr ""
+
+msgctxt "#30009"
+msgid "SDR readback before HDMI; not AFBC/HDR fidelity. Unsupported video stops the service."
+msgstr ""
