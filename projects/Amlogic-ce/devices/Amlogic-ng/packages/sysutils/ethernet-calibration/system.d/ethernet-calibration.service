@@ -1,0 +1,15 @@
+[Unit]
+Description=Native onboard Ethernet calibration
+After=connman.service ethernet-calibration-apply.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/lib/coreelec/ethernet-calibration/service.py
+Restart=on-failure
+RestartSec=2
+RuntimeDirectory=ethernet-calibration
+RuntimeDirectoryMode=0700
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target
