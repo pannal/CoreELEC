@@ -15,6 +15,10 @@ PKG_LONGDESC="CoreELEC-settings: is a settings dialog for CoreELEC"
 
 PKG_MAKE_OPTS_TARGET="DISTRONAME=${DISTRONAME} ADDON_VERSION=${ADDON_VERSION} ROOT_PASSWORD=${ROOT_PASSWORD}"
 
+if [ "${DEVICE}" = "Amlogic-ng" ]; then
+  PKG_DEPENDS_TARGET="${PKG_DEPENDS_TARGET} ethernet-calibration"
+fi
+
 if [ "${DISPLAYSERVER}" = "x11" ]; then
   PKG_DEPENDS_TARGET="${PKG_DEPENDS_TARGET} setxkbmap"
 else

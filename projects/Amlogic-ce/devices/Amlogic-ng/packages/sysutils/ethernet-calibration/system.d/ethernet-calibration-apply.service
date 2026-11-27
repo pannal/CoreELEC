@@ -1,0 +1,11 @@
+[Unit]
+Description=Apply saved onboard Ethernet calibration
+DefaultDependencies=no
+After=local-fs.target systemd-tmpfiles-setup.service userconfig.service
+Before=network-base.service connman.service
+ConditionPathExists=!/dev/.kernel_ipconfig
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/lib/coreelec/ethernet-calibration/service.py --apply
+TimeoutStartSec=25
