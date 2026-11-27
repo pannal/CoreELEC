@@ -12,7 +12,11 @@ if [ ${AML_VNC_PORT} != "5900" ] ; then
   export VNC_PORT="${AML_VNC_PORT}"
 fi
 
-if [ ${AML_VNC_AUTH} == "true" ] ; then
+if [ "${AML_VNC_AUTH}" == "true" ] ; then
+  if [ -z "${AML_VNC_PWD}" ] ; then
+    echo "AML-VNC: authentication requested but password is empty; refusing to start." >&2
+    exit 66
+  fi
   export VNC_PASSWORD="${AML_VNC_PWD}"
 fi
 
@@ -27,5 +31,7 @@ fi
 if [ ${AML_VNC_DEBUG} == "true" ] ; then
   export VNC_DEBUGLOG="TRUE"
 fi
+
+export VNC_VIDEO="${AML_VNC_VIDEO:-false}"
 
 exec aml-vnc

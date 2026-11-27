@@ -9,6 +9,7 @@ ExecStart=/bin/sh /storage/.kodi/addons/service.aml-vnc/bin/aml-vnc.start
 SyslogIdentifier=aml-vnc
 TimeoutStopSec=1
 Restart=always
+RestartPreventExitStatus=66
 RestartSec=2
 StartLimitInterval=0
 

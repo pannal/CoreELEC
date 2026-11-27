@@ -1,0 +1,76 @@
+--- a/src/libvncserver/sockets.c
++++ b/src/libvncserver/sockets.c
+@@ -88,6 +88,9 @@
+ #endif
+ 
+ #include <errno.h>
++#ifdef __linux__
++#include <time.h>
++#endif
+ 
+ #ifdef USE_LIBWRAP
+ #include <syslog.h>
+@@ -853,6 +856,17 @@
+     struct timeval tv;
+     int totalTimeWaited = 0;
+     const int timeout = (cl->screen && cl->screen->maxClientWait) ? cl->screen->maxClientWait : rfbMaxClientWait;
++    int bounded = 0, remaining = 0;
++#ifdef __linux__
++    uint64_t deadline = 0;
++    if (timeout > 0 && timeout < 5000) {
++        struct timespec now;
++        if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
++            return -1;
++        deadline = (uint64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000 + timeout;
++        bounded = 1;
++    }
++#endif
+ 
+ #undef DEBUG_WRITE_EXACT
+ #ifdef DEBUG_WRITE_EXACT
+@@ -888,6 +902,22 @@
+ 
+     LOCK(cl->outputMutex);
+     while (len > 0) {
++#ifdef __linux__
++        if (bounded) {
++            struct timespec now;
++            if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) {
++                UNLOCK(cl->outputMutex);
++                return -1;
++            }
++            uint64_t current = (uint64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
++            if (current >= deadline) {
++                errno = ETIMEDOUT;
++                UNLOCK(cl->outputMutex);
++                return -1;
++            }
++            remaining = (int)(deadline - current);
++        }
++#endif
+ #ifdef LIBVNCSERVER_WITH_WEBSOCKETS
+         if (cl->sslctx)
+ 	    n = rfbssl_write(cl, buf, len);
+@@ -924,8 +954,8 @@
+ 
+             FD_ZERO(&fds);
+             FD_SET(sock, &fds);
+-            tv.tv_sec = 5;
+-            tv.tv_usec = 0;
++            tv.tv_sec = bounded ? remaining / 1000 : 5;
++            tv.tv_usec = bounded ? (remaining % 1000) * 1000 : 0;
+             n = select(sock+1, NULL, &fds, NULL /* &fds */, &tv);
+ 	    if (n < 0) {
+ #ifdef WIN32
+@@ -938,6 +968,11 @@
+                 return n;
+             }
+             if (n == 0) {
++                if (bounded) {
++                    errno = ETIMEDOUT;
++                    UNLOCK(cl->outputMutex);
++                    return -1;
++                }
+                 totalTimeWaited += 5000;
+                 if (totalTimeWaited >= timeout) {
+                     errno = ETIMEDOUT;
