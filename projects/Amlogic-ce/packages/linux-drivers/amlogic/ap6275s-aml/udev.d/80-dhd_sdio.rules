@@ -1,0 +1,28 @@
+# Select one DHD family before 80-drivers.rules resolves MODALIAS.
+# The legacy wildcard must not start a second driver for these devices.
+ACTION!="add", GOTO="p3i_dhd_end"
+SUBSYSTEM!="sdio", GOTO="p3i_dhd_end"
+ENV{MODALIAS}!="?*", GOTO="p3i_dhd_end"
+ENV{SDIO_ID}=="02D0:4497", GOTO="p3i_dhd_sdio"
+ENV{SDIO_ID}=="02D0:4496", GOTO="p3i_dhd_sdio"
+ENV{SDIO_ID}=="02D0:4495", GOTO="p3i_dhd_sdio"
+ENV{SDIO_ID}=="02D0:A806", GOTO="p3i_dhd_sdio"
+ENV{SDIO_ID}=="02D0:A804", GOTO="p3i_dhd_sdio"
+ENV{SDIO_ID}=="02D0:AAE8", GOTO="p3i_dhd_sdio"
+ENV{SDIO_ID}=="02D0:AAE7", GOTO="p3i_dhd_sdio"
+ENV{SDIO_ID}=="02D0:4362", GOTO="p3i_dhd_sdio"
+ENV{SDIO_ID}=="02D0:4354", GOTO="p3i_dhd_legacy"
+ENV{SDIO_ID}=="02D0:A9BF", GOTO="p3i_dhd_legacy"
+GOTO="p3i_dhd_end"
+
+# Keep these two IDs on legacy until the newer driver is device-tested.
+LABEL="p3i_dhd_legacy"
+ENV{MODALIAS}="dhd"
+RUN{builtin}+="kmod load dhd"
+GOTO="p3i_dhd_end"
+
+LABEL="p3i_dhd_sdio"
+ENV{MODALIAS}="dhd_sdio"
+RUN{builtin}+="kmod load dhd_sdio"
+
+LABEL="p3i_dhd_end"

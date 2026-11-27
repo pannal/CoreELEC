@@ -11,8 +11,7 @@ PKG_LONGDESC="Compressed RAM-backed swap (zram) — adds OOM headroom for memory
 PKG_TOOLCHAIN="manual"
 
 makeinstall_target() {
-  mkdir -p ${INSTALL}/usr/lib/libreelec
-    cp ${PKG_DIR}/scripts/zram-swap ${INSTALL}/usr/lib/libreelec/
+  install -Dm755 ${PKG_DIR}/scripts/zram-swap ${INSTALL}/usr/lib/libreelec/zram-swap
 
   mkdir -p ${INSTALL}/etc
     sed -e "s,@ZRAM_SIZE_MB@,${ZRAM_SIZE_MB},g" \

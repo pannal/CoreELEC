@@ -4,24 +4,26 @@ Date: Tue, 3 Oct 2023 17:32:13 +0200
 Subject: [PATCH 1/2] merged all (1.0.2) patches
 
 ---
- Makefile.am            |  2 ++
+ src/libbluray/meson.build            |  2 ++
  src/libbluray/bluray.c | 17 +++++++++++++++++
  src/libbluray/bluray.h | 13 +++++++++++++
  3 files changed, 32 insertions(+)
 
-diff --git a/Makefile.am b/Makefile.am
+diff --git a/src/libbluray/meson.build b/src/libbluray/meson.build
 index 24b60f78..f58f60ad 100644
---- a/Makefile.am
-+++ b/Makefile.am
-@@ -234,7 +234,9 @@ pkginclude_HEADERS = \
- 	src/libbluray/keys.h \
- 	src/libbluray/player_settings.h \
- 	src/libbluray/bdnav/clpi_data.h \
-+	src/libbluray/bdnav/mpls_data.h \
- 	src/libbluray/bdnav/meta_data.h \
-+	src/libbluray/bdnav/uo_mask_table.h \
- 	src/libbluray/decoders/overlay.h \
- 	src/util/log_control.h
+--- a/src/libbluray/meson.build
++++ b/src/libbluray/meson.build
+@@ -7,8 +7,10 @@ libbluray_api_headers = files(
+     '../util/log_control.h',
+     'bluray.h',
+     'bdnav/clpi_data.h',
++    'bdnav/mpls_data.h',
+     'keys.h',
+     'bdnav/meta_data.h',
++    'bdnav/uo_mask_table.h',
+     'decoders/overlay.h',
+     'player_settings.h',
+ )
  
 diff --git a/src/libbluray/bluray.c b/src/libbluray/bluray.c
 index b3b55f75..40eaff2c 100644
@@ -48,16 +50,13 @@ index b3b55f75..40eaff2c 100644
 +    }
 +    return 0;
 +}
-diff --git a/src/libbluray/bluray.h b/src/libbluray/bluray.h
-index 41cd4f6a..1e61fb62 100644
+diff -u a/src/libbluray/bluray.h b/src/libbluray/bluray.h
 --- a/src/libbluray/bluray.h
 +++ b/src/libbluray/bluray.h
-@@ -1179,6 +1179,19 @@ void bd_stop_bdj(BLURAY *bd);
-  */
- int bd_read_file(BLURAY *bd, const char *path, void **data, int64_t *size);
+@@ -1260,6 +1260,19 @@
  
-+/**
-+ *
+ /**
+  *
 + * Get information about the clip
 + *
 + * @param bd  BLURAY object
@@ -69,9 +68,8 @@ index 41cd4f6a..1e61fb62 100644
 + */
 +int bd_get_clip_infos(BLURAY *bd, unsigned clip, uint64_t *clip_start_time, uint64_t *stream_start_time, uint64_t *pos, uint64_t *duration);
 +
- /**
-  *
++/**
++ *
   *  Open a directory from BluRay Virtual File System.
--- 
-2.34.1
-
+  *
+  *  Caller must close with dir->close().

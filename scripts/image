@@ -95,13 +95,13 @@ if [ "${OFFICIAL}" = "yes" ]; then
   LIBREELEC_BUILD="official"
 else
   if [ ${NON_PERIODIC} ]; then
-    OS_STAGE="p3i_T4c"
+    OS_STAGE="p3i_T5"
     BUILD_NUM="_$(date +%Y%m%d%H%M%S)"
   fi
   if [ -n "${BUILDER_NAME}" ]; then
     LIBREELEC_BUILD="${BUILDER_NAME}"
   else
-    LIBREELEC_BUILD="p3i_T4"
+    LIBREELEC_BUILD="p3i_T5"
   fi
 fi
 

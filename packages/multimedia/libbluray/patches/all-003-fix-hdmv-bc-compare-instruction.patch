@@ -1,0 +1,37 @@
+From: SamuriHL <samurihl@gmail.com>
+Date: Tue, 21 Jul 2026 10:00:00 -0400
+Subject: [PATCH] HDMV VM: fix the BC (bit compare) instruction operand reversal
+
+The BC compare executed the next instruction iff (dst & ~src) == 0 - a
+subset test with the operands reversed that never checks whether the
+requested bits are SET, only that no bits outside the mask are.
+
+Real authoring confirms it: the S&M UHD Benchmark's MovieObject enumerates
+the UHD capability PSR bits one at a time (BC PSR25,0x01 / 0x02 / 0x04 /
+0x20 -> one GPR flag per format, then sums player+display flags per
+format). Under the reversed subset test a multi-bit capability register
+fails every single-bit test, which forced players to mis-report a single
+exclusive format bit to branch correctly. Capability PSRs (25/26) are
+genuine OR sets, like PSR15; with BC fixed they can carry the truth.
+
+Fix matches upstream MR 76 by Hendrik Leppkes (who spotted the inverted
+implementation): condition passes when all bits of src (the mask) are set
+in dst (the register). All known discs test a single bit at a time, where
+full-match and any-match are identical; the full-match reading is kept for
+upstream parity.
+---
+ src/libbluray/hdmv/hdmv_vm.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/libbluray/hdmv/hdmv_vm.c b/src/libbluray/hdmv/hdmv_vm.c
+--- a/src/libbluray/hdmv/hdmv_vm.c
++++ b/src/libbluray/hdmv/hdmv_vm.c
+@@ -1134,7 +1134,7 @@ static int _hdmv_step(HDMV_VM *p)
+                 BD_DEBUG(DBG_HDMV|DBG_CRIT, "missing operand in BRANCH/JUMP opcode 0x%08x\n", *(uint32_t*)insn);
+             }
+             switch (insn->cmp_opt) {
+-                case INSN_BC: p->pc += !!(dst & ~src); break;
++                case INSN_BC: p->pc += !!(src & ~dst); break;
+                 case INSN_EQ: p->pc += !(dst == src); break;
+                 case INSN_NE: p->pc += !(dst != src); break;
+                 case INSN_GE: p->pc += !(dst >= src); break;

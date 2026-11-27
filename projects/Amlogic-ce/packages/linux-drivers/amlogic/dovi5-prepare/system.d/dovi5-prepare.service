@@ -1,0 +1,12 @@
+[Unit]
+Description=Prepare optional second Dolby Vision backend
+After=local-fs.target dtb-autoupdate.service
+Before=opentee_linuxdriver.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/coreelec/dovi5-prepare prepare
+
+[Install]
+WantedBy=multi-user.target

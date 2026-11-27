@@ -1,0 +1,151 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+from contextlib import ExitStack
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+import time
+
+
+USB = Path('/sys/bus/usb')
+BOT = USB / 'drivers/usb-storage'
+POLICY = USB / 'drivers/uas/p3i_policy'
+DEV = Path('/dev')
+CONFIG = Path('/storage/.config')
+
+
+def write_sysfs(path, value):
+    path.write_text(value + '\n', encoding='ascii')
+
+
+def device_ids(path):
+    try:
+        content = path.read_text(encoding='utf-8')
+    except FileNotFoundError:
+        return set()
+    entries = {''.join(line.partition('#')[0].split()).lower()
+               for line in content.splitlines()}
+    return {entry for entry in entries if re.fullmatch(r'[0-9a-f]{4}:[0-9a-f]{4}', entry)}
+
+
+def disks(interface):
+    return sorted(interface.glob('host*/target*/*/block/*'))
+
+
+def eligible(interface):
+    try:
+        return (interface / 'p3i_uas_eligible').read_text().strip() == '1'
+    except OSError:
+        return False
+
+
+def mounted_devices():
+    devices = set()
+    for line in Path('/proc/self/mountinfo').read_text().splitlines():
+        fields = line.split()
+        devices.add(fields[2])
+        source = fields[fields.index('-') + 2]
+        if source.startswith('/dev/'):
+            source = re.sub(r'\\([0-7]{3})', lambda match: chr(int(match[1], 8)), source)
+            try:
+                info = os.stat(source)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISBLK(info.st_mode):
+                devices.add(f'{os.major(info.st_rdev)}:{os.minor(info.st_rdev)}')
+    return devices
+
+
+def claim_disks(block_devices, mounted, claims):
+    for disk in block_devices:
+        dev = (disk / 'dev').read_text().strip()
+        partitions = (part for part in disk.iterdir() if (part / 'partition').is_file())
+        if dev in mounted or any((part / 'dev').read_text().strip() in mounted
+                                 for part in partitions):
+            raise OSError(f'{disk.name} has a mounted filesystem')
+        major, minor = map(int, dev.split(':'))
+        fd = os.open(DEV / disk.name, os.O_RDONLY | os.O_EXCL | os.O_NONBLOCK)
+        claims.callback(os.close, fd)
+        info = os.fstat(fd)
+        if not stat.S_ISBLK(info.st_mode) or info.st_rdev != os.makedev(major, minor):
+            raise OSError(f'{disk.name} changed during USB storage discovery')
+
+
+def reselect(interface, claims):
+    try:
+        # Retain the exclusive claims until usb-storage removes the old disks.
+        write_sysfs(BOT / 'unbind', interface.name)
+    finally:
+        claims.close()
+
+    device = USB / 'devices' / interface.name
+    if not device.exists():
+        return
+    try:
+        write_sysfs(USB / 'drivers_probe', interface.name)
+    finally:
+        if device.exists() and not (device / 'driver').exists():
+            write_sysfs(BOT / 'bind', interface.name)
+
+
+def apply_policy():
+    if not (CONFIG / 'uas.enabled').is_file():
+        write_sysfs(POLICY, 'off')
+        return
+
+    exclusions = device_ids(CONFIG / 'uas-blacklist.txt')
+
+    # usb-storage scans for LUNs asynchronously. Give eligible drives a
+    # bounded window to expose their disks before considering a handoff.
+    deadline = time.monotonic() + 2
+    interfaces = sorted(BOT.glob('*:*'))
+    while time.monotonic() < deadline and any(
+            eligible(interface) and not disks(interface) for interface in interfaces):
+        time.sleep(0.05)
+
+    mounted = mounted_devices()
+    with ExitStack() as held:
+        candidates = []
+        for interface in sorted(BOT.glob('*:*')):
+            port = interface.name.split(':', 1)[0]
+            block_devices = disks(interface)
+            if not block_devices:
+                continue
+            with ExitStack() as claims:
+                try:
+                    # A mounted partition, active swap or block holder
+                    # prevents an exclusive claim on the whole disk.
+                    claim_disks(block_devices, mounted, claims)
+                except OSError as error:
+                    print(f'uas-init: keeping {port} on BOT: {error}', file=sys.stderr)
+                    exclusions.add(port)
+                    continue
+                if eligible(interface):
+                    candidates.append((interface, port, held.enter_context(claims.pop_all())))
+
+        policy = 'on ' + ','.join(sorted(exclusions))
+        if len(policy) + 1 > 4096:
+            raise ValueError('USB storage exclusion list is too long')
+        write_sysfs(POLICY, policy)
+        for interface, port, claims in candidates:
+            if port not in exclusions and eligible(interface):
+                try:
+                    reselect(interface, claims)
+                except OSError as error:
+                    print(f'uas-init: {interface.name}: {error}', file=sys.stderr)
+
+
+if __name__ == '__main__':
+    if not POLICY.exists():
+        sys.exit(0)
+    if Path('/proc/1/exe').readlink().name != 'busybox':
+        sys.exit('uas-init: USB storage selection must run from initramfs')
+    try:
+        apply_policy()
+    except (OSError, ValueError) as error:
+        if POLICY.read_text().strip() == 'pending':
+            write_sysfs(POLICY, 'off')
+        sys.exit(f'uas-init: {error}')

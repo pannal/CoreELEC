@@ -1,0 +1,9 @@
+render:
+  binaural:
+    output_mode: binaural
+    hrir_source: saf
+    unit_scale_m: 3.0
+    head_radius_m: 0.0875
+    air_absorption: true
+    reflections: { enabled: false }
+    reverb: { enabled: false }

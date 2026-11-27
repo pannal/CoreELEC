@@ -1,0 +1,2 @@
+# Only explicitly supported user-provided originals are prepared.
+ENABLE=yes

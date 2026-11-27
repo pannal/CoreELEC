@@ -1,0 +1,19 @@
+From: pannal <1359593+pannal@users.noreply.github.com>
+Subject: [PATCH] shutdown: Preserve the watchdog across reboot cleanup
+
+Freeing the cached device path also closes with disarm=true. Close without
+magic close first on reboot/kexec so the watchdog guards the remaining hooks,
+final sync and kernel handover as the existing comment intends. Keep explicit
+path changes, disabled watchdogs, errors and non-reboot cleanup unchanged.
+
+--- a/src/shutdown/shutdown.c
++++ b/src/shutdown/shutdown.c
+@@ -547,6 +547,8 @@
+ 
+         /* We're done with the watchdog. Note that the watchdog is explicitly not stopped here. It remains
+          * active to guard against any issues during the rest of the shutdown sequence. */
++        if (IN_SET(cmd, RB_AUTOBOOT, LINUX_REBOOT_CMD_KEXEC))
++                watchdog_close(/* disarm= */ false);
+         watchdog_free_device();
+ 
+         arguments[0] = NULL; /* Filled in by execute_directories(), when needed */

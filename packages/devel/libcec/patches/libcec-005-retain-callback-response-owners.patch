@@ -1,0 +1,334 @@
+From: CoreELEC
+Subject: [PATCH] libCEC: retain callback and response owners through close
+
+Drain callback and producer workers before resetting responses or freeing their
+processor. Restart callbacks on Open, discard old connection events, and retain
+queued menu results and borrowed responses across timeout/reset. Keep native
+transport alive until completed retirement; preserve close/reopen behavior.
+
+--- a/src/libcec/devices/CECBusDevice.h
++++ b/src/libcec/devices/CECBusDevice.h
+@@ -76,10 +76,10 @@
+     void Received(cec_opcode opcode);
+ 
+   private:
+-    CResponse *GetEvent(cec_opcode opcode);
++    std::shared_ptr<CResponse> GetEvent(cec_opcode opcode);
+ 
+     P8PLATFORM::CMutex               m_mutex;
+-    std::map<cec_opcode, CResponse*> m_waitingFor;
++    std::map<cec_opcode, std::shared_ptr<CResponse>> m_waitingFor;
+   };
+ 
+   class CCECBusDevice
+--- a/src/libcec/devices/CECBusDevice.cpp
++++ b/src/libcec/devices/CECBusDevice.cpp
+@@ -93,40 +93,40 @@
+ void CWaitForResponse::Clear()
+ {
+   P8PLATFORM::CLockObject lock(m_mutex);
+-  for (std::map<cec_opcode, CResponse*>::iterator it = m_waitingFor.begin(); it != m_waitingFor.end(); it++)
++  for (std::map<cec_opcode, std::shared_ptr<CResponse>>::iterator it = m_waitingFor.begin(); it != m_waitingFor.end(); it++)
+   {
+     it->second->Broadcast();
+-    delete it->second;
++    // Wait/Received retain their own response until the call completes.
+   }
+   m_waitingFor.clear();
+ }
+ 
+ bool CWaitForResponse::Wait(cec_opcode opcode, uint32_t iTimeout)
+ {
+-  CResponse *response = GetEvent(opcode);
++  std::shared_ptr<CResponse> response = GetEvent(opcode);
+   return response ? response->Wait(iTimeout) : false;
+ }
+ 
+ void CWaitForResponse::Received(cec_opcode opcode)
+ {
+-  CResponse *response = GetEvent(opcode);
++  std::shared_ptr<CResponse> response = GetEvent(opcode);
+   if (response)
+     response->Broadcast();
+ }
+ 
+-CResponse* CWaitForResponse::GetEvent(cec_opcode opcode)
+-{
+-  CResponse *retVal(NULL);
++std::shared_ptr<CResponse> CWaitForResponse::GetEvent(cec_opcode opcode)
++{
++  std::shared_ptr<CResponse> retVal;
+   {
+     P8PLATFORM::CLockObject lock(m_mutex);
+-    std::map<cec_opcode, CResponse*>::iterator it = m_waitingFor.find(opcode);
++    std::map<cec_opcode, std::shared_ptr<CResponse>>::iterator it = m_waitingFor.find(opcode);
+     if (it != m_waitingFor.end())
+     {
+       retVal = it->second;
+     }
+     else
+     {
+-      retVal = new CResponse(opcode);
++      retVal = std::make_shared<CResponse>(opcode);
+       m_waitingFor[opcode] = retVal;
+     }
+     return retVal;
+--- a/src/libcec/CECClient.h
++++ b/src/libcec/CECClient.h
+@@ -175,6 +175,7 @@
+   class CCECClient : private P8PLATFORM::CThread
+   {
+     friend class CCECProcessor;
++    friend class CLibCEC;
+ 
+   public:
+     CCECClient(CCECProcessor *processor, const libcec_configuration &configuration);
+@@ -339,6 +340,11 @@
+      */
+     virtual void OnUnregister(void) { SetRegistered(false); SetInitialised(false); }
+ 
++    // Callback workers must finish before processor/transport state is retired.
++    bool StartCallbacks(void);
++    void StopCallbacks(void);
++    void DetachProcessor(void);
++
+     /*!
+      * @brief Set the registered state of this client.
+      * @param bSetTo The new value.
+@@ -460,6 +466,6 @@
+     int32_t                                  m_pressedButtoncount;                /**< the number of times a button released message has been seen for this press. */
+     int32_t                                  m_releasedButtoncount;               /**< the number of times a button pressed message has been seen for this press. */
+     int64_t                                  m_iPreventForwardingPowerOffCommand; /**< prevent forwarding standby commands until this time */
+-    P8PLATFORM::SyncedBuffer<CCallbackWrap*> m_callbackCalls;
++    P8PLATFORM::SyncedBuffer<std::shared_ptr<CCallbackWrap>> m_callbackCalls;
+   };
+ }
+--- a/src/libcec/CECClient.cpp
++++ b/src/libcec/CECClient.cpp
+@@ -65,20 +65,44 @@
+   m_configuration.Clear();
+   // set the initial configuration
+   SetConfiguration(configuration);
+-  CreateThread(false);
++  CreateThread();
+ }
+ 
+ CCECClient::~CCECClient(void)
+ {
+-  StopThread();
+-  CCallbackWrap* cb;
++  StopCallbacks();
++  std::shared_ptr<CCallbackWrap> cb;
+   while (!m_callbackCalls.IsEmpty())
+     if (m_callbackCalls.Pop(cb, 0))
+-      delete cb;
++      cb.reset();
+ 
+   // unregister the client
+   if (m_processor && IsRegistered())
+     m_processor->UnregisterClient(this);
++}
++
++bool CCECClient::StartCallbacks(void)
++{
++  if (IsRunning())
++    return true;
++
++  // Discard events from the closed connection before admitting a new one.
++  std::shared_ptr<CCallbackWrap> cb;
++  while (!m_callbackCalls.IsEmpty())
++    if (m_callbackCalls.Pop(cb, 0))
++      cb.reset();
++  return CreateThread();
++}
++
++void CCECClient::StopCallbacks(void)
++{
++  StopThread(0);
++}
++
++void CCECClient::DetachProcessor(void)
++{
++  CLockObject lock(m_mutex);
++  m_processor = NULL;
+ }
+ 
+ bool CCECClient::IsInitialised(void)
+@@ -1579,47 +1603,46 @@
+ 
+ void CCECClient::QueueAddCommand(const cec_command& command)
+ {
+-  m_callbackCalls.Push(new CCallbackWrap(command));
++  m_callbackCalls.Push(std::make_shared<CCallbackWrap>(command));
+ }
+ 
+ void CCECClient::QueueAddKey(const cec_keypress& key)
+ {
+-  m_callbackCalls.Push(new CCallbackWrap(key));
++  m_callbackCalls.Push(std::make_shared<CCallbackWrap>(key));
+ }
+ 
+ void CCECClient::QueueAddLog(const cec_log_message_cpp& message)
+ {
+-  m_callbackCalls.Push(new CCallbackWrap(message));
++  m_callbackCalls.Push(std::make_shared<CCallbackWrap>(message));
+ }
+ 
+ void CCECClient::QueueAlert(const libcec_alert type, const libcec_parameter& param)
+ {
+-  m_callbackCalls.Push(new CCallbackWrap(type, param));
++  m_callbackCalls.Push(std::make_shared<CCallbackWrap>(type, param));
+ }
+ 
+ void CCECClient::QueueConfigurationChanged(const libcec_configuration& config)
+ {
+-  m_callbackCalls.Push(new CCallbackWrap(config));
++  m_callbackCalls.Push(std::make_shared<CCallbackWrap>(config));
+ }
+ 
+ int CCECClient::QueueMenuStateChanged(const cec_menu_state newState)
+ {
+-  CCallbackWrap *wrapState = new CCallbackWrap(newState, true);
++  std::shared_ptr<CCallbackWrap> wrapState = std::make_shared<CCallbackWrap>(newState, true);
+   m_callbackCalls.Push(wrapState);
+   int result(wrapState->Result(1000));
+ 
+-  delete wrapState;
+   return result;
+ }
+ 
+ void CCECClient::QueueSourceActivated(bool bActivated, const cec_logical_address logicalAddress)
+ {
+-  m_callbackCalls.Push(new CCallbackWrap(bActivated, logicalAddress));
++  m_callbackCalls.Push(std::make_shared<CCallbackWrap>(bActivated, logicalAddress));
+ }
+ 
+ void* CCECClient::Process(void)
+ {
+-  CCallbackWrap* cb(NULL);
++  std::shared_ptr<CCallbackWrap> cb;
+   while (!IsStopped())
+   {
+     if (m_callbackCalls.Pop(cb, 500))
+@@ -1653,12 +1676,11 @@
+           break;
+         }
+ 
+-        if (!cb->m_keepResult)
+-          delete cb;
++        cb.reset();
+       } catch (...)
+       {
+          // don't log a warning but let the app deal with this
+-         delete cb;
++         cb.reset();
+       }
+     }
+   }
+--- a/src/libcec/LibCEC.cpp
++++ b/src/libcec/LibCEC.cpp
+@@ -60,17 +60,12 @@
+ 
+ CLibCEC::~CLibCEC(void)
+ {
+-  // unregister all clients
+-  if (m_cec && m_cec->IsRunning())
+-    m_cec->UnregisterClients();
+-
++  Close();
++  for (std::vector<CECClientPtr>::iterator it = m_clients.begin(); it != m_clients.end(); ++it)
++    (*it)->DetachProcessor();
+   m_clients.clear();
+-
+-  // delete the adapter connection
++  m_client.reset();
+   SAFE_DELETE(m_cec);
+-
+-  // delete active client
+-  m_client.reset();
+ }
+ 
+ bool CLibCEC::Open(const char *strPort, uint32_t iTimeoutMs /* = CEC_DEFAULT_CONNECT_TIMEOUT */)
+@@ -78,10 +73,22 @@
+   if (!m_cec || !strPort)
+     return false;
+ 
++  // Close without a processor lock before restarting callback/transport workers.
++  Close();
++  for (std::vector<CECClientPtr>::iterator it = m_clients.begin(); it != m_clients.end(); ++it)
++  {
++    if (!(*it)->StartCallbacks())
++    {
++      Close();
++      return false;
++    }
++  }
++
+   // open a new connection
+   if (!m_cec->Start(strPort, CEC_SERIAL_DEFAULT_BAUDRATE, iTimeoutMs))
+   {
+     AddLog(CEC_LOG_ERROR, "could not start CEC communications");
++    Close();
+     return false;
+   }
+ 
+@@ -91,6 +98,7 @@
+     if (!m_cec->RegisterClient(*it))
+     {
+       AddLog(CEC_LOG_ERROR, "failed to register a CEC client");
++      Close();
+       return false;
+     }
+   }
+@@ -103,10 +111,9 @@
+   if (!m_cec)
+     return;
+ 
+-  // unregister all clients
+-  m_cec->UnregisterClients();
+-
+-  // close the connection
++  // Keep transport and responses alive until all callback re-entry has finished.
++  for (std::vector<CECClientPtr>::iterator it = m_clients.begin(); it != m_clients.end(); ++it)
++    (*it)->StopCallbacks();
+   m_cec->Close();
+ }
+ 
+--- a/src/libcec/CECProcessor.cpp
++++ b/src/libcec/CECProcessor.cpp
+@@ -103,7 +103,6 @@
+ CCECProcessor::~CCECProcessor(void)
+ {
+   m_bStallCommunication = false;
+-  SAFE_DELETE(m_addrAllocator);
+   Close();
+   SAFE_DELETE(m_busDevices);
+ }
+@@ -130,16 +129,19 @@
+ 
+ void CCECProcessor::Close(void)
+ {
+-  // mark as uninitialised
+-  SetCECInitialised(false);
+-
+-  // stop the processor
+-  SAFE_DELETE(m_connCheck);
++  // Stop producers before resetting their clients or deleting native state.
+   StopThread(-1);
+   m_inBuffer.Broadcast();
+-  StopThread();
+-
+-  // close the connection
++  StopThread(0);
++  if (m_connCheck)
++    m_connCheck->StopThread(0);
++  SAFE_DELETE(m_connCheck);
++  if (m_addrAllocator)
++    m_addrAllocator->StopThread(0);
++  SAFE_DELETE(m_addrAllocator);
++
++  SetCECInitialised(false);
++
+   CLockObject lock(m_mutex);
+   SAFE_DELETE(m_communication);
+ }

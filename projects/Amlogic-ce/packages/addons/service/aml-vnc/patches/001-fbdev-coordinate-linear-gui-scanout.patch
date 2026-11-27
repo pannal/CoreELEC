@@ -1,0 +1,222 @@
+--- a/server.c
++++ b/server.c
+@@ -7,6 +7,11 @@
+ #include "input.h"
+ #include "updatescreen.h"
+ 
++#include <stddef.h>
++#include <netinet/tcp.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++
+ // State variables
+ int idle = 1;
+ int suspend = 0;
+@@ -32,6 +37,96 @@
+ #endif
+ int printVncDebug = 0;
+ 
++// Keep one local connection open while any FBDEV viewer has finished the RFB
++// handshake. Kodi replies after swapping a linear GUI frame.
++static const char kodiGuiSocket[] = "\0kodi.aml-vnc.fb0.v1";
++static int kodiGuiFd = -1;
++static int kodiGuiReady = 0;
++static uint64_t kodiGuiRetry = 0;
++static uint64_t kodiGuiDeadline = 0;
++static uint64_t kodiGuiReconnectDeadline = 0;
++
++static uint64_t monotonicUs(void) {
++	struct timespec now;
++	clock_gettime(CLOCK_MONOTONIC, &now);
++	return (uint64_t)now.tv_sec * 1000000ULL + now.tv_nsec / 1000ULL;
++}
++
++static void closeKodiGui(void) {
++	if (kodiGuiFd >= 0)
++		close(kodiGuiFd);
++	kodiGuiFd = -1;
++	kodiGuiReady = 0;
++}
++
++static void connectKodiGui(uint64_t now) {
++	struct sockaddr_un address = { .sun_family = AF_UNIX };
++	memcpy(address.sun_path, kodiGuiSocket, sizeof(kodiGuiSocket));
++	socklen_t length = offsetof(struct sockaddr_un, sun_path) + sizeof(kodiGuiSocket) - 1;
++	int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
++	if (fd < 0)
++		return;
++
++	struct ucred credentials;
++	socklen_t credentialLength = sizeof(credentials);
++	if (connect(fd, (const struct sockaddr*)&address, length) < 0 ||
++	    getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credentials, &credentialLength) < 0 ||
++	    credentials.uid != geteuid()) {
++		close(fd);
++		return;
++	}
++
++	kodiGuiFd = fd;
++	kodiGuiDeadline = now + 2000000ULL;
++	kodiGuiReconnectDeadline = 0;
++}
++
++enum kodiGuiState { GUI_CAPTURE, GUI_WAIT, GUI_REFRESH };
++
++static enum kodiGuiState pollKodiGui(uint64_t now) {
++	if (kodiGuiFd < 0 && now >= kodiGuiRetry) {
++		kodiGuiRetry = now + 250000ULL;
++		connectKodiGui(now);
++	}
++	if (kodiGuiFd < 0)
++		return now < kodiGuiReconnectDeadline ? GUI_WAIT : GUI_CAPTURE;
++
++	char reply;
++	ssize_t received = recv(kodiGuiFd, &reply, 1, 0);
++	if (received == 1 && reply == 'R' && !kodiGuiReady) {
++		kodiGuiReady = 1;
++		return GUI_REFRESH;
++	} else if (received >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
++		closeKodiGui();
++		kodiGuiReconnectDeadline = now + 2000000ULL;
++		return GUI_WAIT;
++	}
++	// Keep trying for a fresh frame, but allow ordinary FBDEV capture if the
++	// GUI cannot render for an extended period (for example, in standby).
++	return !kodiGuiReady && now < kodiGuiDeadline ? GUI_WAIT : GUI_CAPTURE;
++}
++
++static void processFbdevInput(long usec) {
++	// This server runs LibVNCServer in the foreground. Separate input from
++	// rfbUpdateClient so disconnects and authentication still run during the
++	// wait and no queued framebuffer request can overtake the first capture.
++	rfbCheckFds(vncScreen, usec);
++	rfbHttpCheckFds(vncScreen);
++	for (rfbClientPtr client = vncScreen->clientHead, next; client; client = next) {
++		next = client->next;
++		if (client->sock == RFB_INVALID_SOCKET)
++			rfbClientConnectionGone(client);
++	}
++}
++
++static int hasFbdevViewer(void) {
++	for (rfbClientPtr client = vncScreen->clientHead; client; client = client->next) {
++		if (client->state == RFB_NORMAL && !client->onHold)
++			return 1;
++	}
++	return 0;
++}
++
+ void clientDisconnect(rfbClientPtr cl) {
+ 	if (!printVncDebug)
+ 		LOG(" [%d] Client disconnected.\n", (int)(intptr_t)cl->clientData);
+@@ -42,6 +137,14 @@
+ 	if (!printVncDebug)
+ 		LOG(" [%d] Client connected from %s.\n", (int)(intptr_t)cl->clientData, cl->host);
+ 	cl->clientGoneHook = clientDisconnect;
++	if (activeBackend == BACKEND_FBDEV) {
++		// Recover the GUI path when a viewer vanishes without closing TCP.
++		const int enable = 1, idleSeconds = 30, intervalSeconds = 10, probes = 3;
++		setsockopt(cl->sock, IPPROTO_TCP, TCP_KEEPIDLE, &idleSeconds, sizeof(idleSeconds));
++		setsockopt(cl->sock, IPPROTO_TCP, TCP_KEEPINTVL, &intervalSeconds, sizeof(intervalSeconds));
++		setsockopt(cl->sock, IPPROTO_TCP, TCP_KEEPCNT, &probes, sizeof(probes));
++		setsockopt(cl->sock, SOL_SOCKET, SO_KEEPALIVE, &enable, sizeof(enable));
++	}
+ 	return RFB_CLIENT_ACCEPT;
+ }
+ 
+@@ -172,6 +275,9 @@
+ 
+ void serverStateChange(int state) {
+ 	if (state == SERVER_STOP || state == SERVER_REINIT) {
++		closeKodiGui();
++		kodiGuiRetry = 0;
++		kodiGuiReconnectDeadline = 0;
+ 		rfbShutdownServer(vncScreen, TRUE);
+ 		free(vncScreen->frameBuffer);
+ 		rfbScreenCleanup(vncScreen);
+@@ -196,7 +302,6 @@
+ }
+ 
+ int main(int argc, char **argv) {
+-	struct timespec tsNow;
+ 	uint64_t timeLimit, timeLast, timeNow;
+ 	char header[128];
+ 	int i;
+@@ -303,13 +408,33 @@
+ 
+ 	// Start the update loop
+ 	while (updateLoop) {
+-		rfbProcessEvents(vncScreen, vncScreen->deferUpdateTime * 1000);
++		long usec = vncScreen->deferUpdateTime * 1000;
++		int fbdev = activeBackend == BACKEND_FBDEV;
++		if (fbdev)
++			processFbdevInput(usec);
++		else
++			rfbProcessEvents(vncScreen, usec);
++
++		enum kodiGuiState gui = GUI_CAPTURE;
++		int viewer = fbdev && hasFbdevViewer();
++		if (viewer) {
++			gui = pollKodiGui(monotonicUs());
++		} else if (fbdev) {
++			closeKodiGui();
++			kodiGuiRetry = 0;
++			kodiGuiReconnectDeadline = 0;
++		}
+ 
++		// Refresh the FBDEV dimensions and visible page after any swap reply.
+ 		if (!checkBufferStateChange()) {
++			if (fbdev && (!viewer || gui == GUI_WAIT))
++				continue;
++			if (gui == GUI_REFRESH)
++				updateScreenFull();
++
+ 			if (vncScreen->clientHead != NULL) {
+ 				// Ignore events if they arrive before the next frame expected
+-				clock_gettime(CLOCK_MONOTONIC, &tsNow);
+-				timeNow = (uint64_t)tsNow.tv_sec * 1000000ULL + tsNow.tv_nsec / 1000ULL;
++				timeNow = monotonicUs();
+ 
+ 				// When idle, it only updates every fourth frame
+ 				if (timeNow - timeLast >= (idle ? timeLimit * 4 : timeLimit)) {
+@@ -323,6 +448,12 @@
+ 					timeLast = timeNow;
+ 				}
+ 			}
++			if (fbdev) {
++				for (rfbClientPtr client = vncScreen->clientHead; client; client = client->next) {
++					if (client->state == RFB_NORMAL)
++						rfbUpdateClient(client);
++				}
++			}
+ 		} else {
+ 			LOG("-- Server reinitialization started --\n");
+ 			serverStateChange(SERVER_REINIT);
+--- a/updatescreen.c
++++ b/updatescreen.c
+@@ -7,6 +7,15 @@
+ rfbScreenInfoPtr vncScreen;
+ int blank;
+ 
++void updateScreenFull(void) {
++	const uint32_t *fb = readFrameBuffer();
++	for (size_t y = 0; y < screenInfo.height; y++) {
++		const uint32_t *row = fb + (screenInfo.start + y) * (screenInfo.stride / sizeof(*fb));
++		memcpy(vncBuffer + y * screenInfo.width, row, screenInfo.width * sizeof(*fb));
++	}
++	rfbMarkRectAsModified(vncScreen, 0, 0, screenInfo.width, screenInfo.height);
++}
++
+ void updateScreen(void) {
+ 	int x, y, xMin, yMin, xMax, yMax;
+ 	int slip, step, shift;
+--- a/updatescreen.h
++++ b/updatescreen.h
+@@ -15,6 +15,7 @@
+ extern rfbScreenInfoPtr vncScreen;
+ 
+ void updateScreen(void);
++void updateScreenFull(void);
+ void clearScreen(void);
+ 
+ #endif

@@ -1,0 +1,29 @@
+--- a/src/libbluray/bdj/java/java/awt/BDRootWindow.java
++++ b/src/libbluray/bdj/java/java/awt/BDRootWindow.java
+@@ -150,19 +150,25 @@
+         public RefreshTimerTask(BDRootWindow window) {
+             this.window = window;
+             this.changeCount = window.changeCount;
++            this.deadline = System.nanoTime() + MAX_DEFERRAL_NS;
+         }
+ 
+         public void run() {
+             synchronized (window) {
+-                if (this.changeCount == window.changeCount)
++                if (this.changeCount == window.changeCount || System.nanoTime() - deadline >= 0)
+                     window.sync();
+                 else
+                     this.changeCount = window.changeCount;
+             }
+         }
+ 
++        /* An Xlet that repaints continuously never leaves a quiet tick; bound
++         * the deferral from the start of the paint burst this task covers. */
++        private static final long MAX_DEFERRAL_NS = 100L * 1000L * 1000L;
++
+         private BDRootWindow window;
+         private int changeCount;
++        private final long deadline;
+     }
+ 
+     private void close() {

@@ -8,6 +8,7 @@ PKG_LICENSE="GPL2"
 PKG_SITE="http://zapping.sourceforge.net/ZVBI"
 PKG_URL="https://downloads.sourceforge.net/sourceforge/zapping/zvbi-${PKG_VERSION}.tar.bz2"
 PKG_DEPENDS_TARGET="toolchain libpng zlib"
+PKG_NEED_UNPACK="$(get_pkg_directory libpng)"
 PKG_LONGDESC="Library to provide functions to capture and decode VBI data."
 
 PKG_CONFIGURE_OPTS_TARGET="--disable-dvb \

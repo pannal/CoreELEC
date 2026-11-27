@@ -18,27 +18,24 @@ BT_CONFIG_PATH changed to "/lib/firmware/unisoc"
  create mode 100644 tools/hciattach_sprd.c
 
 diff --git a/Makefile.tools b/Makefile.tools
-index 4b513366f..1842e6285 100644
 --- a/Makefile.tools
 +++ b/Makefile.tools
-@@ -378,7 +378,8 @@ tools_hciattach_SOURCES = tools/hciattach.c tools/hciattach.h \
- 						tools/hciattach_ath3k.c \
+@@ -429,6 +429,7 @@
  						tools/hciattach_qualcomm.c \
  						tools/hciattach_intel.c \
 -						tools/hciattach_bcm43xx.c
 +						tools/hciattach_bcm43xx.c \
 +						tools/hciattach_sprd.c
  tools_hciattach_LDADD = lib/libbluetooth-internal.la
- 
+
  tools_hciconfig_SOURCES = tools/hciconfig.c
 diff --git a/tools/hciattach.c b/tools/hciattach.c
-index 276a4e56e..a3267a962 100644
 --- a/tools/hciattach.c
 +++ b/tools/hciattach.c
-@@ -38,20 +38,6 @@
- 
+@@ -39,20 +39,6 @@
+
  #include "hciattach.h"
- 
+
 -struct uart_t {
 -	char *type;
 -	int  m_id;
@@ -56,10 +53,12 @@ index 276a4e56e..a3267a962 100644
  #define FLOW_CTL	0x0001
  #define AMP_DEV		0x0002
  #define ENABLE_PM	1
-@@ -266,6 +252,19 @@ static int bcm43xx(int fd, struct uart_t *u, struct termios *ti)
+@@ -270,6 +256,19 @@
+ static int bcm43xx(int fd, struct uart_t *u, struct termios *ti)
+ {
  	return bcm43xx_init(fd, u->init_speed, u->speed, ti, u->bdaddr);
- }
- 
++}
++
 +/* add sprd init and post function */
 +static int sprd_init(int fd, struct uart_t *u, struct termios *ti)
 +{
@@ -71,29 +70,26 @@ index 276a4e56e..a3267a962 100644
 +{
 +	fprintf(stderr, "SPRD Bluetooth post process\n");
 +	return sprd_config_post(fd, u, ti);
-+}
-+
+ }
+
  static int read_check(int fd, void *buf, int count)
- {
- 	int res;
-@@ -1097,6 +1096,9 @@ struct uart_t uart[] = {
+@@ -1107,6 +1106,9 @@
  	{ "amp",	0x0000, 0x0000, HCI_UART_H4, 115200, 115200,
  			AMP_DEV, DISABLE_PM, NULL, NULL, NULL },
- 
+
 +	/* Bluetooth chip (UWE5622)*/
-+	{  "sprd",      0x0000, 0x0000, NULL, 115200, 1500000,
++	{  "sprd",      0x0000, 0x0000, HCI_UART_H4, 115200, 1500000,
 +			FLOW_CTL, DISABLE_PM, NULL, sprd_init, sprd_post},
  	{ NULL, 0 }
  };
- 
+
 diff --git a/tools/hciattach.h b/tools/hciattach.h
-index 26c0d5424..69bc0ccef 100644
 --- a/tools/hciattach.h
 +++ b/tools/hciattach.h
-@@ -40,6 +40,20 @@
- #define HCI_UART_EXT_CONFIG	4
- #define HCI_UART_VND_DETECT	5
- 
+@@ -44,6 +44,20 @@
+ #define FIRMWARE_DIR "/etc/firmware"
+ #endif
+
 +struct uart_t {
 +	char *type;
 +	int  m_id;
@@ -111,7 +107,7 @@ index 26c0d5424..69bc0ccef 100644
  int read_hci_event(int fd, unsigned char *buf, int size);
  int set_speed(int fd, struct termios *ti, int speed);
  int uart_speed(int speed);
-@@ -56,3 +70,7 @@ int qualcomm_init(int fd, int speed, struct termios *ti, const char *bdaddr);
+@@ -61,3 +75,7 @@
  int intel_init(int fd, int init_speed, int *speed, struct termios *ti);
  int bcm43xx_init(int fd, int def_speed, int speed, struct termios *ti,
  		const char *bdaddr);
@@ -121,10 +117,9 @@ index 26c0d5424..69bc0ccef 100644
 +int sprd_config_post(int fd, struct uart_t *u, struct termios *ti);
 diff --git a/tools/hciattach_sprd.c b/tools/hciattach_sprd.c
 new file mode 100644
-index 000000000..12b4795de
 --- /dev/null
 +++ b/tools/hciattach_sprd.c
-@@ -0,0 +1,832 @@
+@@ -0,0 +1,833 @@
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <unistd.h>
@@ -136,8 +131,9 @@ index 000000000..12b4795de
 +#include <stdint.h>
 +#include <sys/termios.h>
 +#include <sys/ioctl.h>
++#include <sys/uio.h>
 +#include <limits.h>
-+#include "lib/bluetooth.h"
++#include "bluetooth/bluetooth.h"
 +#include "hciattach.h"
 +
 +/******************************************************************************
@@ -957,6 +953,4 @@ index 000000000..12b4795de
 +	SPRD_DBG("Done setting line discpline");
 +	return 0;
 +}
--- 
-2.30.2
 

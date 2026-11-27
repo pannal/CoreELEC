@@ -1,0 +1,32 @@
+From 69b1632efa81946e0d53e8518e071b29a014fba5 Mon Sep 17 00:00:00 2001
+From: SamuriHL <samurihl@msn.com>
+Date: Sun, 19 Jul 2026 13:35:25 -0400
+Subject: [PATCH] bdj: fall back to default jar search when LIBBLURAY_CP has no
+ matching jar
+
+---
+ src/libbluray/bdj/bdj.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/libbluray/bdj/bdj.c b/src/libbluray/bdj/bdj.c
+index 359bc8f..e58fa4d 100644
+--- a/src/libbluray/bdj/bdj.c
++++ b/src/libbluray/bdj/bdj.c
+@@ -575,11 +575,11 @@ static char *_find_libbluray_jar0()
+         }
+ 
+         X_FREE(jar);
+-        BD_DEBUG(DBG_BDJ | DBG_CRIT, "invalid LIBBLURAY_CP %s\n", classpath);
+-        return NULL;
++        BD_DEBUG(DBG_BDJ | DBG_CRIT,
++                 "invalid LIBBLURAY_CP %s, falling back to default search\n", classpath);
+     }
+ 
+-    BD_DEBUG(DBG_BDJ, "LIBBLURAY_CP not set, searching for "BDJ_JARFILE" ...\n");
++    BD_DEBUG(DBG_BDJ, "searching for "BDJ_JARFILE" ...\n");
+ 
+     // check directory where libbluray.so was loaded from
+     const char *lib_path = dl_get_path();
+-- 
+2.43.0
+

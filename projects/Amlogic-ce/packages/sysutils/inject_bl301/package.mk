@@ -3,7 +3,6 @@
 
 PKG_NAME="inject_bl301"
 PKG_VERSION="cdaff43a6dc6b44381959bab27b687d6c922b1a0"
-PKG_SHA256="65c3c86fe0068c195de6b0afd2791a479ebd4f563317b553cbeaa9326189f3ec"
 PKG_SOURCE_NAME="$PKG_NAME-$ARCH-$PKG_VERSION.tar.xz"
 PKG_LICENSE="proprietary"
 PKG_SITE="https://coreelec.org"
@@ -11,6 +10,15 @@ PKG_URL="https://sources.coreelec.org/$PKG_SOURCE_NAME"
 PKG_DEPENDS_TARGET="toolchain bl301_xxxxxx bl301_221119 bl301_091020"
 PKG_LONGDESC="Tool to inject bootloader blob BL301.bin on internal eMMC"
 PKG_TOOLCHAIN="manual"
+
+case "${ARCH}" in
+  arm)
+    PKG_SHA256="65c3c86fe0068c195de6b0afd2791a479ebd4f563317b553cbeaa9326189f3ec"
+    ;;
+  aarch64)
+    PKG_SHA256="607be0ec8e0d931803a3c452bae6beccaedb443a1f51177981e14d792c435778"
+    ;;
+esac
 
 pre_make_target() {
   cp -av ${PKG_DIR}/config/bl301.conf ${PKG_BUILD}/bl301.conf

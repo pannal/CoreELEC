@@ -13,10 +13,10 @@
 # ABI-incompatible stock one.
 
 PKG_NAME="inputstream.adaptive"
-PKG_VERSION="21.5.18-Omega"
-PKG_SHA256="a62ef86fc616c37ff7fa53ff7dfe2a73ee21f48af306a9f82c5bb5fe05245dad"
-PKG_REV="2"
-PKG_ADDON_VERSION="666.21.5.18-p3i.1"
+PKG_VERSION="21.5.26-Omega"
+PKG_SHA256="c6fca33834d6bbba70766a0a1795cf75a6e6e3a1836e67a0bbae721df3de617e"
+PKG_REV="1"
+PKG_ADDON_VERSION="666.21.5.26-p3i.1"
 PKG_ARCH="any"
 PKG_LICENSE="GPL"
 PKG_SITE="https://github.com/xbmc/inputstream.adaptive"
@@ -30,9 +30,4 @@ PKG_IS_ADDON="yes"
 
 addon() {
   install_binary_addon ${PKG_ADDON_ID}
-
-  if [ "${ARCH}" = "aarch64" ]; then
-    mkdir -p ${ADDON_BUILD}/${PKG_ADDON_ID}
-    cp -P ${PKG_BUILD}/.${TARGET_NAME}/lib/cdm_aarch64/libcdm_aarch64_loader.so ${ADDON_BUILD}/${PKG_ADDON_ID}
-  fi
 }

@@ -1,0 +1,302 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: v-lix <280294695+v-lix@users.noreply.github.com>
+Date: Thu, 11 Sep 2026 00:00:00 +0000
+Subject: [PATCH] avcodec/dca_xll: recognise the remaining DTS:X extension
+ syncwords, and report which
+
+The DTS:X extension is named by the syncword at the dword-aligned end of the
+XLL band data. Upstream tests two values, and 0005 split the second so that
+0xF14000D1 reports plain DTS:X while only 0xF14000D0 reports DTS:X IMAX. Three
+further values - 0xF14000D2, 0xF14000D3 and 0xF14000D4 - match neither test,
+so a stream carrying any of them falls through and is reported as ordinary
+DTS-HD MA. Kodi builds its label from that profile, so those streams arrive
+with no DTS:X label at all.
+
+MediaInfoLib already sorts the whole family the way this patch does. Its
+File_Dts::Extensions2() sets presence_Extended_X for 0x02000850 and for
+0xF14000D1 through 0xF14000D4, and only 0xF14000D0 additionally sets
+presence_Extended_IMAX. That list, D2 included, was written by the same author
+whose earlier reverse engineering 0005 rests on:
+
+  MediaArea/MediaInfoLib#2653, which adds
+    case 0x02000850: case 0xF14000D1: case 0xF14000D2:
+    case 0xF14000D3: case 0xF14000D4:
+        Presence.set(presence_Extended_X);
+  https://github.com/MediaArea/MediaInfoLib/blob/master/Source/MediaInfo/Audio/File_Dts.cpp
+  https://github.com/MediaArea/MediaInfo/issues/717
+  https://github.com/MediaArea/MediaInfo/issues/823
+
+This patch takes the three it treats as plain DTS:X that 0005 did not reach,
+and puts them in the branch 0005 put 0xF14000D1 in.
+
+0xF14000D4 was confirmed against DTS:X Pro samples besides: it appears exactly
+once per XLL frame, dword-aligned where this code already looks, and the
+CRC-protected envelope behind it decodes as five objects over the 7.1 bed and
+four fixed heights. Built against ffmpeg 8.1.2 with 0005 and this patch
+applied in order, ffprobe reports those samples as "DTS-HD MA + DTS:X" where
+it reported "DTS-HD MA" before. No sample was available for 0xF14000D2 or
+0xF14000D3; they rest on the classification above, as 0xF14000D1 did.
+
+Like the rest of the DTS:X detection here, this is reverse engineering rather
+than specification, and carries the same false-positive risk as the syncwords
+already listed.
+
+Reporting which one is the other half. Collapsing all five into one boolean
+throws away the only thing in the stream that says how many objects it
+declares. The syncword is not an opaque marker: 0xF14000Dn is the first four
+bytes of the type-241 object metadata element, and after that element's 28-bit
+fixed header the next four bits are its declaration count minus one - which is
+the low nibble of the last byte. So the marker states the count by construction
+rather than by correlation: D0 one object, D1 two, D2 three, D3 four, D4 five.
+
+Two IMAX Enhanced streams confirm the D0 end of it. Both parse with a
+declaration count of one: the five-feed form carries that object alone, and the
+seven-feed form carries it as three contributions to the compatible bed's C, L
+and R. The older 0x02000850 form has no such nibble and declares no objects.
+
+The nibble is reported in the level, and the profile is left exactly as it was.
+A profile per object count would mint a codec identity for what is a property
+of one: DTS:X with two objects and DTS:X with five are the same codec, and
+every consumer that enumerates the DTS-HD MA family by hand - passthrough
+routing, stream naming, codec selection - would have to learn each new value or
+quietly mishandle the stream. The level costs none of that. Nothing in the DCA
+decoder writes it, avcodec_parameters_from_context() already copies it beside
+the profile, and it arrives wherever the profile arrives, so an existing caller
+needs no new plumbing and an uninterested one sees no change at all.
+
+It is passed on as transmitted, the nibble rather than a count, so that the
+decoder reports what the stream said and the reading of it stays with whoever
+asked. Only the 0xF14000Dn family is recorded for it: 0x02000850 is not an
+object metadata element and its last byte is not a count, so a stream carrying
+that form leaves the level at the AV_LEVEL_UNKNOWN it started at. That is how a
+stream which said nothing about objects is told from D0's declaration of one,
+and it is very nearly every DTS:X release in the wild.
+
+The syncword's lifetime is the decoder context's, and matching the two present
+flags beside it is the point. Those are set once and never cleared, so the
+profile describes every frame the context has seen rather than the frame in
+hand; the level now says the same thing about the same frames. Clearing it on a
+flush instead would empty the count on a seek while the profile went on saying
+DTS:X. The cost of the parity is a context that reads D0 through D4 and then
+the older form, which keeps the last count it was given - and keeps saying
+DTS:X for it, on the same terms, as it already did before this patch.
+
+The count is not the whole shape of the presentation, though. Every form seen
+puts the four heights over its bed but one: D0 also marks a 5.1 variant with a
+single object and no heights at all, which a declaration count of one cannot
+tell from the 7.1 D0 form beside it. The element says which itself. Its
+payload opens with a CRC-protected prefix that ends in a byte naming the
+channel sets that follow - bit 0 the object set, always present, bit 1 the
+height quartet - and then the constant tail 34 38 8c 4f 00. So 03 is objects
+and heights, and 01 objects alone.
+
+ff_dca_x_height_flags() reads that byte the way harletty-bridge, whose decoder
+established the reading and renders both variants, finds it: 16 to 96 bytes
+in, followed by the tail, with a zero CRC16-CCITT remainder over everything
+before it, and a second candidate taken as no answer rather than a guess. It
+costs one CRC over at most 96 bytes of a frame already in memory, and decodes
+nothing. It lives in dca.c, which the decoder and the parser both link, so the
+HRA patch can use it as well.
+
+What it finds goes above the nibble, in the same level: DCA_X_LEVEL_SETS_READ
+(0x10) says the byte was read, and DCA_X_LEVEL_HEIGHTS (0x20) that the quartet
+follows. With the first clear nothing was read and nothing is said, so a caller
+can tell "no heights" from "not known" and leave the heights out rather than
+invent them. The flags last as long as the syncword, for the same reason, and a
+frame whose byte cannot be read keeps what an earlier one said. The 0x02000850
+form is no such element and is left exactly as it was.
+
+The same field is where a later patch can report which layout an Auro-3D
+carrier unfolds to, for the same reason and without disturbing anything here:
+the profile says which codec, the level says which variant of it.
+
+Applied in order against ffmpeg 8.1.2, 0005, this patch and the Auro-3D patch
+all apply with no rejects.
+---
+ libavcodec/dca.c           | 30 +++++++++++++++++++
+ libavcodec/dca.h           | 24 ++++++++++++++++
+ libavcodec/dca_syncwords.h |  3 ++
+ libavcodec/dca_xll.c       | 59 +++++++++++++++++++++++++++++++++++++-
+ libavcodec/dca_xll.h       |  2 ++
+ 5 files changed, 117 insertions(+), 1 deletion(-)
+
+diff --git a/libavcodec/dca.c b/libavcodec/dca.c
+--- a/libavcodec/dca.c
++++ b/libavcodec/dca.c
+@@ -25,6 +25,7 @@
+ #include <stdint.h>
+ #include <string.h>
+ 
++#include "libavutil/crc.h"
+ #include "libavutil/error.h"
+ 
+ #include "dca.h"
+@@ -155,3 +156,32 @@ int avpriv_dca_parse_core_frame_header(DCACoreFrameHeader *h, const uint8_t *buf
+ 
+     return 0;
+ }
++
++int ff_dca_x_height_flags(const uint8_t *payload, int size)
++{
++    static const uint8_t tail[] = { 0x34, 0x38, 0x8c, 0x4f, 0x00 };
++    const AVCRC *crc = av_crc_get_table(AV_CRC_16_CCITT);
++    int found = -1;
++
++    /* The same search harletty-bridge, which established this reading, makes:
++     * the set byte somewhere from 16 to 96 bytes in (the shortest prefix seen
++     * is the object-only form's 20), followed by the tail, with a zero CRC
++     * remainder over everything before it - so a stray tail in coded data is
++     * not enough. A second match leaves the boundary ambiguous, and that is
++     * read as nothing. */
++    for (int pos = 16; pos < FFMIN(size, 96) && pos + 1 + (int)sizeof(tail) <= size; pos++) {
++        int sets = payload[pos];
++
++        if ((sets & ~3) || !(sets & 1) ||
++            memcmp(payload + pos + 1, tail, sizeof(tail)) ||
++            av_crc(crc, 0xffff, payload, pos))
++            continue;
++        if (found >= 0)
++            return 0;
++        found = sets;
++    }
++
++    if (found < 0)
++        return 0;
++    return DCA_X_LEVEL_SETS_READ | (found & 2 ? DCA_X_LEVEL_HEIGHTS : 0);
++}
+diff --git a/libavcodec/dca.h b/libavcodec/dca.h
+--- a/libavcodec/dca.h
++++ b/libavcodec/dca.h
+@@ -223,4 +223,28 @@ int avpriv_dca_parse_core_frame_header(DCACoreFrameHeader *h, const uint8_t *buf
+  */
+ int ff_dca_parse_core_frame_header(DCACoreFrameHeader *h, GetBitContext *gb);
+ 
++/**
++ * What an alternate-profile DTS:X payload says about the channel sets it
++ * carries, reported in the level beside the object count.
++ *
++ * The 0xF14000Dn element opens a CRC-protected prefix that ends in a byte
++ * naming the channel sets which follow, then the constant tail
++ * 34 38 8c 4f 00: bit 0 is the object set, always present, and bit 1 the
++ * height quartet. Every form seen carries both but one, 5.1 with a single
++ * object and no heights at all, and the declaration count cannot tell that
++ * form from the 7.1.4 one beside it.
++ */
++#define DCA_X_LEVEL_SETS_READ 0x10 ///< the channel-set byte was read
++#define DCA_X_LEVEL_HEIGHTS   0x20 ///< the height quartet follows
++
++/**
++ * Read the channel-set byte of an alternate-profile DTS:X payload.
++ * @param payload the payload, starting at its 0xF14000Dn syncword
++ * @param size    bytes available from there
++ * @return DCA_X_LEVEL_SETS_READ, with DCA_X_LEVEL_HEIGHTS when the height
++ *         quartet follows; 0 when no single protected prefix is found, which
++ *         says nothing either way
++ */
++int ff_dca_x_height_flags(const uint8_t *payload, int size);
++
+ #endif /* AVCODEC_DCA_H */
+diff --git a/libavcodec/dca_syncwords.h b/libavcodec/dca_syncwords.h
+--- a/libavcodec/dca_syncwords.h
++++ b/libavcodec/dca_syncwords.h
+@@ -35,6 +35,9 @@
+ 
+ #define    DCA_SYNCWORD_XLL_X_1              0x02000850U
+ #define    DCA_SYNCWORD_XLL_X_2              0xF14000D1U
++#define    DCA_SYNCWORD_XLL_X_3              0xF14000D2U
++#define    DCA_SYNCWORD_XLL_X_4              0xF14000D3U
++#define    DCA_SYNCWORD_XLL_X_5              0xF14000D4U
+ #define    DCA_SYNCWORD_XLL_X_IMAX           0xF14000D0U
+ 
+ #endif /* AVCODEC_DCA_SYNCWORDS_H */
+diff --git a/libavcodec/dca_xll.c b/libavcodec/dca_xll.c
+--- a/libavcodec/dca_xll.c
++++ b/libavcodec/dca_xll.c
+@@ -1073,10 +1073,28 @@ static int parse_frame(DCAXllDecoder *s, const uint8_t *data, int size, DCAExssA
+ 
+         extradata_syncword = show_bits_long(&s->gb, 32);
+ 
+-        if (extradata_syncword == DCA_SYNCWORD_XLL_X_1 || extradata_syncword == DCA_SYNCWORD_XLL_X_2) {
++        if (extradata_syncword == DCA_SYNCWORD_XLL_X_1 || extradata_syncword == DCA_SYNCWORD_XLL_X_2 ||
++            extradata_syncword == DCA_SYNCWORD_XLL_X_3 || extradata_syncword == DCA_SYNCWORD_XLL_X_4 ||
++            extradata_syncword == DCA_SYNCWORD_XLL_X_5) {
+             s->x_syncword_present = 1;
++            /* All but 0x02000850 are the head of an object metadata element,
++             * and only those carry an object count in their last byte. */
++            if (extradata_syncword != DCA_SYNCWORD_XLL_X_1)
++                s->x_object_syncword = extradata_syncword;
+         } else if (extradata_syncword == DCA_SYNCWORD_XLL_X_IMAX) {
+             s->x_imax_syncword_present = 1;
++            s->x_object_syncword = extradata_syncword;
++        }
++
++        /* That element's payload runs from its syncword to the end of the
++         * frame, and names the channel sets it carries. A frame whose byte
++         * cannot be read keeps what an earlier one said. */
++        if (s->x_object_syncword && s->x_object_syncword == extradata_syncword) {
++            int start = get_bits_count(&s->gb) >> 3;
++            int flags = ff_dca_x_height_flags(data + start, FFMIN(size, s->frame_size) - start);
++
++            if (flags)
++                s->x_height_flags = flags;
+         }
+     }
+ 
+@@ -1464,6 +1482,45 @@ int ff_dca_xll_filter_frame(DCAXllDecoder *s, AVFrame *frame)
+         avctx->profile = AV_PROFILE_DTS_HD_MA;
+     }
+ 
++    /* How many objects the stream declared, reported in the level. The profile
++     * names the codec and nothing more; this says which variant of it, and a
++     * caller needs both.
++     *
++     * 0xF14000Dn is the first four bytes of the type-241 object metadata
++     * element, and the low nibble of that last byte is the element's
++     * declaration count minus one - so the nibble states how many objects the
++     * stream declares, less one. It is passed on as transmitted rather than as
++     * a count, because the field's job is to carry what the stream said and
++     * leave the reading of it to whoever asked.
++     *
++     * The level carries it because it is already there: nothing in the DCA
++     * decoder writes it, avcodec_parameters_from_context() already copies it
++     * beside the profile, and a caller already receives it. A profile per
++     * object count would instead mint a codec identity for what is a property
++     * of one, and every consumer that enumerates the DTS-HD MA family by hand
++     * would have to learn all of them or quietly mishandle the stream.
++     *
++     * The 0x02000850 form is no such element and was not recorded above, so it
++     * leaves the level at the AV_LEVEL_UNKNOWN it started at. That is how a
++     * stream which said nothing about objects is told from D0's declaration of
++     * one, and it is very nearly every DTS:X release in the wild.
++     *
++     * Its lifetime is the context's, deliberately: the syncword is kept once
++     * seen and survives a flush, exactly as the two present flags above it do.
++     * So the level and the profile always describe the same set of frames -
++     * neither goes stale before the other, and a seek does not empty the count
++     * while the profile still says DTS:X. The one cost is a context that reads
++     * D0 through D4 and then the older form, which keeps the last count it was
++     * given; the profile keeps saying DTS:X on the same terms.
++     *
++     * Above the nibble go the DCA_X_LEVEL_* flags, which say whether the
++     * element carries the height quartet. Only the element's payload says so:
++     * D0 is both 5.1 with a single object and no heights, and 7.1.4 with one.
++     * With DCA_X_LEVEL_SETS_READ clear, nothing was read and nothing is said.
++     * The flags live as long as the syncword, and for the same reasons. */
++    if (s->x_object_syncword)
++        avctx->level = (s->x_object_syncword & 0x0F) | s->x_height_flags;
++
+     avctx->bits_per_raw_sample = p->storage_bit_res;
+     avctx->bit_rate = 0;
+ 
+diff --git a/libavcodec/dca_xll.h b/libavcodec/dca_xll.h
+--- a/libavcodec/dca_xll.h
++++ b/libavcodec/dca_xll.h
+@@ -135,6 +135,8 @@ typedef struct DCAXllDecoder {
+ 
+     DCADSPContext   *dcadsp;
+ 
++    unsigned int x_object_syncword;   ///< The object metadata element's syncword, when one was seen
++    int    x_height_flags;            ///< DCA_X_LEVEL_* read from that element's payload, 0 until read
+     int    x_syncword_present;        ///< Syncword for extension data at end of frame (DTS:X) is present
+     int    x_imax_syncword_present;   ///< Syncword for extension data at end of frame (DTS:X IMAX) is present
+ 

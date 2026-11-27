@@ -17,15 +17,16 @@ hciattach_rome: do not override module internal MAC address
 hciattach_rome: force IBS to disabled in NVM
 hciattach_rome: display ROM and TLV info by default
 
+BlueZ 5.87 no longer ships android/Android.mk; retain only the Linux build changes.
+
 Signed-off-by: Gary Bisson <gary.bisson@boundarydevices.com>
 ---
  Makefile.tools         |    1 +
- android/Android.mk     |    1 +
  tools/hciattach.c      |   12 +
  tools/hciattach.h      |    1 +
  tools/hciattach_rome.c | 1872 ++++++++++++++++++++++++++++++++++++++++
  tools/hciattach_rome.h |  388 +++++++++
- 6 files changed, 2275 insertions(+)
+ 5 files changed, 2274 insertions(+)
  create mode 100644 tools/hciattach_rome.c
  create mode 100644 tools/hciattach_rome.h
 
@@ -41,18 +42,6 @@ index b7b422506..e0e995089 100644
  						tools/hciattach_qualcomm.c \
  						tools/hciattach_intel.c \
  						tools/hciattach_bcm43xx.c
-diff --git a/android/Android.mk b/android/Android.mk
-index 76a826b47..01599c04b 100644
---- a/android/Android.mk
-+++ b/android/Android.mk
-@@ -696,6 +696,7 @@ LOCAL_SRC_FILES := \
- 	bluez/tools/hciattach_ti.c \
- 	bluez/tools/hciattach_tialt.c \
- 	bluez/tools/hciattach_ath3k.c \
-+	bluez/tools/hciattach_rome.c \
- 	bluez/tools/hciattach_qualcomm.c \
- 	bluez/tools/hciattach_intel.c \
- 	bluez/tools/hciattach_bcm43xx.c \
 diff --git a/tools/hciattach.c b/tools/hciattach.c
 index fad176c9b..02a65c692 100644
 --- a/tools/hciattach.c
@@ -107,7 +96,7 @@ new file mode 100644
 index 000000000..9a7f222c4
 --- /dev/null
 +++ b/tools/hciattach_rome.c
-@@ -0,0 +1,1872 @@
+@@ -0,0 +1,1873 @@
 +/*
 + *
 + *  Copyright (c) 2013-2015, The Linux Foundation. All rights reserved.
@@ -939,7 +928,8 @@ index 000000000..9a7f222c4
 +	char *line = NULL;
 +	char *pch = NULL;
 +	char param_str[20];
-+	int bytes_read = 0, position;
++	size_t bytes_read = 0;
++	int position;
 +	int ret = -1;
 +
 +	if (!file_path || !param) {

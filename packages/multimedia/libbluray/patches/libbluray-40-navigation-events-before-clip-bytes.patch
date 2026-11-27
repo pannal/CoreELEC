@@ -1,0 +1,89 @@
+From: pannal <1359593+pannal@users.noreply.github.com>
+Subject: [PATCH] Deliver navigation boundary events before new clip bytes
+
+Kodi associates demux packet positions with the timeline active when the bytes
+were read. _open_m2ts queues UO events before PLAYITEM, so returning new bytes
+alongside only the first event exposes them before the timeline is updated.
+Split navigation reads at normal and angle boundaries, while preserving
+bd_read behavior. _read_ext drains queued events before reading again.
+
+--- a/src/libbluray/bluray.c
++++ b/src/libbluray/bluray.c
+@@ -2031,7 +2031,7 @@
+     return bd->s_pos;
+ }
+ 
+-static int _bd_read(BLURAY *bd, unsigned char *buf, int len)
++static int _bd_read(BLURAY *bd, unsigned char *buf, int len, int stop_at_boundary)
+ {
+     BD_STREAM *st = &bd->st0;
+     int out_len = 0;
+@@ -2044,6 +2044,10 @@
+             clip_pkt = SPN(st->clip_pos);
+             if (bd->seamless_angle_change) {
+                 if (clip_pkt >= bd->angle_change_pkt) {
++                    /* Do not mix old bytes with a new navigation state. */
++                    if (stop_at_boundary && out_len) {
++                        return out_len;
++                    }
+                     if (clip_pkt >= st->clip->end_pkt) {
+                         st->clip = nav_next_clip(bd->title, st->clip);
+                         if (!_open_m2ts(bd, st)) {
+@@ -2055,6 +2059,9 @@
+                         _clip_seek_time(bd, bd->angle_change_time);
+                     }
+                     bd->seamless_angle_change = 0;
++                    if (stop_at_boundary) {
++                        return 0;
++                    }
+                 } else {
+                     uint64_t angle_pos;
+ 
+@@ -2103,6 +2110,11 @@
+                         _queue_event(bd, BD_EVENT_DISCONTINUITY, st->clip->in_time);
+                     }
+ 
++                    /* _open_m2ts may queue UO changes before PLAYITEM. Let
++                     * bd_read_ext deliver all events before the new bytes. */
++                    if (stop_at_boundary) {
++                        return 0;
++                    }
+                 }
+ 
+                 int r = _read_block(bd, st, bd->int_buf);
+@@ -2172,7 +2184,7 @@
+         return out_len;
+ }
+ 
+-static int _bd_read_locked(BLURAY *bd, unsigned char *buf, int len)
++static int _bd_read_locked(BLURAY *bd, unsigned char *buf, int len, int stop_at_boundary)
+ {
+     BD_STREAM *st = &bd->st0;
+     int r;
+@@ -2192,7 +2204,7 @@
+ 
+     BD_DEBUG(DBG_STREAM, "Reading [%d bytes] at %" PRIu64 "...\n", len, bd->s_pos);
+ 
+-    r = _bd_read(bd, buf, len);
++    r = _bd_read(bd, buf, len, stop_at_boundary);
+ 
+     /* mark tracking */
+     if (bd->next_mark >= 0 && bd->s_pos > bd->next_mark_pos) {
+@@ -2207,7 +2219,7 @@
+     int result;
+ 
+     bd_mutex_lock(&bd->mutex);
+-    result = _bd_read_locked(bd, buf, len);
++    result = _bd_read_locked(bd, buf, len, 0);
+     bd_mutex_unlock(&bd->mutex);
+ 
+     return result;
+@@ -3904,7 +3916,7 @@
+         }
+     }
+ 
+-    int bytes = _bd_read_locked(bd, buf, len);
++    int bytes = _bd_read_locked(bd, buf, len, 1);
+ 
+     if (bytes == 0) {
+ 

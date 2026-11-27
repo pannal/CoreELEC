@@ -1,0 +1,123 @@
+Subject: [PATCH] wifi: Preserve CE firmware configuration and optional tuning
+
+Keep chip-specific configuration loading, explicit module overrides and
+the default-off profile. Retain the donor checksum-corruption fix. Clear
+profile-owned CPU masks on SDIO disable as well as PCIe, and preserve the
+CE sleep-off policy including an explicit manual zero.
+
+--- a/bcmdhd.101.10.591.x/dhd_config.c
++++ b/bcmdhd.101.10.591.x/dhd_config.c
+@@ -305,12 +305,9 @@
+ static void
+ dhd_conf_disable_slpauto(dhd_pub_t *dhd)
+ {
+-	uint chip = dhd->conf->chip;
+-
+-	if (chip == BCM43430_CHIP_ID || chip == BCM4345_CHIP_ID ||
+-			chip == BCM4356_CHIP_ID || chip == BCM4359_CHIP_ID) {
+-		dhd_slpauto = FALSE;
+-	}
++	/* Keep the tested CE policy, including explicit dhd_slpauto=0. */
++	(void)dhd;
++	dhd_slpauto = FALSE;
+ 	CONFIG_MSG("dhd_slpauto = %d\n", dhd_slpauto);
+ }
+ #endif
+@@ -1122,7 +1119,6 @@
+ #endif /* DYNAMIC_MAX_HDR_READ */
+ 		dhd_rxbound = 128;
+ #endif /* BCMSDIO */
+-#ifdef BCMPCIE
+ #if defined(SET_XPS_CPUS)
+ 		if (conf->xps_cpus) {
+ 			kfree(conf->xps_cpus);
+@@ -1135,6 +1131,7 @@
+ 			conf->rps_cpus = NULL;
+ 		}
+ #endif /* SET_RPS_CPUS */
++#ifdef BCMPCIE
+ 		conf->flow_ring_queue_threshold = 2048;
+ #endif /* BCMPCIE */
+ #ifdef DHDTCPACK_SUPPRESS
+@@ -1308,6 +1305,24 @@
+ 
+ }
+ 
++#ifdef DHD_TPUT_PATCH
++static void
++dhd_conf_set_p3i_tput_profile(dhd_pub_t *dhd)
++{
++	struct dhd_conf *conf = dhd->conf;
++
++	p3i_tput_active = -1;
++	if (conf->chip != BCM43752_CHIP_ID || conf->chiprev != 2)
++		return;
++
++	if (p3i_tput_profile >= 0) {
++		conf->tput_patch = p3i_tput_profile != 0;
++		dhd_conf_set_tput_patch(dhd);
++	}
++	p3i_tput_active = conf->tput_patch ? 1 : 0;
++}
++#endif
++
+ void
+ dhd_conf_set_path_params(dhd_pub_t *dhd)
+ {
+@@ -1323,6 +1338,7 @@
+ 
+ 	dhd_conf_read_config(dhd, info->conf_path);
+ #ifdef DHD_TPUT_PATCH
++	dhd_conf_set_p3i_tput_profile(dhd);
+ 	dhd_conf_dump_tput_patch(dhd);
+ #endif
+ }
+@@ -6238,7 +6254,7 @@
+ 			conf->chip == BCM43711_CHIP_ID || conf->chip == BCM4612_CHIP_ID ||
+ 			conf->chip == BCM4381_CHIP_ID || conf->chip == BCM4382_CHIP_ID ||
+ 			conf->chip == BCM4383_CHIP_ID) {
+-		conf->tput_patch = TRUE;
++		/* Keep the donor profile opt-in on CE. */
+ 		dhd_conf_set_tput_patch(dhd);
+ 	}
+ #endif
+--- a/bcmdhd.101.10.591.x/dhd_config.h
++++ b/bcmdhd.101.10.591.x/dhd_config.h
+@@ -26,7 +26,7 @@
+ #define FW_TYPE_MFG     6
+ 
+ #define FW_PATH_AUTO_SELECT 1
+-//#define CONFIG_PATH_AUTO_SELECT
++#define CONFIG_PATH_AUTO_SELECT
+ extern char firmware_path[MOD_PARAM_PATHLEN];
+ #ifdef RMMOD_POWER_DOWN_LATER
+ extern atomic_t exit_in_progress;
+@@ -40,6 +40,10 @@
+ #define TXGLOM_RECV_OFFSET 8
+ extern uint dhd_doflow;
+ extern uint dhd_slpauto;
++#ifdef DHD_TPUT_PATCH
++extern int p3i_tput_profile;
++extern int p3i_tput_active;
++#endif
+ #endif
+ 
+ #ifdef SET_FWNV_BY_MAC
+--- a/bcmdhd.101.10.591.x/dhd_linux.c
++++ b/bcmdhd.101.10.591.x/dhd_linux.c
+@@ -677,6 +677,15 @@
+ #else
+ uint dhd_console_ms = 0;
+ #endif /* DHD_DEBUG */
++
++#ifdef DHD_TPUT_PATCH
++int p3i_tput_profile = -1;
++module_param(p3i_tput_profile, int, 0444);
++MODULE_PARM_DESC(p3i_tput_profile, "BCM43752 rev 2 throughput profile: -1=config, 0=off, 1=on");
++int p3i_tput_active = -1;
++module_param(p3i_tput_active, int, 0444);
++MODULE_PARM_DESC(p3i_tput_active, "Effective throughput profile: -1=unsupported, 0=off, 1=on");
++#endif
+ 
+ uint dhd_slpauto = TRUE;
+ module_param(dhd_slpauto, uint, 0);

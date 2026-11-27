@@ -38,7 +38,10 @@ insmod_dovi_ne() {
     message "loading '${DOVI_KO}' module"
     modinfo ${DOVI_KO}
     if check_dovi_version ${DOVI_KO} 5 4 210; then
-      insmod ${DOVI_KO} && return 0
+      if insmod "${DOVI_KO}"; then
+        record_dovi_load dovi "${DOVI_KO}"
+        return 0
+      fi
     else
       cat > /tmp/dovi.message << 'EOF'
 [TITLE]CoreELEC Dolby Vision Media Playback[/TITLE]
@@ -91,6 +94,7 @@ load_dovi_ne() {
 
 cleanup_dovi_ne() {
   rmmod dovi 2>/dev/null
+  original_dovi_loaded || rm -f /run/dovi-loaded-path
   mountpoint -q /android/odm && umount /android/odm
   mountpoint -q /android/oem && umount /android/oem
   # unmount only if mounted from this script
@@ -98,27 +102,88 @@ cleanup_dovi_ne() {
     ls /dev/mapper/dynpart-* &>/dev/null && dmsetup remove /dev/mapper/dynpart-*
 }
 
-load_dovi_ng() {
-  mountpoint -q /android/vendor || mount -o ro /dev/vendor /android/vendor
-  for DOVI_KO in /storage/.config/dovi.ko \
-                 /flash/dovi.ko \
-                 /storage/dovi.ko \
-                 /android/vendor/lib/modules/dovi.ko \
-                 /android/vendor/lib/modules/dovi_vs10.ko \
-                ; do
-    if [ -f ${DOVI_KO} ]; then
-      message "loading '${DOVI_KO}' module"
-      modinfo ${DOVI_KO}
-      insmod  ${DOVI_KO} && return
-    fi
-  done
+original_dovi_loaded() {
+  [ -d /sys/module/dovi ]
+}
 
-  cleanup_dovi_ng
+# Records only successful insmod paths; prepared candidates are not load evidence.
+record_dovi_load() {
+  DOVI_LOAD_RECORD="/run/${1}-loaded-path"
+  if printf '%s\n' "${2}" > "${DOVI_LOAD_RECORD}.tmp"; then
+    mv -f "${DOVI_LOAD_RECORD}.tmp" "${DOVI_LOAD_RECORD}" || rm -f "${DOVI_LOAD_RECORD}.tmp"
+  else
+    rm -f "${DOVI_LOAD_RECORD}.tmp"
+  fi
+}
+
+load_dovi_ng() {
+  DOVI_VENDOR_OWNED=no
+  DOVI_ORIGINAL_LOADED=no
+  if original_dovi_loaded; then
+    DOVI_ORIGINAL_LOADED=yes
+  else
+    rm -f /run/dovi-loaded-path
+  fi
+  [ -d /sys/module/dovi5 ] || rm -f /run/dovi5-loaded-path
+  if [ "${DOVI_ORIGINAL_LOADED}" != yes ]; then
+    for DOVI_KO in /storage/.config/dovi.ko /flash/dovi.ko /storage/dovi.ko; do
+      if [ -f "${DOVI_KO}" ]; then
+        message "loading original dovi '${DOVI_KO}'"
+        if insmod "${DOVI_KO}"; then
+          record_dovi_load dovi "${DOVI_KO}"
+          DOVI_ORIGINAL_LOADED=yes
+          break
+        fi
+      fi
+    done
+  fi
+  if [ "${DOVI_ORIGINAL_LOADED}" != yes ]; then
+    if mountpoint -q /android/vendor; then
+      DOVI_VENDOR_READY=yes
+    elif [ -b /dev/vendor ] && mount -o ro /dev/vendor /android/vendor; then
+      DOVI_VENDOR_OWNED=yes
+      DOVI_VENDOR_READY=yes
+    else
+      DOVI_VENDOR_READY=no
+    fi
+    if [ "${DOVI_VENDOR_READY}" = yes ]; then
+      for DOVI_KO in /android/vendor/lib/modules/dovi.ko /android/vendor/lib/modules/dovi_vs10.ko; do
+        if [ -f "${DOVI_KO}" ] && insmod "${DOVI_KO}"; then
+          record_dovi_load dovi "${DOVI_KO}"
+          DOVI_ORIGINAL_LOADED=yes
+          break
+        fi
+      done
+    fi
+  fi
+  [ "${DOVI_VENDOR_OWNED}" = yes ] && umount /android/vendor
+  if [ "${DOVI_ORIGINAL_LOADED}" != yes ]; then
+    message "original dovi unavailable; optional dovi5 will not be loaded"
+    return 0
+  fi
+  if ! modprobe dv_compat_shim; then
+    message "dv_compat_shim unavailable; retaining original dovi"
+    return 0
+  fi
+  DOVI5_KO=$(/usr/lib/coreelec/dovi5-prepare validate-load)
+  if [ "$?" != 0 ] || [ -z "${DOVI5_KO}" ]; then
+    message "no validated dovi5 generation; retaining original dovi"
+    return 0
+  fi
+  if insmod "${DOVI5_KO}"; then
+    record_dovi_load dovi5 "${DOVI5_KO}"
+    message "loaded validated dovi5 '${DOVI5_KO}' alongside original dovi"
+  else
+    message "dovi5 load failed; retaining original dovi"
+  fi
+  return 0
 }
 
 cleanup_dovi_ng() {
+  rmmod dovi5 2>/dev/null
   rmmod dovi 2>/dev/null
-  mountpoint -q /android/vendor && umount /android/vendor
+  original_dovi_loaded || rm -f /run/dovi-loaded-path
+  [ -d /sys/module/dovi5 ] || rm -f /run/dovi5-loaded-path
 }
 
 message "run dovi '${1}' for ${COREELEC_DEVICE:8:2}"

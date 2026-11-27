@@ -10,7 +10,12 @@ PKG_SITE="http://www.kodi.tv"
 # Using local xbmc checkout for development
 PKG_URL="file://${ROOT}/sources/kodi/xbmc-local"
 PKG_SOURCE_NAME="xbmc-local"
-PKG_DEPENDS_TARGET="toolchain JsonSchemaBuilder:host TexturePacker:host Python3 zlib systemd lzo pcre swig:host libass curl fontconfig fribidi tinyxml tinyxml2 libjpeg-turbo freetype libcdio taglib libxml2 libxslt rapidjson sqlite ffmpeg crossguid libfmt lirc libfstrcmp flatbuffers:host flatbuffers libudfread spdlog obu_util libdovi skin.p3i.estuary"
+# omniphony brings the spatial audio engine, the decoder bridges and the helper
+# process that runs them, installed beside kodi.bin under /usr/lib/kodi/omniphony.
+# CDVDAudioCodecOmniphony looks for them there and leaves audio to the ordinary
+# decoders if they are absent, so nothing here depends on it at link time - it
+# is listed so a Kodi build pulls the payload into the image.
+PKG_DEPENDS_TARGET="toolchain JsonSchemaBuilder:host TexturePacker:host Python3 zlib systemd lzo pcre swig:host libass curl fontconfig fribidi tinyxml tinyxml2 libjpeg-turbo freetype libcdio taglib libxml2 libxslt rapidjson sqlite ffmpeg crossguid libfmt lirc libfstrcmp flatbuffers:host flatbuffers libudfread spdlog obu_util libdovi skin.p3i.estuary omniphony"
 PKG_DEPENDS_UNPACK="commons-lang3 commons-text groovy"
 PKG_DEPENDS_HOST="toolchain"
 PKG_LONGDESC="A free and open source cross-platform media player."
@@ -127,7 +132,7 @@ configure_package() {
   fi
 
   if [ "${KODI_BLURAY_SUPPORT}" = yes ]; then
-    PKG_DEPENDS_TARGET+=" libbluray"
+    PKG_DEPENDS_TARGET+=" libbluray bdj-runtime"
     KODI_BLURAY="-DENABLE_BLURAY=ON"
   else
     KODI_BLURAY="-DENABLE_BLURAY=OFF"
@@ -350,6 +355,26 @@ post_make_target() {
   done
 }
 
+# Install the add-on zip from the URL, or from the sources cache when the URL
+# is empty or the fetch fails
+install_remote_addon() {
+  local id="${1}" url="${2}"
+  local cache="${SOURCES}/${PKG_NAME}/addons/${id}.zip"
+
+  mkdir -p "$(dirname "${cache}")"
+  if [ -n "${url}" ] && curl -Lsf -o "${cache}.part" "${url}" && unzip -tq "${cache}.part" >/dev/null &&
+     unzip -l "${cache}.part" "${id}/addon.xml" >/dev/null; then
+    mv "${cache}.part" "${cache}"
+    echo "Fetched ${id}: ${url}"
+  else
+    rm -f "${cache}.part"
+    [ -f "${cache}" ] || die "Could not fetch ${id}, and the sources cache has no copy: ${cache}"
+    echo "WARNING: Could not fetch ${id}, using the cached copy: ${cache}"
+  fi
+  unzip -q -o "${cache}" -d ${INSTALL}/usr/share/kodi/addons/
+  [ -f "${INSTALL}/usr/share/kodi/addons/${id}/addon.xml" ] || die "${cache} does not contain ${id}/addon.xml"
+}
+
 post_makeinstall_target() {
   mkdir -p ${INSTALL}/.noinstall
     mv ${INSTALL}/usr/share/kodi/addons/skin.estuary \
@@ -422,54 +447,18 @@ post_makeinstall_target() {
     sed -e "s|@ADDON_REPO_NAME@|${ADDON_REPO_NAME}|g" -i ${INSTALL}/usr/share/kodi/addons/${ADDON_REPO_ID}/addon.xml
     sed -e "s|@ADDON_VERSION@|${ADDON_VERSION}|g" -i ${INSTALL}/usr/share/kodi/addons/${ADDON_REPO_ID}/addon.xml
 
-  # Download and install Don't Panic repository from official source
-  # Dynamically fetch the latest version from pm4k.eu
+  # The add-on manifest requires these add-ons, and Kodi does not start
+  # without them. Each build fetches the latest zip and keeps the zip in the
+  # sources cache, for a build while the host is down.
   DONTPANIC_FILE=$(curl -sL https://pm4k.eu | grep -oP 'repository\.dontpanic[^"]*\.zip' | head -1)
-  if [ -n "${DONTPANIC_FILE}" ]; then
-    DONTPANIC_URL="https://pm4k.eu/${DONTPANIC_FILE}"
-    DONTPANIC_ZIP="${BUILD}/repository.dontpanic.zip"
-    echo "Fetching Don't Panic repository: ${DONTPANIC_FILE}"
-    curl -Lsf -o "${DONTPANIC_ZIP}" "${DONTPANIC_URL}"
-    if [ -f "${DONTPANIC_ZIP}" ]; then
-      unzip -q "${DONTPANIC_ZIP}" -d ${INSTALL}/usr/share/kodi/addons/
-      rm -f "${DONTPANIC_ZIP}"
-    fi
-  else
-    echo "WARNING: Could not fetch Don't Panic repository from pm4k.eu"
-  fi
+  install_remote_addon repository.dontpanic "${DONTPANIC_FILE:+https://pm4k.eu/${DONTPANIC_FILE}}"
 
-  # Download and install p3i repository from official source
-  # Dynamically fetch the latest version from p3irepo.pm4k.eu
   P3I_FILE=$(curl -sL https://p3irepo.pm4k.eu | grep -oP 'repository\.p3i[^"]*\.zip' | head -1)
-  if [ -n "${P3I_FILE}" ]; then
-    P3I_URL="https://p3irepo.pm4k.eu/${P3I_FILE}"
-    P3I_ZIP="${BUILD}/repository.p3i.zip"
-    echo "Fetching p3i repository: ${P3I_FILE}"
-    curl -Lsf -o "${P3I_ZIP}" "${P3I_URL}"
-    if [ -f "${P3I_ZIP}" ]; then
-      unzip -q "${P3I_ZIP}" -d ${INSTALL}/usr/share/kodi/addons/
-      rm -f "${P3I_ZIP}"
-    fi
-  else
-    echo "WARNING: Could not fetch p3i repository from p3irepo.pm4k.eu"
-  fi
+  install_remote_addon repository.p3i "${P3I_FILE:+https://p3irepo.pm4k.eu/${P3I_FILE}}"
 
-  # Pre-install p3i seamless-branching helper service addon from p3i repo.
-  # Version is parsed from the repo's addons.xml so the latest zip is always picked.
+  # p3i seamless-branching helper service
   P3I_SB_VERSION=$(curl -sL https://p3irepo.pm4k.eu/omega/zips/addons.xml | grep -oP 'id="service\.p3i\.sb"[^>]*version="\K[^"]+' | head -1)
-  if [ -n "${P3I_SB_VERSION}" ]; then
-    P3I_SB_FILE="service.p3i.sb-${P3I_SB_VERSION}.zip"
-    P3I_SB_URL="https://p3irepo.pm4k.eu/omega/zips/service.p3i.sb/${P3I_SB_FILE}"
-    P3I_SB_ZIP="${BUILD}/service.p3i.sb.zip"
-    echo "Fetching service.p3i.sb: ${P3I_SB_FILE}"
-    curl -Lsf -o "${P3I_SB_ZIP}" "${P3I_SB_URL}"
-    if [ -f "${P3I_SB_ZIP}" ]; then
-      unzip -q "${P3I_SB_ZIP}" -d ${INSTALL}/usr/share/kodi/addons/
-      rm -f "${P3I_SB_ZIP}"
-    fi
-  else
-    echo "WARNING: Could not determine service.p3i.sb version from p3irepo.pm4k.eu"
-  fi
+  install_remote_addon service.p3i.sb "${P3I_SB_VERSION:+https://p3irepo.pm4k.eu/omega/zips/service.p3i.sb/service.p3i.sb-${P3I_SB_VERSION}.zip}"
 
   mkdir -p ${INSTALL}/usr/share/kodi/config
 

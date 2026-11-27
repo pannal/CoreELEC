@@ -1,0 +1,13 @@
+--- a/src/base/ftcalc.c
++++ b/src/base/ftcalc.c
+@@ -746,6 +746,10 @@
+ 
+   /* documentation is in ftcalc.h */
+ 
++  /* GCC 13 ARM SLP can emit a zero shift for the variable right shift below. */
++#if defined( __GNUC__ ) && !defined( __clang__ ) && defined( __arm__ )
++  __attribute__(( optimize( "no-tree-slp-vectorize" ) ))
++#endif
+   FT_BASE_DEF( FT_Bool )
+   FT_Matrix_Check( const FT_Matrix*  matrix )
+   {

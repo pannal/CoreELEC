@@ -69,10 +69,13 @@ case $display_mode in
   480*)            X=720  Y=480  ;;
   576*)            X=720  Y=576  ;;
   720p*)           X=1280 Y=720  ;;
-  2160p*)          X=3840 Y=2160 ;;
+  smpte*|4k2ksmpte)  X=4096 Y=2160 ;;
+  2160p*|4k2k*)      X=3840 Y=2160 ;;
   *)               X=1920 Y=1080 ;;
 esac
 
+output_width=$X
+output_height=$Y
 if [ "$native_4k_gui" != "1" -a $X -gt 1920 ]; then
   X=1920
   Y=1080
@@ -88,10 +91,10 @@ echo 1 > /sys/class/video/disable_video
 
 # Enable scaling for 4K output
 if [ "$native_4k_gui" != "1" ]; then
-  case $display_mode in
-    4k*|smpte*|2160*)
+  case "${output_width}x${output_height}" in
+    3840x2160|4096x2160)
       echo 0 0 1919 1079 > /sys/class/graphics/fb0/free_scale_axis
-      echo 0 0 3839 2159 > /sys/class/graphics/fb0/window_axis
+      echo 0 0 $((output_width - 1)) $((output_height - 1)) > /sys/class/graphics/fb0/window_axis
       echo 0x10001 > /sys/class/graphics/fb0/free_scale
     ;;
   esac

@@ -9,6 +9,7 @@ PKG_LICENSE="LGPL"
 PKG_SITE="https://cairographics.org/"
 PKG_URL="https://cairographics.org/releases/${PKG_NAME}-${PKG_VERSION}.tar.xz"
 PKG_DEPENDS_TARGET="toolchain zlib freetype fontconfig glib libpng pixman"
+PKG_NEED_UNPACK="$(get_pkg_directory libpng)"
 PKG_LONGDESC="Cairo is a vector graphics library with cross-device output support."
 
 configure_package() {

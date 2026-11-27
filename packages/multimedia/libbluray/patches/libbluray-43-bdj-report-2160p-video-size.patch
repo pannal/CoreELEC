@@ -1,0 +1,45 @@
+From: SamuriHL <samurihl@msn.com>
+Subject: [PATCH] BD-J: report the 2160p video size
+
+StreamInfo.getVideoSize() has no break after the 2160p case (video
+format 0x08), so it falls through to "default: return null" for every
+UHD stream. VideoControl.getInputVideoSize() passes the null on, and
+setClipRegion() dereferences it (VideoControl.java:119). BD-J Xlets
+that size or clip the background video then throw: on M3GAN 2.0 UHD,
+Top Menu during the feature raised NullPointerException from
+BackgroundVideoPresentationControlImpl.setSize() in the Xlet's tearDown,
+setVideoResolution, setGraphicsResolution and setBackgroundResolution
+handlers.
+
+Add the missing break. getInputVideoSize() also treats a format that
+StreamInfo does not know as "no size", as it already does for a missing
+stream, so callers get their existing 0x0 path instead of a null.
+
+Unchanged in libbluray 1.5.1 and master.
+
+diff -ruN a/src/libbluray/bdj/java/org/videolan/StreamInfo.java b/src/libbluray/bdj/java/org/videolan/StreamInfo.java
+--- a/src/libbluray/bdj/java/org/videolan/StreamInfo.java	2026-09-25 16:49:46.421563732 -0400
++++ b/src/libbluray/bdj/java/org/videolan/StreamInfo.java	2026-09-25 16:49:46.475927982 -0400
+@@ -73,6 +73,7 @@
+         case (byte)0x08:
+             width = 3840;
+             height = 2160;
++            break;
+         default:
+                 return null;
+         }
+diff -ruN a/src/libbluray/bdj/java/org/videolan/media/content/playlist/VideoControl.java b/src/libbluray/bdj/java/org/videolan/media/content/playlist/VideoControl.java
+--- a/src/libbluray/bdj/java/org/videolan/media/content/playlist/VideoControl.java	2026-09-25 16:49:46.421908370 -0400
++++ b/src/libbluray/bdj/java/org/videolan/media/content/playlist/VideoControl.java	2026-09-25 16:49:46.476164159 -0400
+@@ -82,7 +82,10 @@
+         StreamInfo stream = getCurrentStream();
+         if (stream == null)
+             return new Dimension(0, 0);
+-        return stream.getVideoSize();
++        Dimension size = stream.getVideoSize();
++        if (size == null)
++            return new Dimension(0, 0);
++        return size;
+     }
+ 
+     public Dimension getVideoSize() {

@@ -1,0 +1,297 @@
+From: CoreELEC
+Subject: [PATCH] libCEC: preserve the interpretation of a held power toggle
+
+Backport the wake-versus-off classification from upstream commit
+efe7d98c891ad26b65f2844c4f7e060476d8cc64 (Pulse-Eight/libcec#744).
+An inactive or standby source interprets Power as activation; do not forward
+that activation as a shutdown-capable application key.
+
+Deliver Power On callbacks for that interpretation and retain it for the
+existing held-key lifetime, scoped to sender, destination and raw key. Expire
+it across suspend with CLOCK_BOOTTIME when available, and cancel old key state
+on client retirement. Match releases to their power-key sender/destination.
+Explicit Power Off, ordinary input and active-source runtime Power remain.
+No startup grace period, new worker or public adapter ABI change.
+
+--- a/src/libcec/CECClient.h
++++ b/src/libcec/CECClient.h
+@@ -322,6 +322,8 @@
+     virtual void                  AddKey(bool bSendComboKey = false, bool bButtonRelease = false);
+     virtual void                  AddKey(const cec_keypress &key);
+     virtual void                  SetCurrentButton(const cec_user_control_code iButtonCode);
++    bool                          SetCurrentPowerButton(const cec_command &command, bool bPowerOn);
++    void                          ReleaseCurrentButton(const cec_command &command, bool bButtonRelease = true);
+     virtual uint16_t              CheckKeypressTimeout(void);
+     virtual void                  SourceActivated(const cec_logical_address logicalAddress);
+     virtual void                  SourceDeactivated(const cec_logical_address logicalAddress);
+@@ -451,6 +453,19 @@
+     void CallbackSourceActivated(bool bActivated, const cec_logical_address logicalAddress);
+ 
+     uint32_t DoubleTapTimeoutMS(void);
++
++    void ResetKeypress(void);
++    void ExpirePowerButton(void);
++    struct PowerButtonState
++    {
++      cec_user_control_code key = CEC_USER_CONTROL_CODE_UNKNOWN;
++      cec_logical_address initiator = CECDEVICE_UNKNOWN;
++      cec_logical_address destination = CECDEVICE_UNKNOWN;
++      bool powerOn = false;
++      int64_t releaseTime = 0;
++      bool suspendAware = false;
++    };
++    PowerButtonState m_powerButton;
+ 
+     CCECProcessor *                          m_processor;                         /**< a pointer to the processor */
+     libcec_configuration                     m_configuration;                     /**< the configuration of this client */
+--- a/src/libcec/CECClient.cpp
++++ b/src/libcec/CECClient.cpp
+@@ -42,12 +42,27 @@
+ #include "devices/CECTV.h"
+ #include "implementations/CECCommandHandler.h"
+ #include <stdio.h>
++#include <time.h>
+ 
+ using namespace CEC;
+ using namespace P8PLATFORM;
+ 
+ #define LIB_CEC     m_processor->GetLib()
+ #define ToString(x) CCECTypeUtils::ToString(x)
++
++static int64_t GetPowerButtonTimeMs(bool &suspendAware)
++{
++#if defined(CLOCK_BOOTTIME)
++  struct timespec time;
++  if (clock_gettime(CLOCK_BOOTTIME, &time) == 0)
++  {
++    suspendAware = true;
++    return (int64_t)time.tv_sec * 1000 + time.tv_nsec / 1000000;
++  }
++#endif
++  suspendAware = false;
++  return GetTimeMs();
++}
+ 
+ CCECClient::CCECClient(CCECProcessor *processor, const libcec_configuration &configuration) :
+     m_processor(processor),
+@@ -115,6 +130,8 @@
+ {
+   CLockObject lock(m_mutex);
+   m_bInitialised = bSetTo;
++  if (!bSetTo)
++    ResetKeypress();
+ }
+ 
+ bool CCECClient::IsRegistered(void)
+@@ -127,6 +144,8 @@
+ {
+   CLockObject lock(m_mutex);
+   m_bRegistered = bSetTo;
++  if (!bSetTo)
++    ResetKeypress();
+ }
+ 
+ bool CCECClient::OnRegister(void)
+@@ -1025,6 +1044,7 @@
+ 
+   {
+     CLockObject lock(m_mutex);
++    ExpirePowerButton();
+     if (m_iCurrentButton != CEC_USER_CONTROL_CODE_UNKNOWN)
+     {
+       unsigned int duration = (unsigned int) (GetTimeMs() - m_updateButtontime);
+@@ -1075,6 +1095,8 @@
+ 
+   {
+     CLockObject lock(m_mutex);
++    ExpirePowerButton();
++    m_powerButton = PowerButtonState();
+     if (m_configuration.iComboKeyTimeoutMs > 0 && m_iCurrentButton == comboKey && key.duration == 0)
+     {
+       // stop + ok -> exit
+@@ -1150,6 +1172,9 @@
+ 
+ void CCECClient::SetCurrentButton(const cec_user_control_code iButtonCode)
+ {
++  CLockObject lock(m_mutex);
++  ExpirePowerButton();
++  m_powerButton = PowerButtonState();
+   // push a keypress to the buffer with 0 duration and another with the duration set when released
+   cec_keypress key;
+   key.duration = 0;
+@@ -1159,8 +1184,96 @@
+   AddKey(key);
+ }
+ 
++bool CCECClient::SetCurrentPowerButton(const cec_command &command, bool bPowerOn)
++{
++  CLockObject lock(m_mutex);
++  ExpirePowerButton();
++  bool suspendAware;
++  const int64_t powerTime = GetPowerButtonTimeMs(suspendAware);
++  const cec_user_control_code button = (cec_user_control_code)command.parameters[0];
++  const cec_user_control_code previous = m_powerButton.powerOn ?
++      CEC_USER_CONTROL_CODE_POWER_ON_FUNCTION : m_powerButton.key;
++
++  // A held toggle retains its initial meaning after activation changes the
++  // device state. Reuse the existing release deadline, including a lost release.
++  if (m_powerButton.key == button &&
++      m_powerButton.initiator == command.initiator &&
++      m_powerButton.destination == command.destination &&
++      m_iCurrentButton == previous && m_releaseButtontime > GetTimeMs())
++    bPowerOn = m_powerButton.powerOn;
++
++  // Keep press/repeat/release tracking, but never expose an activation as a
++  // shutdown-capable toggle. Explicit Power Off and other input stay unchanged.
++  cec_keypress key;
++  key.duration = 0;
++  key.keycode = bPowerOn ? CEC_USER_CONTROL_CODE_POWER_ON_FUNCTION : button;
++  LIB_CEC->AddLog(CEC_LOG_DEBUG, "power toggle %02x from %x to %x means %s",
++      button, command.initiator, command.destination, bPowerOn ? "on" : "off");
++  AddKey(key);
++  m_powerButton.key = button;
++  m_powerButton.initiator = command.initiator;
++  m_powerButton.destination = command.destination;
++  m_powerButton.powerOn = bPowerOn;
++  m_powerButton.releaseTime = powerTime + std::max<int64_t>(0, m_releaseButtontime - GetTimeMs());
++  m_powerButton.suspendAware = suspendAware;
++  return bPowerOn;
++}
++
++void CCECClient::ReleaseCurrentButton(const cec_command &command, bool bButtonRelease)
++{
++  CLockObject lock(m_mutex);
++  ExpirePowerButton();
++  const cec_user_control_code button = m_powerButton.powerOn ?
++      CEC_USER_CONTROL_CODE_POWER_ON_FUNCTION : m_powerButton.key;
++  if (m_powerButton.key != CEC_USER_CONTROL_CODE_UNKNOWN && m_iCurrentButton == button &&
++      (m_powerButton.initiator != command.initiator ||
++       m_powerButton.destination != command.destination))
++    return;
++
++  AddKey(false, bButtonRelease);
++  m_powerButton = PowerButtonState();
++}
++
++void CCECClient::ExpirePowerButton(void)
++{
++  // Caller holds m_mutex. Also cover direct AddKey callers and the timeout
++  // pump: after suspend, an ordinary key or release must not flush an old Off.
++  if (m_powerButton.key == CEC_USER_CONTROL_CODE_UNKNOWN)
++    return;
++  const cec_user_control_code button = m_powerButton.powerOn ?
++      CEC_USER_CONTROL_CODE_POWER_ON_FUNCTION : m_powerButton.key;
++  if (m_iCurrentButton != button)
++  {
++    m_powerButton = PowerButtonState();
++    return;
++  }
++
++  // The regular monotonic key clock stops during sleep. Retained clients must
++  // additionally expire the same release interval against suspend-aware time.
++  bool suspendAware;
++  const int64_t powerTime = GetPowerButtonTimeMs(suspendAware);
++  if (m_powerButton.suspendAware != suspendAware ||
++      m_powerButton.releaseTime <= powerTime || m_releaseButtontime <= GetTimeMs())
++    ResetKeypress();
++}
++
++void CCECClient::ResetKeypress(void)
++{
++  // Caller holds m_mutex. Callback retirement discards the old session queue.
++  m_powerButton = PowerButtonState();
++  m_iCurrentButton = CEC_USER_CONTROL_CODE_UNKNOWN;
++  m_initialButtontime = 0;
++  m_updateButtontime = 0;
++  m_repeatButtontime = 0;
++  m_releaseButtontime = 0;
++  m_pressedButtoncount = 0;
++  m_releasedButtoncount = 0;
++}
++
+ uint16_t CCECClient::CheckKeypressTimeout(void)
+ {
++  CLockObject lock(m_mutex);
++  ExpirePowerButton();
+   // time when we'd like to be called again
+   uint64_t timeout = CEC_PROCESSOR_SIGNAL_WAIT_TIME;
+   cec_keypress key;
+--- a/src/libcec/implementations/CECCommandHandler.cpp
++++ b/src/libcec/implementations/CECCommandHandler.cpp
+@@ -758,25 +758,30 @@
+   if (!device)
+     return CEC_ABORT_REASON_INVALID_OPERAND;
+ 
++  const cec_user_control_code key = (cec_user_control_code)command.parameters[0];
++  const bool bPowerToggle = (key == CEC_USER_CONTROL_CODE_POWER ||
++                            key == CEC_USER_CONTROL_CODE_POWER_TOGGLE_FUNCTION);
++  bool bPowerOn(true);
++  if (bPowerToggle)
++  {
++    const cec_power_status status = device->GetCurrentPowerStatus();
++    // A TV selecting an inactive source uses a toggle to wake it, even when
++    // the application is already running. Resolve this before its key callback.
++    bPowerOn = !device->IsActiveSource() ||
++        !(status == CEC_POWER_STATUS_ON || status == CEC_POWER_STATUS_IN_TRANSITION_STANDBY_TO_ON);
++  }
++
+   CECClientPtr client = device->GetClient();
+   if (client)
+-    client->SetCurrentButton((cec_user_control_code) command.parameters[0]);
+-
+-  if (command.parameters[0] == CEC_USER_CONTROL_CODE_POWER ||
+-      command.parameters[0] == CEC_USER_CONTROL_CODE_POWER_ON_FUNCTION||
+-      command.parameters[0] == CEC_USER_CONTROL_CODE_POWER_TOGGLE_FUNCTION)
+-  {
+-    bool bPowerOn(true);
+-
+-    // CEC_USER_CONTROL_CODE_POWER and CEC_USER_CONTROL_CODE_POWER_TOGGLE_FUNCTION operate as a toggle
+-    // assume CEC_USER_CONTROL_CODE_POWER_ON_FUNCTION does not
+-    if (command.parameters[0] == CEC_USER_CONTROL_CODE_POWER ||
+-        command.parameters[0] == CEC_USER_CONTROL_CODE_POWER_TOGGLE_FUNCTION)
+-    {
+-      cec_power_status status = device->GetCurrentPowerStatus();
+-      bPowerOn = !(status == CEC_POWER_STATUS_ON || status == CEC_POWER_STATUS_IN_TRANSITION_STANDBY_TO_ON);
+-    }
+-
++  {
++    if (bPowerToggle)
++      bPowerOn = client->SetCurrentPowerButton(command, bPowerOn);
++    else
++      client->SetCurrentButton(key);
++  }
++
++  if (bPowerToggle || key == CEC_USER_CONTROL_CODE_POWER_ON_FUNCTION)
++  {
+     if (bPowerOn)
+     {
+       device->ActivateSource();
+@@ -788,7 +793,7 @@
+       device->SetMenuState(CEC_MENU_STATE_DEACTIVATED);
+     }
+   }
+-  else if (command.parameters[0] != CEC_USER_CONTROL_CODE_POWER_OFF_FUNCTION)
++  else if (key != CEC_USER_CONTROL_CODE_POWER_OFF_FUNCTION)
+   {
+     // we're not marked as active source, but the tv sends keypresses to us, so assume it forgot to activate us
+     if (!device->IsActiveSource() && command.initiator == CECDEVICE_TV && command.destination != CECDEVICE_AUDIOSYSTEM)
+@@ -806,7 +811,7 @@
+ 
+   CECClientPtr client = m_processor->GetClient(command.destination);
+   if (client)
+-    client->AddKey(false, true);
++    client->ReleaseCurrentButton(command);
+ 
+   return COMMAND_HANDLED;
+ }
+--- a/src/libcec/implementations/RLCommandHandler.cpp
++++ b/src/libcec/implementations/RLCommandHandler.cpp
+@@ -128,7 +128,7 @@
+       break;
+     // user control released
+     case CEC_OPCODE_USER_CONTROL_RELEASE:
+-      client->AddKey();
++      client->ReleaseCurrentButton(command, false);
+       bHandled = true;
+       break;
+     default:

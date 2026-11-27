@@ -1,0 +1,190 @@
+{
+  "labels": {
+    "p3i_ba30": {
+      "offset": 368,
+      "size": 100
+    },
+    "p3i_bdd8": {
+      "offset": 480,
+      "size": 100
+    },
+    "p3i_concat_done": {
+      "offset": 672,
+      "size": 72
+    },
+    "p3i_cp_done": {
+      "offset": 752,
+      "size": 116
+    },
+    "p3i_curve": {
+      "offset": 592,
+      "size": 80
+    },
+    "p3i_entry": {
+      "offset": 0,
+      "size": 360
+    }
+  },
+  "relocations": [
+    {
+      "addend": 0,
+      "offset": 0,
+      "symbol": "p3i_state",
+      "type": 275
+    },
+    {
+      "addend": 0,
+      "offset": 4,
+      "symbol": "p3i_state",
+      "type": 277
+    },
+    {
+      "addend": 0,
+      "offset": 64,
+      "symbol": "p3i_state",
+      "type": 275
+    },
+    {
+      "addend": 0,
+      "offset": 68,
+      "symbol": "p3i_state",
+      "type": 277
+    },
+    {
+      "addend": 0,
+      "offset": 144,
+      "symbol": "p3i_state",
+      "type": 275
+    },
+    {
+      "addend": 0,
+      "offset": 148,
+      "symbol": "p3i_state",
+      "type": 277
+    },
+    {
+      "addend": 0,
+      "offset": 336,
+      "symbol": "p3i_state",
+      "type": 275
+    },
+    {
+      "addend": 0,
+      "offset": 340,
+      "symbol": "p3i_state",
+      "type": 277
+    },
+    {
+      "addend": 0,
+      "offset": 356,
+      "symbol": "p3i_resume_cp",
+      "type": 282
+    },
+    {
+      "addend": 0,
+      "offset": 380,
+      "symbol": "p3i_state",
+      "type": 275
+    },
+    {
+      "addend": 0,
+      "offset": 384,
+      "symbol": "p3i_state",
+      "type": 277
+    },
+    {
+      "addend": 0,
+      "offset": 460,
+      "symbol": "p3i_resume_ba30",
+      "type": 282
+    },
+    {
+      "addend": 0,
+      "offset": 464,
+      "symbol": "p3i_taken_ba30",
+      "type": 282
+    },
+    {
+      "addend": 0,
+      "offset": 492,
+      "symbol": "p3i_state",
+      "type": 275
+    },
+    {
+      "addend": 0,
+      "offset": 496,
+      "symbol": "p3i_state",
+      "type": 277
+    },
+    {
+      "addend": 0,
+      "offset": 572,
+      "symbol": "p3i_resume_bdd8",
+      "type": 282
+    },
+    {
+      "addend": 0,
+      "offset": 576,
+      "symbol": "p3i_taken_bdd8",
+      "type": 282
+    },
+    {
+      "addend": 0,
+      "offset": 592,
+      "symbol": "p3i_state",
+      "type": 275
+    },
+    {
+      "addend": 0,
+      "offset": 596,
+      "symbol": "p3i_state",
+      "type": 277
+    },
+    {
+      "addend": 0,
+      "offset": 668,
+      "symbol": "CreateToneCurve",
+      "type": 282
+    },
+    {
+      "addend": 0,
+      "offset": 684,
+      "symbol": "p3i_state",
+      "type": 275
+    },
+    {
+      "addend": 0,
+      "offset": 688,
+      "symbol": "p3i_state",
+      "type": 277
+    },
+    {
+      "addend": 0,
+      "offset": 740,
+      "symbol": "p3i_resume_concat",
+      "type": 282
+    },
+    {
+      "addend": 0,
+      "offset": 768,
+      "symbol": "p3i_state",
+      "type": 275
+    },
+    {
+      "addend": 0,
+      "offset": 772,
+      "symbol": "p3i_state",
+      "type": 277
+    },
+    {
+      "addend": 0,
+      "offset": 864,
+      "symbol": "p3i_resume_done",
+      "type": 282
+    }
+  ],
+  "source_sha256": "891c5194e8018d51afd82bc85d37518928749685a751c1105a8454042d080853",
+  "state_size": 32,
+  "text": "10000090100200911f7e00291f0e00b91f1600b9000e00f9400a00b4100040b91f0e0071e1090054100440b91f0a007181090054103041b91f06007121090054100000901002009131008052110200b910104091105a4db911ea8852114ba6721f02116be107005410104091105e4db91f0600716807005410104091116a4db93f060071e8060054317a1f53310200321000009010020091111600b910104091105e4db9f0050034100840b9b0050035100c40b970050035101440b930050035101c40b9f0040035101840b9b0040035102040b970040035105840b930040035106040b91f060071c1030054106440b99003003510c840b950030035103041b91f060071e1020054103441b91f0a007181020054104441b91f22007121020054104841b91f0e0071c1010054104c41b91f06007161010054105041b91f06007101010054108441b91f0a0071a1000054100000901002009131008052110600b93f2303d5000000141f2003d51f2003d5f047bea910423bd5f00b00f91000009010020091110240b9b1010034b10240b9df02116b41010054111640b9f1000837111240b9b1000035110640b9100a40b91f02116b4000005408010032f00b40f910421bd5f047c2a84800003500000014000000141f2003d51f2003d51f2003d5f047bea910423bd5f00b00f91000009010020091110240b9b1010034b10240b9df02116b41010054111640b9f1000837111240b9b1000035110640b9100a40b91f02116b4000005408010032f00b40f910421bd5f047c2a84800003400000014000000141f2003d51f2003d51f2003d51000009010020091110240b911020034b10240b9df02116ba1010054110640b9b1000035110a40b971000035111240b9f100003431008052111200b9110640b9710000345000805210e400b900000014f047bea910423bd5f00b00f91000009010020091110240b9f1000034b10240b9df02116b81000054110640b931060011110e00b9f00b40f910421bd5f047c2a8fa031f2a000000141f2003d51f2003d5f047bea910423bd5f00b00f9b502f8371000009010020091110e40b99100003431060051110a00b91f1200b9111640b991010034000e40f90010409131e88852114ba67211600db9110a40b931021e32100e40b95000003431021f3211640db9f00b40f910421bd5f047c2a8e003152a00000014",
+  "version": 2
+}

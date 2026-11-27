@@ -1386,6 +1386,11 @@ done
 # setup kernel overlays
 /usr/bin/busybox chroot /sysroot /usr/sbin/kernel-overlays-setup
 
+# Select the transport before systemd coldplugs external storage.
+if [ -x /sysroot/usr/lib/libreelec/uas-init ]; then
+  /usr/bin/busybox chroot /sysroot /usr/lib/libreelec/uas-init
+fi
+
 # tell OE settings addon to disable updates
 if [ "$UPDATE_DISABLED" = "yes" ]; then
   echo "" > /sysroot/dev/.update_disabled

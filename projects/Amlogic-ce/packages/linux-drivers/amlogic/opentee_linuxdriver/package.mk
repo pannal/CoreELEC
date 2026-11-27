@@ -32,7 +32,11 @@ makeinstall_target() {
     install -m 0755 ${PKG_DIR}/scripts/tee-loader.sh ${INSTALL}/usr/lib/coreelec/tee-loader
     install -m 0755 ${PKG_DIR}/scripts/dovi-loader.sh ${INSTALL}/usr/lib/coreelec/dovi-loader
 
-  cp -rP $(get_pkg_directory ${PKG_NAME})/filesystem/${ARCH}/usr ${INSTALL}
+  cp -rP --remove-destination $(get_pkg_directory ${PKG_NAME})/filesystem/${ARCH}/usr ${INSTALL}
+
+  # Some checkouts store Git symlinks as plain files.
+  ln -sfn libteec.so.1.0 "${INSTALL}/usr/lib/libteec.so"
+  ln -sfn libteec.so.1.0 "${INSTALL}/usr/lib/libteec.so.1"
 }
 
 post_install() {

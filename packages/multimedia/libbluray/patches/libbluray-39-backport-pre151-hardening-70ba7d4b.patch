@@ -1,0 +1,480 @@
+PORTED: upstream libbluray, the commits between the 1.5.0 tag and 70ba7d4bf7
+(2026-08-06) -- everything staged for 1.5.1 except the version bump.
+Modified for this tree: one context line in the clpi_lookup_spn hunk is
+adjusted for the '- 1' applied by libbluray-02.
+Delete this patch when PKG_VERSION reaches 1.5.1.
+
+diff --git a/src/libbluray/bdj/java/org/dvb/dsmcc/DSMCCObject.java b/src/libbluray/bdj/java/org/dvb/dsmcc/DSMCCObject.java
+index 133a6897..4bc5d381 100644
+--- a/src/libbluray/bdj/java/org/dvb/dsmcc/DSMCCObject.java
++++ b/src/libbluray/bdj/java/org/dvb/dsmcc/DSMCCObject.java
+@@ -99,7 +99,7 @@ public class DSMCCObject extends File {
+     }
+ 
+     public void unload() throws NotLoadedException {
+-        if (loaded)
++        if (!loaded)
+             throw new NotLoadedException();
+ 
+         loaded = false;
+diff --git a/src/libbluray/bdj/java/org/dvb/dsmcc/NPTRate.java b/src/libbluray/bdj/java/org/dvb/dsmcc/NPTRate.java
+index c2b736a1..846ba2f8 100644
+--- a/src/libbluray/bdj/java/org/dvb/dsmcc/NPTRate.java
++++ b/src/libbluray/bdj/java/org/dvb/dsmcc/NPTRate.java
+@@ -24,7 +24,7 @@ import java.io.Serializable;
+ public class NPTRate implements Serializable {
+ 
+     // should only be called internally
+-    public NPTRate(int numerator, int denominator) {
++    NPTRate(int numerator, int denominator) {
+         this.numerator = numerator;
+         this.denominator = denominator;
+     }
+diff --git a/src/libbluray/bdj/java/org/dvb/event/EventManager.java b/src/libbluray/bdj/java/org/dvb/event/EventManager.java
+index 1271d603..dff33d37 100644
+--- a/src/libbluray/bdj/java/org/dvb/event/EventManager.java
++++ b/src/libbluray/bdj/java/org/dvb/event/EventManager.java
+@@ -37,6 +37,9 @@ public class EventManager implements ResourceServer {
+ 
+     private static final Object instanceLock = new Object();
+ 
++    protected EventManager() {
++    }
++
+     public static EventManager getInstance() {
+         synchronized (instanceLock) {
+             if (instance == null)
+diff --git a/src/libbluray/bdnav/clpi_parse.c b/src/libbluray/bdnav/clpi_parse.c
+index 514afad4..99d6dcb3 100644
+--- a/src/libbluray/bdnav/clpi_parse.c
++++ b/src/libbluray/bdnav/clpi_parse.c
+@@ -338,6 +338,12 @@ _parse_ep_map_stream(BITSTREAM *bits, CLPI_EP_MAP_ENTRY *ee)
+     }
+     for (ii = 0; ii < ee->num_ep_coarse; ii++) {
+         coarse[ii].ref_ep_fine_id = bs_read(bits, 18);
++        if (coarse[ii].ref_ep_fine_id >= ee->num_ep_fine) {
++            BD_DEBUG(DBG_HDMV | DBG_CRIT, "clpi_parse: invalid EP fine reference %u\n", coarse[ii].ref_ep_fine_id);
++            if (ee->num_ep_fine > 0) {
++                coarse[ii].ref_ep_fine_id = ee->num_ep_fine - 1;
++            }
++        }
+         coarse[ii].pts_ep         = bs_read(bits, 14);
+         coarse[ii].spn_ep         = bs_read(bits, 32);
+     }
+@@ -426,7 +432,8 @@ clpi_find_stc_spn(const CLPI_CL *cl, uint8_t stc_id)
+ 
+     for (ii = 0; ii < cl->sequence.num_atc_seq; ii++) {
+         atc = &cl->sequence.atc_seq[ii];
+-        if (stc_id < atc->offset_stc_id + atc->num_stc_seq) {
++        if (stc_id >= atc->offset_stc_id &&
++            stc_id < atc->offset_stc_id + atc->num_stc_seq) {
+             return atc->stc_seq[stc_id - atc->offset_stc_id].spn_stc_start;
+         }
+     }
+@@ -457,6 +464,13 @@ clpi_lookup_spn(const CLPI_CL *cl, uint32_t timestamp, int before, uint8_t stc_i
+     // Assumes that there is only one pid of interest
+     entry = &cpi->entry[0];
+ 
++    if (entry->num_ep_fine < 1) {
++        if (before) {
++            return 0;
++        }
++        return cl->clip.num_source_packets;
++    }
++
+     // Use sequence info to find spn_stc_start before doing
+     // PTS search. The spn_stc_start defines the point in
+     // the EP map to start searching.
+@@ -535,6 +549,9 @@ done:
+         }
+         jj = entry->coarse[ii].ref_ep_fine_id;
+     }
++    if (jj < 0) {
++        jj = 0;
++    }
+     spn = (entry->coarse[ii].spn_ep & ~0x1FFFF) + entry->fine[jj].spn_ep - 1;
+     return spn;
+ }
+@@ -552,6 +569,11 @@ clpi_access_point(const CLPI_CL *cl, uint32_t pkt, int next, int angle_change, u
+     int start, end;
+     int ref;
+ 
++    if (cpi->num_stream_pid < 1 || !cpi->entry) {
++        *time = 0;
++        return 0;
++    }
++
+     // Assumes that there is only one pid of interest
+     entry = &cpi->entry[0];
+ 
+@@ -587,7 +609,9 @@ clpi_access_point(const CLPI_CL *cl, uint32_t pkt, int next, int angle_change, u
+         ii++;
+         jj = 0;
+     } else if (spn != pkt && !next) {
+-        jj--;
++        if (jj > 0) {
++            jj--;
++        }
+     }
+     if (ii == entry->num_ep_coarse) {
+         *time = 0;
+diff --git a/src/libbluray/bdnav/mpls_parse.c b/src/libbluray/bdnav/mpls_parse.c
+index 13226f9d..2f4619e2 100644
+--- a/src/libbluray/bdnav/mpls_parse.c
++++ b/src/libbluray/bdnav/mpls_parse.c
+@@ -681,10 +681,12 @@ _clean_subpath(MPLS_SUB *sp)
+ {
+     int ii;
+ 
+-    for (ii = 0; ii < sp->sub_playitem_count; ii++) {
+-        _clean_subplayitem(&sp->sub_play_item[ii]);
++    if (sp->sub_play_item != NULL) {
++        for (ii = 0; ii < sp->sub_playitem_count; ii++) {
++            _clean_subplayitem(&sp->sub_play_item[ii]);
++        }
++        X_FREE(sp->sub_play_item);
+     }
+-    X_FREE(sp->sub_play_item);
+ }
+ 
+ static int
+diff --git a/src/libbluray/bdnav/navigation.c b/src/libbluray/bdnav/navigation.c
+index b3f719f4..448ce750 100644
+--- a/src/libbluray/bdnav/navigation.c
++++ b/src/libbluray/bdnav/navigation.c
+@@ -546,14 +546,21 @@ _fill_mark(const NAV_TITLE *title, NAV_MARK *mark, int entry)
+ 
+     mark->mark_type = plm->mark_type;
+     mark->clip_ref = plm->play_item_ref;
+-    clip = &title->clip_list.clip[mark->clip_ref];
+-    if (clip->cl != NULL && mark->clip_ref < title->pl->list_count) {
+-        mark->clip_pkt = clpi_lookup_spn(clip->cl, plm->time, 1,
+-            title->pl->play_item[mark->clip_ref].clip[title->angle].stc_id);
+-    } else {
+-        mark->clip_pkt = clip->start_pkt;
++    if (mark->clip_ref >= title->clip_list.count) {
++        BD_DEBUG(DBG_NAV | DBG_CRIT, "_fill_mark(): invalid play_item_ref %d\n", plm->play_item_ref);
++        mark->clip_ref = 0;
++    }
++
++    if (title->clip_list.count) {
++        clip = &title->clip_list.clip[mark->clip_ref];
++        if (clip->cl != NULL && mark->clip_ref < title->pl->list_count) {
++            mark->clip_pkt = clpi_lookup_spn(clip->cl, plm->time, 1,
++                    title->pl->play_item[mark->clip_ref].clip[clip->angle].stc_id);
++        } else {
++            mark->clip_pkt = clip->start_pkt;
++        }
++        mark->title_pkt = clip->title_pkt + mark->clip_pkt - clip->start_pkt;
+     }
+-    mark->title_pkt = clip->title_pkt + mark->clip_pkt - clip->start_pkt;
+     mark->clip_time = plm->time;
+ 
+     // Calculate start of mark relative to beginning of playlist
+@@ -743,6 +750,10 @@ NAV_TITLE* nav_title_open(BD_DISC *disc, const char *playlist, unsigned angle)
+     strncpy(title->name, playlist, 11);
+     title->name[10] = '\0';
+     title->angle_count = 0;
++    if (angle > 8) {
++        // invalid angle
++        angle = 0;
++    }
+     title->angle = angle;
+     title->pl = mpls_get(disc, playlist);
+     if (title->pl == NULL) {
+@@ -838,7 +849,7 @@ const NAV_CLIP* nav_chapter_search(const NAV_TITLE *title, unsigned chapter,
+         return NULL;
+     }
+ 
+-    if (chapter > title->chap_list.count) {
++    if (chapter >= title->chap_list.count) {
+         clip = &title->clip_list.clip[0];
+         *clip_pkt = clip->start_pkt;
+         *out_pkt = clip->title_pkt;
+@@ -885,7 +896,7 @@ const NAV_CLIP* nav_mark_search(const NAV_TITLE *title, unsigned mark,
+         return NULL;
+     }
+ 
+-    if (mark > title->mark_list.count) {
++    if (mark >= title->mark_list.count) {
+         clip = &title->clip_list.clip[0];
+         *clip_pkt = clip->start_pkt;
+         *out_pkt = clip->title_pkt;
+diff --git a/src/libbluray/bdnav/sound_parse.c b/src/libbluray/bdnav/sound_parse.c
+index 84647a9e..0e3d345c 100644
+--- a/src/libbluray/bdnav/sound_parse.c
++++ b/src/libbluray/bdnav/sound_parse.c
+@@ -197,7 +197,7 @@ static SOUND_DATA *_sound_parse(BD_FILE_H *fp)
+ 
+     for (i = 0; i < data->num_sounds; i++) {
+ 
+-        if (bs_seek_byte(&bs, data_start + data_offsets[i]) < 0) {
++        if (bs_seek_byte(&bs, (int64_t)data_start + data_offsets[i]) < 0) {
+             BD_DEBUG(DBG_NAV | DBG_CRIT, "error reading samples for sound %d\n", i);
+             data->sounds[i].num_frames = 0;
+             continue;
+diff --git a/src/libbluray/decoders/graphics_processor.c b/src/libbluray/decoders/graphics_processor.c
+index 3638a6da..7fd1eeb5 100644
+--- a/src/libbluray/decoders/graphics_processor.c
++++ b/src/libbluray/decoders/graphics_processor.c
+@@ -102,7 +102,7 @@ static PES_BUFFER *_find_segment_by_idv(PES_BUFFER *p,
+                                         uint8_t seg_type, unsigned idv_pos,
+                                         uint8_t *idv, unsigned idv_len)
+ {
+-    while (p && (p->buf[0] != seg_type || memcmp(p->buf + idv_pos, idv, idv_len))) {
++    while (p && (p->buf[0] != seg_type || p->len < idv_pos + idv_len || memcmp(p->buf + idv_pos, idv, idv_len))) {
+         p = p->next;
+     }
+     return p;
+@@ -159,9 +159,15 @@ static int _join_segment_fragments(struct pes_buffer_s *p)
+ 
+     /* check sequence descriptor - is segment complete ? */
+ 
++    if (p->len < sd_pos + 1) {
++        /* invalid, incomplete header */
++        BD_DEBUG(DBG_DECODE|DBG_CRIT, "Missing header in segment 0x%02x, len=%u\n", type, p->len);
++        return 1;
++    }
++
+     BD_PG_SEQUENCE_DESCRIPTOR sd;
+     BITBUFFER bb;
+-    bb_init(&bb, p->buf + sd_pos, 3);
++    bb_init(&bb, p->buf + sd_pos, 1);
+     pg_decode_sequence_descriptor(&bb, &sd);
+ 
+     if (sd.last_in_seq) {
+@@ -176,10 +182,19 @@ static int _join_segment_fragments(struct pes_buffer_s *p)
+     PES_BUFFER *next;
+     while (NULL != (next = _find_segment_by_idv(p->next, p->buf[0], id_pos, p->buf + id_pos, id_len))) {
+ 
+-        bb_init(&bb, next->buf + sd_pos, 3);
++        if (next->len < sd_pos + 1) {
++            /* invalid, incomplete header */
++            BD_DEBUG(DBG_DECODE|DBG_CRIT, "Missing header in segment 0x%02x, len=%u\n", type, next->len);
++            pes_buffer_remove(&p, next);
++            continue;
++        }
++
++        bb_init(&bb, next->buf + sd_pos, 1);
+         pg_decode_sequence_descriptor(&bb, &sd);
+ 
+-        _join_fragments(p, next, data_pos);
++        if (next->len > data_pos /* at least one byte of payload */) {
++            _join_fragments(p, next, data_pos);
++        }
+ 
+         pes_buffer_remove(&p, next);
+ 
+diff --git a/src/libbluray/decoders/m2ts_demux.c b/src/libbluray/decoders/m2ts_demux.c
+index 73bd4d9d..1319a554 100644
+--- a/src/libbluray/decoders/m2ts_demux.c
++++ b/src/libbluray/decoders/m2ts_demux.c
+@@ -180,9 +180,17 @@ static int _parse_pes(PES_BUFFER *p, uint8_t *buf, unsigned len)
+         }
+ 
+         if (pts_exists) {
++            if (hdr_len < 14) {
++                BD_DEBUG(DBG_DECODE, "invalid BDAV TS (PES header too short for PTS)\n");
++                return -1;
++            }
+             p->pts = _parse_timestamp(buf + 9);
+         }
+         if (dts_exists) {
++            if (hdr_len < 19) {
++                BD_DEBUG(DBG_DECODE, "invalid BDAV TS (PES header too short for DTS)\n");
++                return -1;
++            }
+             p->dts = _parse_timestamp(buf + 14);
+         }
+     }
+diff --git a/src/libbluray/decoders/pg_decode.c b/src/libbluray/decoders/pg_decode.c
+index 5ccc1fa6..03b0b0d6 100644
+--- a/src/libbluray/decoders/pg_decode.c
++++ b/src/libbluray/decoders/pg_decode.c
+@@ -28,6 +28,7 @@
+ #include "util/logging.h"
+ #include "util/bits.h"
+ 
++#include <inttypes.h>
+ #include <string.h>
+ #include <stdlib.h>
+ 
+@@ -122,13 +123,16 @@ int pg_decode_palette(BITBUFFER *bb, BD_PG_PALETTE *p)
+ static int _decode_rle(BITBUFFER *bb, BD_PG_OBJECT *p)
+ {
+     BD_PG_RLE_ELEM *tmp;
+-    int pixels_left = p->width * p->height;
++    int64_t pixels_left = (int64_t)p->width * p->height;
++    int rle_size        = (int)(pixels_left / 4);
+     int num_rle     = 0;
+-    int rle_size    = p->width * p->height / 4;
+ 
+     if (rle_size < 1)
+         rle_size = 1;
+ 
++    if (rle_size > 65536)
++        rle_size = 65536;
++
+     tmp = refcnt_realloc(p->img, rle_size * sizeof(BD_PG_RLE_ELEM), NULL);
+     if (!tmp) {
+         BD_DEBUG(DBG_DECODE | DBG_CRIT, "pg_decode_object(): realloc failed\n");
+@@ -163,7 +167,7 @@ static int _decode_rle(BITBUFFER *bb, BD_PG_OBJECT *p)
+         pixels_left -= len;
+ 
+         if (pixels_left < 0) {
+-            BD_DEBUG(DBG_DECODE, "pg_decode_object(): too many pixels (%d)\n", -pixels_left);
++            BD_DEBUG(DBG_DECODE, "pg_decode_object(): too many pixels (%" PRId64 ")\n", -pixels_left);
+             return 0;
+         }
+ 
+@@ -180,7 +184,7 @@ static int _decode_rle(BITBUFFER *bb, BD_PG_OBJECT *p)
+     }
+ 
+     if (pixels_left > 0) {
+-        BD_DEBUG(DBG_DECODE, "pg_decode_object(): missing %d pixels\n", pixels_left);
++        BD_DEBUG(DBG_DECODE, "pg_decode_object(): missing %" PRId64 " pixels\n", pixels_left);
+         return 0;
+     }
+ 
+diff --git a/src/libbluray/hdmv/hdmv_vm.c b/src/libbluray/hdmv/hdmv_vm.c
+index 7d6aa344..c2c60be9 100644
+--- a/src/libbluray/hdmv/hdmv_vm.c
++++ b/src/libbluray/hdmv/hdmv_vm.c
+@@ -1169,10 +1169,10 @@ static int _hdmv_step(HDMV_VM *p)
+                         case INSN_AND:    dst &= src;         break;
+                         case INSN_OR:     dst |= src;         break;
+                         case INSN_XOR:    dst ^= src;         break;
+-                        case INSN_BITSET: dst |=  (1 << src); break;
+-                        case INSN_BITCLR: dst &= ~(1 << src); break;
+-                        case INSN_SHL:    dst <<= src;        break;
+-                        case INSN_SHR:    dst >>= src;        break;
++                        case INSN_BITSET: if (src < 32) dst |=  (1 << src); break;
++                        case INSN_BITCLR: if (src < 32) dst &= ~(1 << src); break;
++                        case INSN_SHL:    if (src < 32) dst <<= src; else dst = 0; break;
++                        case INSN_SHR:    if (src < 32) dst >>= src; else dst = 0; break;
+                         default:
+                             BD_DEBUG(DBG_HDMV|DBG_CRIT, "unknown SET option %d in opcode 0x%08x\n",
+                                      insn->set_opt, *(uint32_t*)insn);
+diff --git a/src/util/bits.c b/src/util/bits.c
+index 670ef98a..896f7b92 100644
+--- a/src/util/bits.c
++++ b/src/util/bits.c
+@@ -28,6 +28,7 @@
+ 
+ #include "file/file.h"
+ #include "util/logging.h"
++#include "util/macro.h"
+ 
+ #include <stdio.h>  // SEEK_*
+ 
+@@ -44,7 +45,7 @@ void bb_init( BITBUFFER *bb, const uint8_t *p_data, size_t i_data )
+     bb->i_left  = 8;
+ }
+ 
+-static int _bs_read( BITSTREAM *bs)
++static BD_USED int _bs_read( BITSTREAM *bs)
+ {
+     int result = 0;
+     int64_t got;
+@@ -62,7 +63,7 @@ static int _bs_read( BITSTREAM *bs)
+     return result;
+ }
+ 
+-static int _bs_read_at( BITSTREAM *bs, int64_t off )
++static BD_USED int _bs_read_at( BITSTREAM *bs, int64_t off )
+ {
+     if (file_seek(bs->fp, off, SEEK_SET) < 0) {
+         BD_DEBUG(DBG_FILE | DBG_CRIT, "bs_read(): seek failed\n");
+@@ -73,6 +74,19 @@ static int _bs_read_at( BITSTREAM *bs, int64_t off )
+     return _bs_read(bs);
+ }
+ 
++static void _bs_refill( BITSTREAM *bs )
++{
++    int64_t pos = bs->pos + (bs->bb.p - bs->bb.p_start);
++    int left = bs->bb.i_left;
++
++    if (_bs_read_at(bs, pos) < 0) {
++        /* seek failed: treat as EOF */
++        bs->size = 0;
++        bb_init(&bs->bb, bs->buf, 0);
++    }
++    bs->bb.i_left = left;
++}
++
+ int bs_init( BITSTREAM *bs, BD_FILE_H *fp )
+ {
+     int64_t size = file_size(fp);;
+@@ -184,6 +198,11 @@ uint32_t bb_read( BITBUFFER *bb, int i_count )
+     int      i_shr;
+     uint32_t i_result = 0;
+ 
++    if (i_count > 32) {
++        BD_ASSERT(i_count <= 32);
++        i_count = 32;
++    }
++
+     while( i_count > 0 ) {
+ 
+         if( bb->p >= bb->p_end ) {
+@@ -214,16 +233,16 @@ uint32_t bb_read( BITBUFFER *bb, int i_count )
+ 
+ uint32_t bs_read( BITSTREAM *bs, int i_count )
+ {
+-    int left;
+-    int bytes = (i_count + 7) >> 3;
++    int bytes;
++
++    if (i_count > 32) {
++        BD_ASSERT(i_count <= 32);
++        i_count = 32;
++    }
++    bytes = (i_count + 7) >> 3;
+ 
+     if (bs->bb.p + bytes >= bs->bb.p_end) {
+-        bs->pos = bs->pos + (bs->bb.p - bs->bb.p_start);
+-        left = bs->bb.i_left;
+-        file_seek(bs->fp, bs->pos, SEEK_SET);
+-        bs->size = file_read(bs->fp, bs->buf, BF_BUF_SIZE);
+-        bb_init(&bs->bb, bs->buf, bs->size);
+-        bs->bb.i_left = left;
++        _bs_refill(bs);
+     }
+     return bb_read(&bs->bb, i_count);
+ }
+@@ -241,16 +260,10 @@ void bb_skip( BITBUFFER *bb, size_t i_count )
+ 
+ void bs_skip( BITSTREAM *bs, size_t i_count )
+ {
+-    int left;
+     size_t bytes = (i_count + 7) >> 3;
+ 
+     if (bs->bb.p + bytes >= bs->bb.p_end) {
+-        bs->pos = bs->pos + (bs->bb.p - bs->bb.p_start);
+-        left = bs->bb.i_left;
+-        file_seek(bs->fp, bs->pos, SEEK_SET);
+-        bs->size = file_read(bs->fp, bs->buf, BF_BUF_SIZE);
+-        bb_init(&bs->bb, bs->buf, bs->size);
+-        bs->bb.i_left = left;
++        _bs_refill(bs);
+     }
+     bb_skip(&bs->bb, i_count);
+ }
+diff --git a/src/util/macro.h b/src/util/macro.h
+index 9b8595a9..53e30435 100644
+--- a/src/util/macro.h
++++ b/src/util/macro.h
+@@ -33,6 +33,13 @@
+ 
+ #define BD_MAX_SSIZE ((int64_t)(((size_t)-1)>>1))
+ 
++#define BD_ASSERT(p)                                      \
++  do {                                                    \
++    if (!(p)) {                                           \
++      BD_DEBUG(DBG_CRIT, "assertion failed: '%s'\n", #p); \
++    }                                                     \
++  } while (0)
++
+ /*
+  * automatic cast from void* (malloc/calloc/realloc)
+  */

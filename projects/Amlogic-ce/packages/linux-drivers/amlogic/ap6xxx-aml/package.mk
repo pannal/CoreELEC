@@ -32,16 +32,6 @@ make_target() {
 
   if [ "$DEVICE" = "Amlogic-ng" ]; then
     echo
-    echo "building ap6275s"
-    kernel_make -C  ${PKG_BUILD}/bcmdhd.100.10.545.x \
-         PWD=${PKG_BUILD}/bcmdhd.100.10.545.x \
-         KDIR=$(kernel_path) \
-         ARCH=${TARGET_KERNEL_ARCH} \
-         CROSS_COMPILE=${TARGET_KERNEL_PREFIX} \
-         CONFIG_BCMDHD_DISABLE_WOWLAN=y \
-         bcmdhd_sdio
-
-    echo
     echo "building ap6275p"
     kernel_make -C  ${PKG_BUILD}/bcmdhd.101.10.591.x \
          M=${PKG_BUILD}/bcmdhd.101.10.591.x \
@@ -56,8 +46,12 @@ make_target() {
 makeinstall_target() {
   mkdir -p ${INSTALL}/$(get_full_module_dir)/${PKG_NAME}
 
-  find ${PKG_BUILD}/ -name \*.ko -not -path '*/\.*' \
-    -exec cp {} ${INSTALL}/$(get_full_module_dir)/${PKG_NAME} \;
+  cp ${PKG_BUILD}/bcmdhd.1.363.59.144.x.cn/dhd.ko \
+    ${INSTALL}/$(get_full_module_dir)/${PKG_NAME}/
+  if [ "$DEVICE" = "Amlogic-ng" ]; then
+    cp ${PKG_BUILD}/bcmdhd.101.10.591.x/dhdpci.ko \
+      ${INSTALL}/$(get_full_module_dir)/${PKG_NAME}/
+  fi
 }
 
 post_install() {

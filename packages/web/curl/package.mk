@@ -3,21 +3,18 @@
 # Copyright (C) 2018-present Team LibreELEC (https://libreelec.tv)
 
 PKG_NAME="curl"
-PKG_VERSION="8.6.0"
-PKG_SHA256="3ccd55d91af9516539df80625f818c734dc6f2ecf9bada33c76765e99121db15"
+PKG_VERSION="8.23.0"
+PKG_SHA256="8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5"
 PKG_LICENSE="MIT"
-PKG_SITE="https://curl.haxx.se"
-PKG_URL="https://curl.haxx.se/download/${PKG_NAME}-${PKG_VERSION}.tar.xz"
-PKG_DEPENDS_TARGET="toolchain zlib openssl rtmpdump libidn2 nghttp2"
+PKG_SITE="https://curl.se"
+PKG_URL="https://curl.se/download/${PKG_NAME}-${PKG_VERSION}.tar.xz"
+PKG_DEPENDS_TARGET="toolchain zlib openssl libidn2 nghttp2"
 PKG_LONGDESC="Client and library for (HTTP, HTTPS, FTP, ...) transfers."
 PKG_TOOLCHAIN="configure"
 
-PKG_CONFIGURE_OPTS_TARGET="ac_cv_lib_rtmp_RTMP_Init=yes \
-                           ac_cv_header_librtmp_rtmp_h=yes \
-                           --disable-debug \
+PKG_CONFIGURE_OPTS_TARGET="--disable-debug \
                            --enable-optimize \
                            --enable-warnings \
-                           --disable-curldebug \
                            --disable-ares \
                            --enable-largefile \
                            --enable-http \
@@ -32,10 +29,10 @@ PKG_CONFIGURE_OPTS_TARGET="ac_cv_lib_rtmp_RTMP_Init=yes \
                            --disable-tftp \
                            --disable-pop3 \
                            --disable-imap \
-                           --disable-smb \
                            --disable-smtp \
                            --disable-gopher \
                            --disable-mqtt \
+                           --disable-websockets \
                            --disable-manual \
                            --enable-libgcc \
                            --enable-ipv6 \
@@ -50,15 +47,13 @@ PKG_CONFIGURE_OPTS_TARGET="ac_cv_lib_rtmp_RTMP_Init=yes \
                            --with-zlib \
                            --without-brotli \
                            --without-zstd \
-                           --with-random=/dev/urandom \
                            --without-gnutls \
-                           --with-ssl \
+                           --with-openssl \
                            --without-mbedtls \
                            --with-ca-bundle=/run/libreelec/cacert.pem \
                            --without-ca-path \
                            --without-libpsl \
                            --without-libssh2 \
-                           --with-librtmp \
                            --with-libidn2 \
                            --with-nghttp2"
 

@@ -1,0 +1,558 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: v-lix <280294695+v-lix@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 00:00:00 +0000
+Subject: [PATCH] avcodec/dca_xll: detect Auro-3D carried in DTS-HD MA
+
+Auro-3D does not extend the bitstream. An Auro title is an ordinary 5.1 or
+7.1 DTS-HD MA stream whose height layer is written into the low bits of the
+24-bit PCM samples, so every field a demuxer can read says plain DTS-HD MA and
+the side channel is only legible once the samples are reconstructed. That is
+also why MediaInfoLib's own Auro detection, MediaArea/MediaInfoLib#2531, runs
+on WAV and raw PCM only.
+
+Reconstructed samples are what ff_dca_xll_filter_frame() already holds, a few
+lines below where the DTS:X syncword becomes a profile, so the probe costs the
+scan and nothing else. Getting the answer before playback took a second
+change: find_stream_info() reaches this code but stops at the first decoded
+frame, and one frame is 512 samples where the scan needs several thousand.
+Widening has_codec_parameters() would make a stream that ends early report
+missing parameters, so try_decode_frame() and the outer read loop each get one
+condition instead. Only DTS-HD MA pays, and that is what reaches passthrough
+users and the library scanner, neither of which decodes a frame.
+
+A block opens with sixteen samples whose bit 0 is set, and three bit planes of
+those sixteen are its header: bit 0 the sync, bit 1 a CRC16-CCITT over the
+block, bit 2 its length and the low bits per sample the side channel borrows.
+Sync alone is not evidence and neither is the CRC behind it - sixteen bits
+each, which a long enough run of candidates satisfies by chance - so a block is
+believed only once it also reads as one: CRC matched and bytecode walked to its
+end. One such block is the whole test and the verdict is then latched.
+
+The layout goes in the level, where 0008 already puts the DTS:X object count
+and for the same reason: it says which variant of a codec, not which codec, so
+every consumer that enumerates the DTS-HD MA family by profile goes on seeing
+what it saw. Reading it walks the payload bit planes to ADOL instruction 0x1E,
+which announces the channel-input configuration, after checking the reserved
+bit every 16*m positions is clear. What lands in the level is the mask of
+streams that configuration places - bit 3 the LFE, bits 9 to 14 the heights,
+the rest the floor - so its population count is the channel count and the name
+a listener uses is arithmetic on the same mask. Neither is derived here.
+
+Measured on seven carriers: six Auro-3D demo titles and the reference carrier
+from the Orua-D3 pair. All six titles report "DTS-HD MA + Auro-3D" after
+find_stream_info alone with nothing decoded by the caller, all seven validate
+on the first candidate reached, and every recovered layout matches the
+independent reference parser - 32319 for the four 11.1 titles, 26175 for the
+two 9.1 ones, and 63 for the reference carrier, which wraps a 5.1 original
+with no height layer and so names no presentation.
+
+Negative controls reject on every channel: the 5.1 original of the same
+programme as that carrier (24-bit 96 kHz, bit 0 set in 47% of its samples, and
+not one of its chance sync runs survives its CRC), the carrier with bit 0
+randomised, the carrier with its low byte cleared, white noise, digital
+silence, a ramp, and the constant -8354511 - the one input here whose sixteen
+sample window satisfies both the sync and the CRC, and which the walk then
+rejects. 20000 random buffers with bit 0 set throughout were swept as well, and
+none is accepted. Streams truncated between 4 KB and 2 MB were checked
+against an unpatched build: no new warnings, and a stream too short to finish
+the scan stays "DTS-HD MA".
+
+Like the DTS:X detection alongside it this is reverse engineering rather than
+specification, and AV_PROFILE_DTS_HD_MA_AURO3D is local to this tree. Built
+and run as ffprobe on x86_64 against ffmpeg 8.1.2 with 0005 and 0008 applied
+first; not built for the device.
+ libavcodec/dca_xll.c  | 352 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ libavcodec/dca_xll.h  |  26 ++++
+ libavcodec/defs.h     |   1 +
+ libavcodec/profiles.c |   1 +
+ libavformat/demux.c   |  23 ++++
+ 5 files changed, 403 insertions(+)
+
+diff --git a/libavcodec/dca_xll.c b/libavcodec/dca_xll.c
+--- a/libavcodec/dca_xll.c
++++ b/libavcodec/dca_xll.c
+@@ -1349,6 +1349,310 @@ static int combine_residual_frame(DCAXllDecoder *s, DCAXllChSet *c)
+     return 0;
+ }
+ 
++static uint16_t auro_crc16(uint16_t crc, uint8_t b)
++{
++    int i;
++
++    crc ^= b << 8;
++    for (i = 0; i < 8; i++)
++        crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1;
++    return crc;
++}
++
++/* CRC16-CCITT over all three bytes of every 24-bit sample in the block. Bit 1
++ * of the first byte is masked out of the first sixteen samples: it carries part
++ * of the block header, which the encoder writes after taking the CRC. */
++static uint16_t auro_block_crc(const int32_t *s, int n)
++{
++    uint16_t crc = 0;
++    int i, first = FFMIN(n, 16);
++
++    for (i = 0; i < n; i++) {
++        uint32_t w = s[i] & 0xFFFFFF;
++
++        crc = auro_crc16(crc, (i < first ? (w & 0xFD) : w) & 0xFF);
++        crc = auro_crc16(crc, (w >>  8) & 0xFF);
++        crc = auro_crc16(crc, (w >> 16) & 0xFF);
++    }
++    return ~crc;
++}
++
++/* The CRC the encoder stored, carried a couple of bits at a time through the
++ * low half of the block's first sixteen samples. */
++static uint16_t auro_stored_crc(const int32_t *s)
++{
++    uint32_t lo[16], v22, a, b, c, d, e, f;
++    int i;
++
++    for (i = 0; i < 16; i++)
++        lo[i] = s[i] & 0xFFFF;
++
++#define AURO_B4(v) ((2 * ((v) & 0xFF)) & 4)
++    v22 = (((2 * lo[0]) & 0xFFFFFFFC) | (lo[1] & 3)) >> 1;
++    a   = ((((2 * lo[2]) & 4) | (8 * (v22 & 3)) | (lo[3] & 3)) >> 1) & 0xF;
++    b   = (((2 * lo[4]) & 4) | (8 * a) | (lo[5] & 3)) >> 1;
++    c   = (AURO_B4(lo[6])  | (8 * b) | (lo[7]  & 3)) >> 1;
++    d   = (AURO_B4(lo[8])  | (8 * c) | (lo[9]  & 3)) >> 1;
++    e   = (AURO_B4(lo[10]) | (8 * d) | (lo[11] & 3)) >> 1;
++    f   =  AURO_B4(lo[12]) | (8 * e) | (lo[13] & 3);
++#undef AURO_B4
++
++    return (((2 * f) & 0xFFFFFFFC) | (lo[14] & 2) | ((lo[15] >> 1) & 1)) & 0xFFFF;
++}
++
++/* A block opens with sixteen samples whose bit 0 is set. Three bit planes of
++ * those sixteen carry the whole header: bit 0 the sync, bit 1 the stored CRC,
++ * bit 2 the length and the width. The length is spread through bit 2 of the
++ * first eight, with bit 1 carried along the way the commercial decoder carries
++ * it and masked off at the next step; the width is bit 2 of the last four, and
++ * says how many low bits of every sample in the block the side channel borrows.
++ * 0 when this is not a block head.
++ *
++ * Every one of the 256 length codes names a length, from 16 up to
++ * DCA_AURO_BLOCK_MAX, so there is nothing to range-check: what a head is worth
++ * is settled by its CRC, not by its length looking plausible. The width is
++ * bounded, because at fewer than three bits the header planes would not fit in
++ * their own samples. */
++static int auro_block_size(const int32_t *s, int *lsb_bits)
++{
++    uint32_t q[8], a, b, c, raw, width = 0;
++    int i;
++
++    for (i = 0; i < 16; i++)
++        if (!(s[i] & 1))
++            return 0;
++    for (i = 0; i < 8; i++)
++        q[i] = s[i] & 0xFFFFFF;
++
++    a   = (q[0] & 4) | ((q[1] >> 1) & 3);
++    b   = ((4 * a) & 0xF8) | (q[2] & 4) | ((q[3] >> 1) & 3);
++    c   = ((4 * b) & 0x78) | (q[4] & 4) | ((q[5] >> 1) & 2) | !!(q[6] & 4);
++    raw = ((4 * q[7]) & 0x10) | (32 * c);
++
++    for (i = 12; i < 16; i++)
++        width = (width << 1) | ((s[i] >> 2) & 1);
++    *lsb_bits = width > DCA_AURO_LSB_BITS_MAX - DCA_AURO_LSB_BITS_MIN
++                    ? 0 : DCA_AURO_LSB_BITS_MAX - width;
++
++    return raw == 0x3D0 ? 1000 : raw + 16;
++}
++
++/* Where payload bit position pos lives: which sample, and which bit of it.
++ *
++ * The first 48 positions are the three header planes, read straight across the
++ * sixteen header samples. The rest of the header samples give up their bits 3
++ * and above, and from there the payload runs through every sample's low m bits,
++ * most significant first. One position every 16*m is reserved and is stepped
++ * over by a reader of the payload, which is what skip_reserved selects; the
++ * check for those bits being clear has to look at them, so it does not. */
++static void auro_locate(int pos, int m, int skip_reserved, int *idx, int *bit)
++{
++    int header_bits = 16 * m;
++
++    if (pos < 48) {
++        *idx = pos & 15;
++        *bit = pos >> 4;
++    } else if (pos < header_bits) {
++        int rel = pos - 48;
++
++        *idx = rel / (m - 3);
++        *bit = m - 1 - rel % (m - 3);
++    } else {
++        if (skip_reserved)
++            pos += (pos - m) / (header_bits - 1);
++        *idx = pos / m;
++        *bit = m - 1 - pos % m;
++    }
++}
++
++/* One raw position every 16*m, from 17*m-1, must read zero across the block.
++ * An independent check on the same bits the CRC covers: it costs a pass and it
++ * is what stops a payload walk from following a mis-read width into noise. */
++static int auro_reserved_clear(const int32_t *s, int n, int m)
++{
++    int pos, total = m * n;
++
++    for (pos = 17 * m - 1; pos < total; pos += 16 * m) {
++        int idx, bit;
++
++        auro_locate(pos, m, 0, &idx, &bit);
++        if (idx >= n || ((s[idx] >> bit) & 1))
++            return 0;
++    }
++    return 1;
++}
++
++typedef struct AuroBits {
++    const int32_t *s;
++    int n;
++    int m;
++    int pos;
++    int err;
++} AuroBits;
++
++static uint32_t auro_read(AuroBits *b, int bits)
++{
++    uint32_t v = 0;
++    int i;
++
++    for (i = 0; i < bits; i++) {
++        int idx, bit;
++
++        auro_locate(b->pos++, b->m, 1, &idx, &bit);
++        if (idx >= b->n) {
++            b->err = 1;
++            return 0;
++        }
++        v = (v << 1) | ((b->s[idx] >> bit) & 1);
++    }
++    return v;
++}
++
++/* Operand width of an ADOL opcode, -1 for one the reference does not define.
++ * Only 0x1E's operand is wanted; the rest are read to step over them, which is
++ * why 0x40's two eight-bit operands are taken as one sixteen. */
++static int auro_adol_operand_bits(int opcode)
++{
++    if (opcode == 0x00)
++        return 0;
++    if (opcode == 0x01 || opcode == 0x03 || (opcode >= 0x5A && opcode <= 0x62))
++        return 16;
++    if (opcode == 0x02 || opcode == 0x04 || opcode == 0x1E || opcode == 0x1F ||
++        opcode == 0x41 || opcode == 0x47 || (opcode >= 0x50 && opcode <= 0x58))
++        return 8;
++    if (opcode == 0x0E || opcode == 0x46 || (opcode >= 0x6E && opcode <= 0x76) ||
++        (opcode >= 0x80 && opcode <= 0x85) || (opcode >= 0x8C && opcode <= 0x90))
++        return 32;
++    if (opcode == 0x40)
++        return 16;
++    if (opcode >= 0x64 && opcode <= 0x6C)
++        return 24;
++    return -1;
++}
++
++/* The layout a channel-input configuration unfolds to, as a mask of the streams
++ * it places: bit 3 is the LFE, bits 9 to 14 are the heights, the rest are the
++ * floor. So its population count is the channel count and the two labels a host
++ * shows are arithmetic on it, with no table at the far end. 0 for a
++ * configuration the public tables do not name. */
++static int auro_config_layout(unsigned cfg)
++{
++    static const struct { uint8_t cfg; uint16_t layout; } tab[] = {
++        {   1,    55 }, {   2,    63 }, {   8,    71 }, {  11,  1587 },
++        {  12,    51 }, {  15,  1599 }, {  20, 26163 }, {  30, 26175 },
++        {  40, 30271 }, {  50, 32319 }, {  54, 26559 }, {  62, 32703 },
++        {  64,     3 }, {  66,     7 }, {  67,   119 }, {  68,   127 },
++        {  69,   439 }, {  70,   447 }, {  71, 26167 }, {  72, 30263 },
++        {  73, 32311 }, {  74, 26551 }, {  75,  1983 }, {  76, 30647 },
++        {  77, 30655 }, {  78, 32695 }, { 128,     4 }, { 129,  2052 },
++        { 130,  6148 },
++    };
++    size_t i;
++
++    for (i = 0; i < FF_ARRAY_ELEMS(tab); i++)
++        if (tab[i].cfg == cfg)
++            return tab[i].layout;
++    return 0;
++}
++
++/* Read the layout out of a block whose CRC has already matched. The ADOL
++ * bytecode sits behind a run of fixed fields whose meaning is not public; they
++ * are stepped over at the widths the reference parser uses, and instruction
++ * 0x1E is the one that announces the configuration.
++ *
++ * Three outcomes, and the caller needs all three apart: a layout, 0 for a block
++ * that holds together but names a configuration the public tables do not, and
++ * -1 for one that does not hold together at all. The last is not a block - a
++ * sixteen bit CRC matches by chance about once in every 65536 candidates, and
++ * the scan below offers it sixty-four - so it is the walk that settles it. */
++static int auro_block_layout(const int32_t *s, int n, int m)
++{
++    AuroBits b = { .s = s, .n = n, .m = m, .pos = 48 };
++    unsigned adol_blocks, streams = 0, cfg = 0;
++    int i, table_words;
++
++    if (m < DCA_AURO_LSB_BITS_MIN || !auro_reserved_clear(s, n, m))
++        return -1;
++
++    auro_read(&b, 8); auro_read(&b, 8); auro_read(&b, 1); auro_read(&b, 1);
++    auro_read(&b, 2); auro_read(&b, 4); auro_read(&b, 8);
++    adol_blocks = auro_read(&b, 8);
++    auro_read(&b, 8);
++    for (i = 0; i < 4; i++)
++        if (auro_read(&b, 8) != 0xFF)
++            streams++;
++    for (i = 0; i < 4; i++)
++        auro_read(&b, 8);
++
++    /* A downmix table follows two or three streams, and nothing follows fewer.
++     * Four is not a shape the format defines. */
++    table_words = streams < 2 ? 0 : streams == 2 ? 2 : streams == 3 ? 5 : -1;
++    if (table_words < 0)
++        return -1;
++    for (i = 0; i < table_words; i++)
++        auro_read(&b, 32);
++
++    while (adol_blocks--) {
++        int instructions = 0;
++
++        if (auro_read(&b, 8) != 1 || b.err)
++            return -1;
++        for (;;) {
++            int opcode = auro_read(&b, 8);
++            int operand_bits = auro_adol_operand_bits(opcode);
++
++            if (b.err || operand_bits < 0 ||
++                ++instructions > DCA_AURO_MAX_ADOL_INSTRUCTIONS)
++                return -1;
++            if (opcode == 0x1E)
++                cfg = auro_read(&b, 8);
++            else
++                auro_read(&b, operand_bits);
++            if (!opcode)
++                break;
++        }
++    }
++
++    return b.err ? -1 : auro_config_layout(cfg);
++}
++
++/* A block is Auro when its CRC matches and it then walks to the end of its own
++ * bytecode. Neither half is enough alone: the sync is only sixteen low bits,
++ * which any channel throws by chance, and the CRC behind it is sixteen more, so
++ * a long enough run of candidates will eventually satisfy both - 8192 samples
++ * of the constant -8354511 do. What such a window cannot do is read as a block
++ * afterwards, so the walk is what separates the two.
++ *
++ * Returns 1 when a block validates, -1 when so many candidates have failed that
++ * the answer is no and further scanning would only cost time, 0 while it may
++ * still be ahead. Every Auro carrier tested validates on the first candidate:
++ * blocks tile the stream, so the first sync found is a real block head. A
++ * channel whose low bit is set throughout offers a candidate at nearly every
++ * sample, and without the ceiling each one buys a CRC over up to
++ * DCA_AURO_BLOCK_MAX samples. */
++static int auro_scan(const int32_t *s, int n, int *layout)
++{
++    int start, tries = 0;
++
++    for (start = 0; start + 16 <= n; start++) {
++        int m, bs = auro_block_size(s + start, &m);
++
++        if (!bs || start + bs > n)
++            continue;
++        if (auro_block_crc(s + start, bs) == auro_stored_crc(s + start)) {
++            int found = auro_block_layout(s + start, bs, m);
++
++            if (found >= 0) {
++                *layout = found;
++                return 1;
++            }
++        }
++        if (++tries >= DCA_AURO_MAX_CANDIDATES)
++            return -1;
++    }
++    return 0;
++}
++
+ int ff_dca_xll_filter_frame(DCAXllDecoder *s, AVFrame *frame)
+ {
+     AVCodecContext *avctx = s->avctx;
+@@ -1491,6 +1783,51 @@ int ff_dca_xll_filter_frame(DCAXllDecoder *s, AVFrame *frame)
+         }
+     }
+ 
++    /* Auro-3D hides its height layer in the low bits of an ordinary DTS-HD MA
++     * carrier, so nothing in the bitstream names it and the profile above says
++     * plain MA. The side channel is only legible here, in the reconstructed
++     * samples, which is also where the DTS:X syncword is turned into a profile
++     * a few lines up - so this costs the scan and nothing else.
++     *
++     * Only the first output channel is scanned, and only until one block
++     * validates or the budget runs out; after that the answer is latched and no
++     * further frame pays anything. Skipped unless the samples are stored
++     * unshifted, because a carrier whose low bits have been moved is not one
++     * Auro could have been written into. */
++    if (!s->auro_latched && !shift && frame->format == AV_SAMPLE_FMT_S32P &&
++        avctx->profile == AV_PROFILE_DTS_HD_MA) {
++        const int32_t *plane = (const int32_t *)frame->extended_data[0];
++        int take = FFMIN(nsamples, DCA_AURO_SCAN_SAMPLES - s->auro_nsamples);
++        int found;
++
++        for (k = 0; k < take; k++)
++            s->auro_samples[s->auro_nsamples + k] = plane[k] >> 8;
++        s->auro_nsamples += take;
++
++        found = auro_scan(s->auro_samples, s->auro_nsamples, &s->auro_layout);
++        if (found > 0)
++            s->auro_present = s->auro_latched = 1;
++        else if (found < 0 || s->auro_nsamples >= DCA_AURO_SCAN_SAMPLES)
++            s->auro_latched = 1;
++    }
++
++    /* Re-asserted every frame: the switch above sets the profile afresh each
++     * time, and an Auro carrier is DTS-HD MA to it every time.
++     *
++     * The layout goes in the level, where 0008 already puts the DTS:X object
++     * count, and for the same reason: it says which variant of a codec, not
++     * which codec, so every list that enumerates the DTS-HD MA family by
++     * profile goes on seeing what it saw. It is the mask of streams the
++     * configuration places, passed on as the format states it - the count of
++     * them and the name a listener uses are both arithmetic on that mask, and
++     * belong to whoever asked rather than here. 0 for a block that announced no
++     * configuration, which stays at AV_LEVEL_UNKNOWN and says nothing. */
++    if (s->auro_present && avctx->profile == AV_PROFILE_DTS_HD_MA) {
++        avctx->profile = AV_PROFILE_DTS_HD_MA_AURO3D;
++        if (s->auro_layout)
++            avctx->level = s->auro_layout;
++    }
++
+     if (!asset->one_to_one_map_ch_to_spkr) {
+         if (asset->representation_type == DCA_REPR_TYPE_LtRt)
+             matrix_encoding = AV_MATRIX_ENCODING_DOLBY;
+@@ -1507,6 +1844,9 @@ int ff_dca_xll_filter_frame(DCAXllDecoder *s, AVFrame *frame)
+ 
+ av_cold void ff_dca_xll_flush(DCAXllDecoder *s)
+ {
++    /* The next stream need not be the one that was scanned, so the verdict goes
++     * with the rest of the state rather than outliving what it described. */
++    s->auro_latched = s->auro_present = s->auro_nsamples = s->auro_layout = 0;
+     clear_pbr(s);
+ }
+ 
+diff --git a/libavcodec/dca_xll.h b/libavcodec/dca_xll.h
+--- a/libavcodec/dca_xll.h
++++ b/libavcodec/dca_xll.h
+@@ -37,6 +37,26 @@
+ #define DCA_XLL_DMIX_SCALES_MAX         ((DCA_XLL_CHSETS_MAX - 1) * DCA_XLL_CHANNELS_MAX)
+ #define DCA_XLL_DMIX_COEFFS_MAX         (DCA_XLL_DMIX_SCALES_MAX * DCA_XLL_CHANNELS_MAX)
+ #define DCA_XLL_PBR_BUFFER_MAX          (240 << 10)
++
++/* Auro-Codec scan: the largest block the size code can express, how much of the
++ * first output channel to look at before giving up, and how many failed block
++ * candidates to pay for.
++ *
++ * Blocks tile the stream, so a buffer holding two of the largest always holds
++ * one whole one whatever phase it starts at; the reference detector sizes its
++ * own ring the same way. 8192 samples is ~170 ms at 48 kHz, and sixteen frames
++ * of the usual 512. Every carrier tested validates on its first candidate, so
++ * 64 is generous. */
++#define DCA_AURO_BLOCK_MAX              4096
++#define DCA_AURO_SCAN_SAMPLES           (2 * DCA_AURO_BLOCK_MAX)
++#define DCA_AURO_MAX_CANDIDATES         64
++
++/* Low bits per sample the side channel may borrow, and the ceiling on how far
++ * the bytecode announcing the layout is followed. Below three the header planes
++ * would not fit in their own samples. */
++#define DCA_AURO_LSB_BITS_MIN           3
++#define DCA_AURO_LSB_BITS_MAX           14
++#define DCA_AURO_MAX_ADOL_INSTRUCTIONS  64
+ #define DCA_XLL_SAMPLE_BUFFERS_MAX      3
+ 
+ typedef struct DCAXllBand {
+@@ -138,6 +158,12 @@ typedef struct DCAXllDecoder {
+     int    x_syncword_present;        ///< Syncword for extension data at end of frame (DTS:X) is present
+     int    x_imax_syncword_present;   ///< Syncword for extension data at end of frame (DTS:X IMAX) is present
+ 
++    int     auro_latched;             ///< Auro-Codec scan has finished, one way or the other
++    int     auro_present;             ///< Auro-Codec side channel confirmed by a block CRC
++    int     auro_layout;              ///< Stream mask of the layout it unfolds to, 0 if unannounced
++    int     auro_nsamples;            ///< Samples held in auro_samples
++    int32_t auro_samples[DCA_AURO_SCAN_SAMPLES]; ///< First output channel, 24-bit, for the scan
++
+     int     output_mask;
+     int32_t *output_samples[DCA_SPEAKER_COUNT];
+ } DCAXllDecoder;
+diff --git a/libavcodec/defs.h b/libavcodec/defs.h
+--- a/libavcodec/defs.h
++++ b/libavcodec/defs.h
+@@ -92,6 +92,7 @@
+ #define AV_PROFILE_DTS_EXPRESS        70
+ #define AV_PROFILE_DTS_HD_MA_X        61
+ #define AV_PROFILE_DTS_HD_MA_X_IMAX   62
++#define AV_PROFILE_DTS_HD_MA_AURO3D   63
+ 
+ #define AV_PROFILE_EAC3_DDP_ATMOS         30
+ 
+diff --git a/libavcodec/profiles.c b/libavcodec/profiles.c
+--- a/libavcodec/profiles.c
++++ b/libavcodec/profiles.c
+@@ -45,6 +45,7 @@ const AVProfile ff_dca_profiles[] = {
+     { AV_PROFILE_DTS_HD_MA,          "DTS-HD MA"              },
+     { AV_PROFILE_DTS_HD_MA_X,        "DTS-HD MA + DTS:X"      },
+     { AV_PROFILE_DTS_HD_MA_X_IMAX,   "DTS-HD MA + DTS:X IMAX" },
++    { AV_PROFILE_DTS_HD_MA_AURO3D,   "DTS-HD MA + Auro-3D"    },
+     { AV_PROFILE_DTS_EXPRESS,        "DTS Express"            },
+     { AV_PROFILE_UNKNOWN },
+ };
+diff --git a/libavformat/demux.c b/libavformat/demux.c
+--- a/libavformat/demux.c
++++ b/libavformat/demux.c
+@@ -2134,6 +2134,26 @@ static int has_codec_parameters(const AVStream *st, const char **errmsg_ptr)
+     return 1;
+ }
+ 
++/* Auro-3D rides in the low bits of an ordinary DTS-HD MA carrier. The scan in
++ * dca_xll.c can only see it in reconstructed samples and needs more of them
++ * than a single frame carries - DCA_AURO_SCAN_SAMPLES, sixteen frames at the
++ * usual 512 - but probing stops at the first decoded frame. Passthrough
++ * playback and the library scanner never decode a frame of their own, so
++ * without this they would never be told. Only DTS-HD MA pays for it: anything
++ * that is not DTS, or that the first frame already named DTS:X, drops out. */
++#define DCA_AURO_PROBE_FRAMES 16
++
++static int dca_auro_probe_pending(const AVStream *st)
++{
++    const FFStream *const sti = cffstream(st);
++    const AVCodecContext *const avctx = sti->avctx;
++
++    return avctx->codec_id == AV_CODEC_ID_DTS &&
++           sti->info->found_decoder >= 0 &&
++           sti->nb_decoded_frames < DCA_AURO_PROBE_FRAMES &&
++           (!sti->nb_decoded_frames || avctx->profile == AV_PROFILE_DTS_HD_MA);
++}
++
+ /* returns 1 or 0 if or if not decoded data was returned, or a negative error */
+ static int try_decode_frame(AVFormatContext *s, AVStream *st,
+                             const AVPacket *pkt, AVDictionary **options)
+@@ -2198,6 +2218,7 @@ static int try_decode_frame(AVFormatContext *s, AVStream *st,
+     while ((pkt_to_send || (!pkt->data && got_picture)) &&
+            ret >= 0 &&
+            (!has_codec_parameters(st, NULL) || !has_decode_delay_been_guessed(st) ||
++            dca_auro_probe_pending(st) ||
+             (!sti->codec_info_nb_frames &&
+              (avctx->codec->capabilities & AV_CODEC_CAP_CHANNEL_CONF)))) {
+         got_picture = 0;
+@@ -2728,6 +2749,8 @@ int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
+ 
+             if (!has_codec_parameters(st, NULL))
+                 break;
++            if (dca_auro_probe_pending(st))
++                break;
+             /* If the timebase is coarse (like the usual millisecond precision
+              * of mkv), we need to analyze more frames to reliably arrive at
+              * the correct fps. */

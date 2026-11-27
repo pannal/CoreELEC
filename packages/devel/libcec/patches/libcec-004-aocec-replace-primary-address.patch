@@ -1,0 +1,54 @@
+From: CoreELEC
+Subject: [PATCH] AOCEC: replace logical addresses when claiming an allocation
+
+The newer kernel keeps the first saved logical address for standby firmware
+and puts subsequent addresses in a second slot. AOCEC previously only added the primary
+address, so ADD alone can leave G12B standby firmware using an old allocation
+on reconnect or address change.
+
+Clear the previous allocation before adding a valid primary, then restore
+the remaining requested addresses for other registered libCEC clients. Keep the
+unregistered path unchanged: final client teardown must retain the wake
+address until the next allocation. Generic kernel multi-address users are
+unaffected. This fixes a source-level compatibility defect found while
+investigating pannal/CoreELEC#103; device wake behavior remains to be verified.
+
+---
+--- a/src/libcec/adapter/AOCEC/AOCECAdapterCommunication.cpp
++++ b/src/libcec/adapter/AOCEC/AOCECAdapterCommunication.cpp
+@@ -224,11 +224,35 @@
+   if (!IsOpen())
+     return false;
+ 
++  // Replace the allocation, programming the primary first for standby firmware.
++  // Keep the saved address when unregistering: the kernel uses it to wake us.
++  if (log_addr < CECDEVICE_BROADCAST &&
++      ioctl(m_fd, CEC_IOC_CLR_LOGICAL_ADDR, 0))
++  {
++    LIB_CEC->AddLog(CEC_LOG_WARNING, "%s: ioctl(CEC_IOC_CLR_LOGICAL_ADDR) failed", __func__);
++    return false;
++  }
++
+   if (ioctl(m_fd, CEC_IOC_ADD_LOGICAL_ADDR, log_addr))
+   {
+     LIB_CEC->AddLog(CEC_LOG_WARNING, "%s: ioctl(CEC_IOC_ADD_LOGICAL_ADDR) failed", __func__);
+     return false;
+   }
++
++  // Keep every address still owned by another registered libCEC client.
++  if (log_addr < CECDEVICE_BROADCAST)
++  {
++    for (uint8_t address = 0; address < CECDEVICE_BROADCAST; ++address)
++    {
++      if (address != log_addr && addresses[address] &&
++          ioctl(m_fd, CEC_IOC_ADD_LOGICAL_ADDR, address))
++      {
++        LIB_CEC->AddLog(CEC_LOG_WARNING, "%s: ioctl(CEC_IOC_ADD_LOGICAL_ADDR) failed", __func__);
++        return false;
++      }
++    }
++  }
++
+   m_logicalAddresses = addresses;
+   m_bLogicalAddressChanged = true;
+ 

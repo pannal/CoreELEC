@@ -1,0 +1,32 @@
+# The virtual room the cascaded binaural mode renders onto: a closed 3D shell
+# around the listener rather than a room anyone would build. Transcribed from
+# the engine's own `cascade-12` preset (SpeakerLayout::preset_cascade_12), so
+# that the codec can select it through the layout path the C ABI already takes
+# and does not need a preset-by-name knob that the ABI does not have.
+#
+# Eight spatialized positions on the ear plane at 45 degree spacing, where
+# almost all content lives, plus four at 45 degrees of elevation. The zenith is
+# covered by the panner folding the virtual pole onto the height ring. LFE is
+# not spatialized: the binaural stage sends it to both ears dry, which is also
+# why it costs nothing - a cascaded render pays one convolution per spatialized
+# speaker, twelve here, and that count is the whole cost model.
+#
+# Only consulted in cascaded mode. Direct convolves the objects themselves and
+# never opens a layout, which is why its cost came out identical across two
+# different layouts when measured.
+name: "cascade-12"
+radius_m: 1
+speakers:
+  - { name: "C",   coord_mode: "polar", azimuth:    0.0, elevation:   0.0, spatialize: true,  delay_ms: 0 }
+  - { name: "LFE", coord_mode: "polar", azimuth:   45.0, elevation: -10.0, spatialize: false, delay_ms: 0 }
+  - { name: "FL",  coord_mode: "polar", azimuth:  -45.0, elevation:   0.0, spatialize: true,  delay_ms: 0 }
+  - { name: "FR",  coord_mode: "polar", azimuth:   45.0, elevation:   0.0, spatialize: true,  delay_ms: 0 }
+  - { name: "SL",  coord_mode: "polar", azimuth:  -90.0, elevation:   0.0, spatialize: true,  delay_ms: 0 }
+  - { name: "SR",  coord_mode: "polar", azimuth:   90.0, elevation:   0.0, spatialize: true,  delay_ms: 0 }
+  - { name: "BL",  coord_mode: "polar", azimuth: -135.0, elevation:   0.0, spatialize: true,  delay_ms: 0 }
+  - { name: "BR",  coord_mode: "polar", azimuth:  135.0, elevation:   0.0, spatialize: true,  delay_ms: 0 }
+  - { name: "B",   coord_mode: "polar", azimuth:  180.0, elevation:   0.0, spatialize: true,  delay_ms: 0 }
+  - { name: "TFL", coord_mode: "polar", azimuth:  -45.0, elevation:  45.0, spatialize: true,  delay_ms: 0 }
+  - { name: "TFR", coord_mode: "polar", azimuth:   45.0, elevation:  45.0, spatialize: true,  delay_ms: 0 }
+  - { name: "TBL", coord_mode: "polar", azimuth: -135.0, elevation:  45.0, spatialize: true,  delay_ms: 0 }
+  - { name: "TBR", coord_mode: "polar", azimuth:  135.0, elevation:  45.0, spatialize: true,  delay_ms: 0 }

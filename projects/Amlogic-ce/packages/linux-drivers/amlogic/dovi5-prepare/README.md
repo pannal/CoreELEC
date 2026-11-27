@@ -1,0 +1,65 @@
+# Optional second Dolby Vision backend
+
+This package prepares a supported user-provided module for p3i's Amlogic-ng kernel and compatibility shim. The original Dolby Vision module remains required and is loaded first. Missing, disabled, rejected or failed preparation keeps playback on the original backend. This package includes no proprietary module.
+
+This integration targets the supported S922X-J / AM6B+ configuration with ARM userspace and an ARM64 kernel. Amlogic-ne and SC2/S905X4 are outside this package's selected scope. The second backend is used only for eligible native Dolby Vision routes; conversion, VP and unsupported refresh routes continue through the original backend.
+
+Provision the original, unmodified new-module file with SHA256:
+
+```text
+f6c26659a255447685ceac9441e399c999b1fae9c6435c48d70e14a14dd7f8f7
+```
+
+Keep it in one of these locations, in search order:
+
+1. `/storage/.config/dovi5.ko`
+2. `/flash/dovi5.ko`
+3. `/storage/dovi5.ko`
+
+Preparation reads these files and writes a separate private copy under `/storage/.dovi5/generations/`. It never patches the supplied original or writes `/flash`. Keep the supplied original available: a prepared cache alone cannot authorize loading. Already patched or different module contents are rejected.
+
+The image must contain the paired kernel changes, configured `dv_compat_shim`, Python3 and the exact kernel/shim `Module.symvers` installed by this package. Preparation checks the native module layout, running kernel release, readable kernel exports and each imported symbol's target CRC. The kernel enforces strict version checks for `dovi5` and `dv_compat_shim` while retaining the original vendor module's existing compatibility policy. A mismatch rejects the second backend.
+
+Native module metadata may contain repeated parameter types/descriptions, aliases, firmware, author and description records. These records are preserved; identity and compatibility fields, including name, vermagic, depends and license, remain strict singletons.
+
+Installed module references may follow CoreELEC kernel-overlay symlinks to a regular target. Broken or looping links, nonregular targets and incompatible module contents reject preparation. Generated modules, manifests, markers and their directories retain strict link rejection.
+
+To opt out, create `/storage/.config/dovi5.conf` containing:
+
+```ini
+ENABLE=no
+```
+
+`ENABLE=yes` permits preparation and loading when all checks succeed. The system default is in `/etc/dovi5.conf`; the user file takes precedence. Other values or malformed configuration reject loading. Configuration is parsed as data and never executed. Disabling preserves supplied files and complete prepared generations; it removes eligibility for a new load. It does not unload a module already running in the current session; use the setting before the next normal boot or service start.
+
+Preparation is ordered before the Dolby loader. The loader independently rechecks the current source, configuration, kernel/shim references, symbol versions, manifest and complete canonical output before loading the second module. `/run/dovi5-path` identifies a validated generation for that boot and cannot authorize an arbitrary file. Preparation and loader messages are available in the system journal.
+
+The prepared library also supports the default-off **Stabilize SDR subtitle and OSD brightness** option in Kodi's DV settings. Use it only if the TV's scene-dependent dimming of subtitles and the OSD is unwanted. It selects a neutral graphics forward curve before composition with the current video compensation; it does not freeze the final Core2 curves. Video processing, Core3 metadata and the SDR graphics peak input remain native. Disabling restores the native graphics policy.
+
+This option needs the paired driver and shim. The shim advertises `dv_graphics_stable_available` only when the registered library reports `[p3i-gfxref:2]`. Private reserved words at byte 19800 carry the request, retry and successful-generation acknowledgment. The driver retires a request only after Core2 receives its fresh curves; skipped transfers and current CONST decisions do not consume it. Unknown library versions leave the option unavailable.
+
+The transformation is pinned to the supplied source hash and a checked-in graphics helper profile. It preserves the vendor callback/CFI entries, stack checks, legacy ABI and all video mapping instructions. The helper's AArch64 source and profile generator are maintainer inputs; the installed preparation path needs no assembler. To update the profile, assemble `maintainer/graphics-reference.S`, run `maintainer/update-graphics-profile.py` on that object, and update the explicit profile hash in `scripts/dv5_graphics.py` after review.
+
+Successful preparation and loading establish software compatibility checks. CMv4 rendering, chroma quality, cadence and HDMI behavior still require acceptance testing on the paired image and display chain.
+
+For maintainers, tests contain synthetic references only. Supply the optional real module fixture outside the repository:
+
+```sh
+DOVI5_TEST_SOURCE=/path/to/unmodified/dovi5.ko python3 projects/Amlogic-ce/packages/linux-drivers/amlogic/dovi5-prepare/tests/test_dovi5.py
+```
+
+`--fixture /path/to/unmodified/dovi5.ko` is equivalent. Tests resolve the repository's actual opentee loader; `--loader /path/to/dovi-loader.sh` is available for isolated staging. Without a supplied module, real-module cases are explicitly skipped and synthetic validation tests still run. Never add a module fixture to the repository.
+
+To verify complete preparation and load validation against external native build artifacts, pass the matching shim, kernel manifest and exports explicitly. Repeat `--reference` to include installed or stripped shim artifacts from the same kernel:
+
+```sh
+python3 projects/Amlogic-ce/packages/linux-drivers/amlogic/dovi5-prepare/tests/test_dovi5.py \
+  --fixture /path/to/unmodified/dovi5.ko \
+  --reference /path/to/built/dv_compat_shim.ko \
+  --reference /path/to/installed/dv_compat_shim.ko \
+  --versions /path/to/matching/Module.symvers \
+  --exports /path/to/matching/System.map \
+  --reference-report /tmp/dovi5-reference-report.json
+```
+
+These checks model the installed overlay symlink path and run the production preparation/load-validation and standalone patcher entry points. `System.map` supplies host export evidence; it does not verify the running device's `/proc/kallsyms` or load a module. External artifacts are never included in the package.

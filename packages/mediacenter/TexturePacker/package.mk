@@ -7,6 +7,7 @@ PKG_VERSION="0"
 PKG_LICENSE="GPL"
 PKG_SITE="http://www.kodi.tv"
 PKG_DEPENDS_HOST="lzo:host libpng:host libjpeg-turbo:host giflib:host"
+PKG_NEED_UNPACK="$(get_pkg_directory libpng)"
 PKG_DEPENDS_UNPACK="${MEDIACENTER}"
 PKG_LONGDESC="kodi-platform:"
 

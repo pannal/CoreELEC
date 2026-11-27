@@ -35,10 +35,14 @@ if [ "${PROJECT}" = "Generic" -a -z "${DEVICE}" ]; then
 fi
 
 # determines TARGET_ARCH, if not forced by user
+# Note whether the user picked one before the default lands, so the per-device
+# default below stays a default instead of silently overriding the choice.
+_ARCH_FROM_ENV="${ARCH}"
 export ARCH="${ARCH:-aarch64}"
 
 # set default arch for ng device
-[[ "${DEVICE}" = "Amlogic-ng"* ]] && ARCH=arm
+[[ "${DEVICE}" = "Amlogic-ng"* && -z "${_ARCH_FROM_ENV}" ]] && ARCH=arm
+unset _ARCH_FROM_ENV
 
 TARGET_ARCH="${ARCH}"
 

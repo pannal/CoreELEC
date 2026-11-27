@@ -1,0 +1,518 @@
+From 25657dc523fb9c9128c68501e95a11af40a6ef0a Mon Sep 17 00:00:00 2001
+From: v-lix <280294695+v-lix@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 16:53:20 -0500
+Subject: [PATCH] avcodec/dca: detect DTS:X carried in DTS-HD HRA
+
+---
+ libavcodec/Makefile         |   1 +
+ libavcodec/dca_core.c       |  10 ++-
+ libavcodec/dca_exss.c       |  48 ++++++++++
+ libavcodec/dca_exss.h       |   3 +
+ libavcodec/dca_parser.c     |  46 ++++++----
+ libavcodec/dcadec.c         |  11 +++
+ libavcodec/dcadec.h         |   2 +
+ libavcodec/defs.h           |   1 +
+ libavcodec/profiles.c       |   1 +
+ libavcodec/tests/dca_exss.c | 169 ++++++++++++++++++++++++++++++++++++
+ libavformat/demux.c         |  25 +++---
+ tests/fate/libavcodec.mak   |   5 ++
+ 12 files changed, 294 insertions(+), 28 deletions(-)
+ create mode 100644 libavcodec/tests/dca_exss.c
+
+diff --git a/libavcodec/Makefile b/libavcodec/Makefile
+index 854d2d9fbbd5f685d595939cd026cc0ea261a926..2d877402e4f8806011ca3c3eb9b1b2be002f2b68 100644
+--- a/libavcodec/Makefile
++++ b/libavcodec/Makefile
+@@ -1376,6 +1376,7 @@ TESTPROGS = avcodec                                                     \
+ TESTPROGS-$(CONFIG_APV_DECODER)           += apv
+ TESTPROGS-$(CONFIG_AV1_VAAPI_ENCODER)     += av1_levels
+ TESTPROGS-$(CONFIG_CABAC)                 += cabac
++TESTPROGS-$(CONFIG_DCA_DECODER)           += dca_exss
+ TESTPROGS-$(CONFIG_CELP_MATH)             += celp_math
+ TESTPROGS-$(CONFIG_GOLOMB)                += golomb
+ TESTPROGS-$(CONFIG_IDCTDSP)               += dct
+diff --git a/libavcodec/dca_core.c b/libavcodec/dca_core.c
+index cb1f7b7bbfaa81dcd7c1d1ac19519d028f03265a..34c903b1b90efda4e04180003795f4a0eb91e2aa 100644
+--- a/libavcodec/dca_core.c
++++ b/libavcodec/dca_core.c
+@@ -2370,8 +2370,14 @@ int ff_dca_core_filter_frame(DCACoreDecoder *s, AVFrame *frame)
+         return ret;
+ 
+     // Set profile, bit rate, etc
+-    if (s->ext_audio_mask & DCA_EXSS_MASK)
+-        avctx->profile = AV_PROFILE_DTS_HD_HRA;
++    if (s->ext_audio_mask & DCA_EXSS_MASK) {
++        avctx->profile = dca->hra_x_syncword ? AV_PROFILE_DTS_HD_HRA_X
++                                             : AV_PROFILE_DTS_HD_HRA;
++        if (dca->hra_x_syncword >= DCA_SYNCWORD_XLL_X_IMAX &&
++            dca->hra_x_syncword <= DCA_SYNCWORD_XLL_X_5)
++            avctx->level = (dca->hra_x_syncword & 0xf) |
++                           dca->hra_x_height_flags;
++    }
+     else if (s->ext_audio_mask & (DCA_CSS_XXCH | DCA_CSS_XCH))
+         avctx->profile = AV_PROFILE_DTS_ES;
+     else if (s->ext_audio_mask & DCA_CSS_X96)
+diff --git a/libavcodec/dca_exss.c b/libavcodec/dca_exss.c
+index e873088f82dd7fdfd5b1cfeadec4878362caf691..8a38c422b6a731255b7e0e4767184fe676c1df81 100644
+--- a/libavcodec/dca_exss.c
++++ b/libavcodec/dca_exss.c
+@@ -18,7 +18,55 @@
+  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+  */
+ 
++#include <limits.h>
++
++#include "libavutil/intreadwrite.h"
++
+ #include "dcadec.h"
++#include "dca_syncwords.h"
++
++uint32_t ff_dca_exss_hra_x_syncword(const DCAExssParser *s,
++                                    const uint8_t *data, int size,
++                                    int *height_flags)
++{
++    const DCAExssAsset *asset;
++    int end, payload_end, start;
++
++    if (height_flags)
++        *height_flags = 0;
++    if (!s || !data || size < 4 || s->nassets != 1)
++        return 0;
++
++    asset = &s->assets[0];
++    if (asset->extension_mask & DCA_EXSS_XLL ||
++        !(asset->extension_mask & (DCA_EXSS_XBR | DCA_EXSS_XXCH | DCA_EXSS_X96)) ||
++        asset->asset_offset < 0 || asset->asset_size < 0 ||
++        asset->asset_offset > INT_MAX - asset->asset_size)
++        return 0;
++
++    start = asset->asset_offset + asset->asset_size;
++    end = payload_end = FFMIN(size, s->exss_size);
++    if (start > end)
++        return 0;
++    if (end - start > 32)
++        end = start + 32;
++
++    for (; start <= end - 4; start++) {
++        uint32_t syncword = AV_RB32(data + start);
++
++        if (syncword == DCA_SYNCWORD_XLL_X_1)
++            return syncword;
++        if (syncword >= DCA_SYNCWORD_XLL_X_IMAX &&
++            syncword <= DCA_SYNCWORD_XLL_X_5) {
++            if (height_flags)
++                *height_flags = ff_dca_x_height_flags(data + start,
++                                                      payload_end - start);
++            return syncword;
++        }
++    }
++
++    return 0;
++}
+ 
+ static void parse_xll_parameters(DCAExssParser *s, DCAExssAsset *asset)
+ {
+diff --git a/libavcodec/dca_exss.h b/libavcodec/dca_exss.h
+index 9e91b00bfdf1f2d8dbc2cd4980c99ff709683280..3ca481e8e85e65c44ef4815f79649667ebd6a798 100644
+--- a/libavcodec/dca_exss.h
++++ b/libavcodec/dca_exss.h
+@@ -88,5 +88,8 @@ typedef struct DCAExssParser {
+ } DCAExssParser;
+ 
+ int ff_dca_exss_parse(DCAExssParser *s, const uint8_t *data, int size);
++uint32_t ff_dca_exss_hra_x_syncword(const DCAExssParser *s,
++                                    const uint8_t *data, int size,
++                                    int *height_flags);
+ 
+ #endif
+diff --git a/libavcodec/dca_parser.c b/libavcodec/dca_parser.c
+index aaf4f422219deebc7209b4270078e7293a0dc444..dad581470a85c16907aea3f4c7e7896b1c252457 100644
+--- a/libavcodec/dca_parser.c
++++ b/libavcodec/dca_parser.c
+@@ -193,12 +193,13 @@ static av_cold int dca_parse_init(AVCodecParserContext *s)
+ 
+ static int dca_parse_params(DCAParseContext *pc1, const uint8_t *buf,
+                             int buf_size, int *duration, int *sample_rate,
+-                            int *profile)
++                            int *profile, int *level)
+ {
+     DCAExssAsset *asset = &pc1->exss.assets[0];
+     GetBitContext gb;
+     DCACoreFrameHeader h;
+     uint8_t hdr[DCA_CORE_FRAME_HEADER_SIZE + AV_INPUT_BUFFER_PADDING_SIZE] = { 0 };
++    int probe_hra_x = *profile == AV_PROFILE_DTS_HD_HRA;
+     int ret, frame_size;
+ 
+     if (buf_size < DCA_CORE_FRAME_HEADER_SIZE)
+@@ -269,19 +270,21 @@ static int dca_parse_params(DCAParseContext *pc1, const uint8_t *buf,
+ 
+     *duration = h.npcmblocks * DCA_PCMBLOCK_SAMPLES;
+     *sample_rate = ff_dca_sample_rates[h.sr_code];
+-    if (*profile != AV_PROFILE_UNKNOWN)
++    if (*profile != AV_PROFILE_UNKNOWN && !probe_hra_x)
+         return 0;
+ 
+-    *profile = AV_PROFILE_DTS;
+-    if (h.ext_audio_present) {
+-        switch (h.ext_audio_type) {
+-        case DCA_EXT_AUDIO_XCH:
+-        case DCA_EXT_AUDIO_XXCH:
+-            *profile = AV_PROFILE_DTS_ES;
+-            break;
+-        case DCA_EXT_AUDIO_X96:
+-            *profile = AV_PROFILE_DTS_96_24;
+-            break;
++    if (!probe_hra_x) {
++        *profile = AV_PROFILE_DTS;
++        if (h.ext_audio_present) {
++            switch (h.ext_audio_type) {
++            case DCA_EXT_AUDIO_XCH:
++            case DCA_EXT_AUDIO_XXCH:
++                *profile = AV_PROFILE_DTS_ES;
++                break;
++            case DCA_EXT_AUDIO_X96:
++                *profile = AV_PROFILE_DTS_96_24;
++                break;
++            }
+         }
+     }
+ 
+@@ -298,8 +301,20 @@ static int dca_parse_params(DCAParseContext *pc1, const uint8_t *buf,
+ 
+     if (asset->extension_mask & DCA_EXSS_XLL)
+         *profile = AV_PROFILE_DTS_HD_MA;
+-    else if (asset->extension_mask & (DCA_EXSS_XBR | DCA_EXSS_XXCH | DCA_EXSS_X96))
+-        *profile = AV_PROFILE_DTS_HD_HRA;
++    else if (asset->extension_mask & (DCA_EXSS_XBR | DCA_EXSS_XXCH | DCA_EXSS_X96)) {
++        int height_flags;
++        uint32_t syncword = ff_dca_exss_hra_x_syncword(&pc1->exss, buf, buf_size,
++                                                       &height_flags);
++
++        if (syncword) {
++            *profile = AV_PROFILE_DTS_HD_HRA_X;
++            if (syncword >= DCA_SYNCWORD_XLL_X_IMAX &&
++                syncword <= DCA_SYNCWORD_XLL_X_5)
++                *level = (syncword & 0xf) | height_flags;
++        } else {
++            *profile = AV_PROFILE_DTS_HD_HRA;
++        }
++    }
+ 
+     return 0;
+ }
+@@ -332,7 +347,8 @@ static int dca_parse(AVCodecParserContext *s, AVCodecContext *avctx,
+     }
+ 
+     /* read the duration and sample rate from the frame header */
+-    if (!dca_parse_params(pc1, buf, buf_size, &duration, &sample_rate, &avctx->profile)) {
++    if (!dca_parse_params(pc1, buf, buf_size, &duration, &sample_rate,
++                          &avctx->profile, &avctx->level)) {
+         if (!avctx->sample_rate)
+             avctx->sample_rate = sample_rate;
+         s->duration = av_rescale(duration, avctx->sample_rate, sample_rate);
+diff --git a/libavcodec/dcadec.c b/libavcodec/dcadec.c
+index 0d7bf1c53cb0c4e1255b1360d88321360b184619..17a1a955a347feaa9d670589465947bc7537a670 100644
+--- a/libavcodec/dcadec.c
++++ b/libavcodec/dcadec.c
+@@ -211,6 +211,17 @@ static int dcadec_decode_frame(AVCodecContext *avctx, AVFrame *frame,
+             } else {
+                 s->packet |= DCA_PACKET_EXSS;
+                 asset = &s->exss.assets[0];
++                if (!(asset->extension_mask & DCA_EXSS_XLL)) {
++                    int height_flags;
++                    uint32_t syncword = ff_dca_exss_hra_x_syncword(&s->exss,
++                                                                   input,
++                                                                   input_size,
++                                                                   &height_flags);
++                    if (syncword)
++                        s->hra_x_syncword = syncword;
++                    if (height_flags)
++                        s->hra_x_height_flags = height_flags;
++                }
+             }
+         }
+ 
+diff --git a/libavcodec/dcadec.h b/libavcodec/dcadec.h
+index 0ff28dd4d17c97d542775215a1d4ccb95535df12..dae8cba9a879b8aa0d8d1debeed5ba018941c93a 100644
+--- a/libavcodec/dcadec.h
++++ b/libavcodec/dcadec.h
+@@ -67,6 +67,8 @@ typedef struct DCAContext {
+     unsigned int    buffer_size;
+ 
+     int     packet; ///< Packet flags
++    uint32_t hra_x_syncword; ///< Last DTS:X syncword detected after a lossy HRA asset
++    int     hra_x_height_flags; ///< Last DCA_X_LEVEL_* read from that syncword's payload
+ 
+     int     request_channel_layout; ///< Converted from avctx.request_channel_layout
+     int     core_only;              ///< Core only decoding flag
+diff --git a/libavcodec/defs.h b/libavcodec/defs.h
+index 1d2e799730de120fe8a9906e6f54d22709a759da..8ea04f257eb2afc8a19070d190cff6ab900e9aa6 100644
+--- a/libavcodec/defs.h
++++ b/libavcodec/defs.h
+@@ -93,6 +93,7 @@
+ #define AV_PROFILE_DTS_HD_MA_X        61
+ #define AV_PROFILE_DTS_HD_MA_X_IMAX   62
+ #define AV_PROFILE_DTS_HD_MA_AURO3D   63
++#define AV_PROFILE_DTS_HD_HRA_X       64
+ 
+ #define AV_PROFILE_EAC3_DDP_ATMOS         30
+ 
+diff --git a/libavcodec/profiles.c b/libavcodec/profiles.c
+index d846ba9a0aefa32de83ae15ffcb02ec4aa587164..8f8ef5f7fd5846e677e1fcfa4d21895d6bca47cc 100644
+--- a/libavcodec/profiles.c
++++ b/libavcodec/profiles.c
+@@ -46,6 +46,7 @@ const AVProfile ff_dca_profiles[] = {
+     { AV_PROFILE_DTS_HD_MA_X,        "DTS-HD MA + DTS:X"      },
+     { AV_PROFILE_DTS_HD_MA_X_IMAX,   "DTS-HD MA + DTS:X IMAX" },
+     { AV_PROFILE_DTS_HD_MA_AURO3D,   "DTS-HD MA + Auro-3D"    },
++    { AV_PROFILE_DTS_HD_HRA_X,        "DTS-HD HRA + DTS:X"     },
+     { AV_PROFILE_DTS_EXPRESS,        "DTS Express"            },
+     { AV_PROFILE_UNKNOWN },
+ };
+diff --git a/libavcodec/tests/dca_exss.c b/libavcodec/tests/dca_exss.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..07317e80fabcb99bf8cb9e3f2241ec298bd6d04e
+--- /dev/null
++++ b/libavcodec/tests/dca_exss.c
+@@ -0,0 +1,169 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#include <limits.h>
++#include <stdio.h>
++#include <stdint.h>
++#include <string.h>
++
++#include "libavutil/intreadwrite.h"
++
++#include "libavcodec/dca.h"
++#include "libavcodec/dca_exss.h"
++#include "libavcodec/dca_syncwords.h"
++
++#define CHECK(condition) do {                                            \
++    if (!(condition)) {                                                  \
++        fprintf(stderr, "check failed at line %d: %s\n",                \
++                __LINE__, #condition);                                   \
++        return 1;                                                        \
++    }                                                                    \
++} while (0)
++
++/* Bit by bit, and so independent of the table the code under test uses:
++ * CRC16-CCITT, 0xffff in, nothing out. */
++static unsigned crc16(const uint8_t *data, int size)
++{
++    unsigned crc = 0xffff;
++
++    for (int i = 0; i < size; i++) {
++        crc ^= data[i] << 8;
++        for (int bit = 0; bit < 8; bit++)
++            crc = crc & 0x8000 ? (crc << 1 ^ 0x1021) & 0xffff : crc << 1 & 0xffff;
++    }
++    return crc;
++}
++
++/* A protected prefix ending at pos, then the set byte and the tail. */
++static void plant_sets(uint8_t *payload, int pos, int sets)
++{
++    static const uint8_t tail[] = { 0x34, 0x38, 0x8c, 0x4f, 0x00 };
++
++    AV_WB16(payload + pos - 2, crc16(payload, pos - 2));
++    payload[pos] = sets;
++    memcpy(payload + pos + 1, tail, sizeof(tail));
++}
++
++static int x_payload(uint8_t *payload, int size, int pos, int sets)
++{
++    memset(payload, 0, size);
++    AV_WB32(payload, DCA_SYNCWORD_XLL_X_3);
++    for (int i = 4; i < pos - 2; i++)
++        payload[i] = i * 37;
++    plant_sets(payload, pos, sets);
++    return ff_dca_x_height_flags(payload, size);
++}
++
++static uint32_t detect(uint32_t syncword)
++{
++    DCAExssParser parser = { 0 };
++    uint8_t data[64] = { 0 };
++
++    parser.nassets = 1;
++    parser.exss_size = sizeof(data);
++    parser.assets[0].extension_mask = DCA_EXSS_XXCH;
++    parser.assets[0].asset_offset = 8;
++    parser.assets[0].asset_size = 12;
++    AV_WB32(data + 26, syncword);
++    return ff_dca_exss_hra_x_syncword(&parser, data, sizeof(data), NULL);
++}
++
++int main(void)
++{
++    static const uint32_t syncwords[] = {
++        DCA_SYNCWORD_XLL_X_1,
++        DCA_SYNCWORD_XLL_X_IMAX,
++        DCA_SYNCWORD_XLL_X_2,
++        DCA_SYNCWORD_XLL_X_3,
++        DCA_SYNCWORD_XLL_X_4,
++        DCA_SYNCWORD_XLL_X_5,
++    };
++    DCAExssParser parser = { 0 };
++    uint8_t data[64] = { 0 };
++    uint8_t payload[128];
++    int height_flags;
++
++    for (unsigned i = 0; i < FF_ARRAY_ELEMS(syncwords); i++)
++        CHECK(detect(syncwords[i]) == syncwords[i]);
++    CHECK(detect(0xf14000d5) == 0);
++
++    parser.nassets = 1;
++    parser.exss_size = sizeof(data);
++    parser.assets[0].extension_mask = DCA_EXSS_XBR;
++    parser.assets[0].asset_offset = 8;
++    parser.assets[0].asset_size = 12;
++
++    AV_WB32(data + 48, DCA_SYNCWORD_XLL_X_1);
++    CHECK(ff_dca_exss_hra_x_syncword(&parser, data, sizeof(data), NULL) ==
++          DCA_SYNCWORD_XLL_X_1);
++    memset(data, 0, sizeof(data));
++    AV_WB32(data + 49, DCA_SYNCWORD_XLL_X_1);
++    CHECK(ff_dca_exss_hra_x_syncword(&parser, data, sizeof(data), NULL) == 0);
++
++    AV_WB32(data + 26, DCA_SYNCWORD_XLL_X_1);
++    parser.assets[0].extension_mask = DCA_EXSS_XLL;
++    CHECK(ff_dca_exss_hra_x_syncword(&parser, data, sizeof(data), NULL) == 0);
++    parser.assets[0].extension_mask = DCA_EXSS_CORE;
++    CHECK(ff_dca_exss_hra_x_syncword(&parser, data, sizeof(data), NULL) == 0);
++    parser.assets[0].extension_mask = DCA_EXSS_XXCH;
++    parser.nassets = 2;
++    CHECK(ff_dca_exss_hra_x_syncword(&parser, data, sizeof(data), NULL) == 0);
++
++    parser.nassets = 1;
++    parser.exss_size = 25;
++    CHECK(ff_dca_exss_hra_x_syncword(&parser, data, sizeof(data), NULL) == 0);
++    parser.exss_size = sizeof(data);
++    parser.assets[0].asset_offset = INT_MAX;
++    parser.assets[0].asset_size = 1;
++    CHECK(ff_dca_exss_hra_x_syncword(&parser, data, sizeof(data), NULL) == 0);
++
++    /* The channel-set byte: heights, none, and every way of saying nothing. */
++    CHECK(x_payload(payload, sizeof(payload), 20, 0x03) ==
++          (DCA_X_LEVEL_SETS_READ | DCA_X_LEVEL_HEIGHTS));
++    CHECK(x_payload(payload, sizeof(payload), 20, 0x01) == DCA_X_LEVEL_SETS_READ);
++    CHECK(x_payload(payload, sizeof(payload), 16, 0x03) ==
++          (DCA_X_LEVEL_SETS_READ | DCA_X_LEVEL_HEIGHTS));
++    CHECK(x_payload(payload, sizeof(payload), 95, 0x01) == DCA_X_LEVEL_SETS_READ);
++    CHECK(x_payload(payload, sizeof(payload), 96, 0x03) == 0);
++    CHECK(x_payload(payload, sizeof(payload), 20, 0x02) == 0);
++    CHECK(x_payload(payload, sizeof(payload), 20, 0x07) == 0);
++    CHECK(x_payload(payload, 25, 20, 0x03) == 0);
++    x_payload(payload, sizeof(payload), 20, 0x03);
++    payload[10] ^= 1;
++    CHECK(ff_dca_x_height_flags(payload, sizeof(payload)) == 0);
++    x_payload(payload, sizeof(payload), 20, 0x03);
++    payload[23] ^= 1;
++    CHECK(ff_dca_x_height_flags(payload, sizeof(payload)) == 0);
++    x_payload(payload, sizeof(payload), 20, 0x03);
++    plant_sets(payload, 40, 0x01);
++    CHECK(ff_dca_x_height_flags(payload, sizeof(payload)) == 0);
++
++    /* Found through the HRA search, from the syncword to the end of the EXSS. */
++    memset(data, 0, sizeof(data));
++    parser.assets[0].asset_offset = 8;
++    parser.assets[0].asset_size = 12;
++    parser.exss_size = sizeof(data);
++    x_payload(payload, sizeof(payload), 20, 0x01);
++    memcpy(data + 22, payload, 26);
++    CHECK(ff_dca_exss_hra_x_syncword(&parser, data, sizeof(data), &height_flags) ==
++          DCA_SYNCWORD_XLL_X_3);
++    CHECK(height_flags == DCA_X_LEVEL_SETS_READ);
++    parser.exss_size = 22 + 25;
++    CHECK(ff_dca_exss_hra_x_syncword(&parser, data, sizeof(data), &height_flags) ==
++          DCA_SYNCWORD_XLL_X_3);
++    CHECK(height_flags == 0);
++    parser.exss_size = sizeof(data);
++    memset(data, 0, sizeof(data));
++    AV_WB32(data + 22, DCA_SYNCWORD_XLL_X_1);
++    CHECK(ff_dca_exss_hra_x_syncword(&parser, data, sizeof(data), &height_flags) ==
++          DCA_SYNCWORD_XLL_X_1);
++    CHECK(height_flags == 0);
++
++    return 0;
++}
+diff --git a/libavformat/demux.c b/libavformat/demux.c
+index 7c247995308106c32d8397ef719b0cbecf6041d7..3ebc11dfea41cb33d45db7197e7595d6c24a7445 100644
+--- a/libavformat/demux.c
++++ b/libavformat/demux.c
+@@ -2137,21 +2137,24 @@ static int has_codec_parameters(const AVStream *st, const char **errmsg_ptr)
+ /* Auro-3D rides in the low bits of an ordinary DTS-HD MA carrier. The scan in
+  * dca_xll.c can only see it in reconstructed samples and needs more of them
+  * than a single frame carries - DCA_AURO_SCAN_SAMPLES, sixteen frames at the
+- * usual 512 - but probing stops at the first decoded frame. Passthrough
+- * playback and the library scanner never decode a frame of their own, so
+- * without this they would never be told. Only DTS-HD MA pays for it: anything
+- * that is not DTS, or that the first frame already named DTS:X, drops out. */
+-#define DCA_AURO_PROBE_FRAMES 16
+-
+-static int dca_auro_probe_pending(const AVStream *st)
++ * usual 512 - but probing stops at the first decoded frame. DTS:X metadata can
++ * likewise follow a lossy HRA asset and may not be present in the first packet.
++ * Passthrough playback and the library scanner never decode frames themselves,
++ * so keep the bounded opening probe active for undecided MA and HRA streams.
++ * A distinct spatial profile ends the extra work immediately. */
++#define DCA_SPATIAL_PROBE_FRAMES 16
++
++static int dca_spatial_probe_pending(const AVStream *st)
+ {
+     const FFStream *const sti = cffstream(st);
+     const AVCodecContext *const avctx = sti->avctx;
+ 
+     return avctx->codec_id == AV_CODEC_ID_DTS &&
+            sti->info->found_decoder >= 0 &&
+-           sti->nb_decoded_frames < DCA_AURO_PROBE_FRAMES &&
+-           (!sti->nb_decoded_frames || avctx->profile == AV_PROFILE_DTS_HD_MA);
++           sti->nb_decoded_frames < DCA_SPATIAL_PROBE_FRAMES &&
++           (!sti->nb_decoded_frames ||
++            avctx->profile == AV_PROFILE_DTS_HD_MA ||
++            avctx->profile == AV_PROFILE_DTS_HD_HRA);
+ }
+ 
+ /* returns 1 or 0 if or if not decoded data was returned, or a negative error */
+@@ -2218,7 +2221,7 @@ static int try_decode_frame(AVFormatContext *s, AVStream *st,
+     while ((pkt_to_send || (!pkt->data && got_picture)) &&
+            ret >= 0 &&
+            (!has_codec_parameters(st, NULL) || !has_decode_delay_been_guessed(st) ||
+-            dca_auro_probe_pending(st) ||
++            dca_spatial_probe_pending(st) ||
+             (!sti->codec_info_nb_frames &&
+              (avctx->codec->capabilities & AV_CODEC_CAP_CHANNEL_CONF)))) {
+         got_picture = 0;
+@@ -2749,7 +2752,7 @@ int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
+ 
+             if (!has_codec_parameters(st, NULL))
+                 break;
+-            if (dca_auro_probe_pending(st))
++            if (dca_spatial_probe_pending(st))
+                 break;
+             /* If the timebase is coarse (like the usual millisecond precision
+              * of mkv), we need to analyze more frames to reliably arrive at
+diff --git a/tests/fate/libavcodec.mak b/tests/fate/libavcodec.mak
+index e2d616e307ad41c625f4f2ad13b923ef61b780fb..ac5659e157a33faae9f676542d9125bb43a92c4b 100644
+--- a/tests/fate/libavcodec.mak
++++ b/tests/fate/libavcodec.mak
+@@ -43,6 +43,11 @@ fate-golomb: libavcodec/tests/golomb$(EXESUF)
+ fate-golomb: CMD = run libavcodec/tests/golomb$(EXESUF)
+ fate-golomb: CMP = null
+ 
++FATE_LIBAVCODEC-$(CONFIG_DCA_DECODER) += fate-dca-exss
++fate-dca-exss: libavcodec/tests/dca_exss$(EXESUF)
++fate-dca-exss: CMD = run libavcodec/tests/dca_exss$(EXESUF)
++fate-dca-exss: CMP = null
++
+ FATE_LIBAVCODEC-$(CONFIG_DXV_ENCODER) += fate-hashtable
+ fate-hashtable: libavcodec/tests/hashtable$(EXESUF)
+ fate-hashtable: CMD = run libavcodec/tests/hashtable$(EXESUF)

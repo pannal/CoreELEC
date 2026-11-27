@@ -17,8 +17,19 @@
         <setting id="videoscreen.screen">
           <visible>false</visible>
         </setting>
+        <!-- The appliance hides the display mode selector. Show its controls at the top level. -->
+        <setting id="videoscreen.resolution" parent="" />
+        <setting id="videoscreen.screenmode" parent="" />
+        <setting id="videoscreen.fakefullscreen" parent="" />
+        <setting id="videoscreen.blankdisplays" parent="" />
+        <setting id="coreelec.amlogic.disableguiscaling" parent="" />
+        <setting id="coreelec.amlogic.afbcscanout.twobuffers" parent="" />
+        <setting id="coreelec.amlogic.limitcd" parent="" />
+        <setting id="coreelec.amlogic.forcecs" parent="" />
+        <setting id="videoscreen.delayrefreshchange" parent="" />
       </group>
       <group id="3">
+        <setting id="videoscreen.whitelist" parent="" />
         <setting id="videoscreen.noofbuffers">
           <default>2</default>
         </setting>

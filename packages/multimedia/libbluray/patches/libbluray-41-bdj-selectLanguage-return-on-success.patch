@@ -1,0 +1,37 @@
+From: SamuriHL <samurihl@msn.com>
+Subject: bdj: return from selectLanguage() once the stream is selected
+
+StreamControl.selectLanguage() finds the stream whose language matches, selects
+it, and then keeps iterating - and falls out of the loop into the unconditional
+`throw new LanguageNotAvailableException()` at the end. So a call that SUCCEEDS
+still throws, and any Xlet selecting audio or subtitles by language name sees an
+exception it has no reason to expect.
+
+Two consequences, both real:
+
+  - selectLanguage() always throws, success or not. An Xlet that treats the
+    exception as fatal abandons whatever it was doing, and BD-J titles do
+    exactly that inside stream-setup handlers.
+
+  - selectDefaultLanguage() calls selectLanguage() and converts
+    LanguageNotAvailableException into NotAuthorizedException, so it always
+    throws too - including on the ordinary path where the disc's default
+    language was found and selected.
+
+There is a second, quieter bug in the same loop: without the return, a later
+stream carrying the same language code overwrites the selection, so the LAST
+match wins where the API contract implies the first.
+
+Add the return. Nothing else changes: a genuine no-match still reaches the
+LanguageNotAvailableException, and a match whose stream number is out of range
+still converts to NotAuthorizedException.
+--- a/src/libbluray/bdj/java/org/videolan/media/content/playlist/StreamControl.java
++++ b/src/libbluray/bdj/java/org/videolan/media/content/playlist/StreamControl.java
+@@ -117,6 +117,7 @@
+             if (streams[i].getLang().equals(language)) {
+                 try {
+                     selectStreamNumber(i + 1);
++                    return;
+                 } catch (StreamNotAvailableException e) {
+                     throw new NotAuthorizedException();
+                 }
